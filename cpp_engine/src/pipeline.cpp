@@ -1,0 +1,713 @@
+#include "pipeline.hpp"
+
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+#include <fstream>
+#include <stdexcept>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <openssl/evp.h>
+
+#include <algorithm>
+#include <filesystem>
+#include <map>
+
+#include "chunker.h"
+#include "gear_table.hpp"
+#include "immutability.hpp"
+#include "manifest.hpp"
+#include "phenotype.hpp"
+#include "phylo.hpp"
+
+namespace pfs_engine {
+
+namespace {
+
+constexpr uint64_t kChunkMask = 0x1FFF;   // matches pipeline.py's default chunk_mask
+constexpr size_t kMinSize = 4096;         // matches STORAGE_MIN_SIZE
+constexpr size_t kMaxSize = 16384;        // matches STORAGE_MAX_SIZE
+
+// PART 8 item #1 (see cpp_port_plan.txt's 1.5GB-benchmark profiling --
+// dedup index lookup+register was ~19% of the core loop, one SELECT + one
+// INSERT per chunk): chunks are grouped into windows of this many before
+// touching the dedup index, resolved with one batched `IN (...)` SELECT
+// and one multi-row upsert per window instead of two round trips per
+// chunk. 300 keeps bound-parameter counts (up to 300 for the SELECT, up
+// to 600 for the upsert) safely under SQLite's variable-count ceiling on
+// every version this project might run against (999 pre-3.32, 32766
+// after) -- see pipeline.py's DEDUP_INDEX_BATCH_SIZE for the same choice
+// made for the same reason on the Python side.
+constexpr size_t kDedupBatchSize = 300;
+
+struct ChunkSpan {
+    size_t offset;
+    size_t length;
+    Bytes32 digest;
+};
+
+struct MappedFile {
+    int fd = -1;
+    uint8_t* data = nullptr;
+    size_t size = 0;
+    explicit MappedFile(const std::string& path) {
+        fd = open(path.c_str(), O_RDONLY);
+        if (fd < 0) throw std::runtime_error("failed to open source file '" + path + "': " + strerror(errno));
+        struct stat st{};
+        fstat(fd, &st);
+        size = static_cast<size_t>(st.st_size);
+        if (size > 0) {
+            void* m = mmap(nullptr, size, PROT_READ, MAP_PRIVATE, fd, 0);
+            if (m == MAP_FAILED) { close(fd); throw std::runtime_error("mmap failed: " + path); }
+            data = static_cast<uint8_t*>(m);
+        }
+    }
+    ~MappedFile() { if (data) munmap(data, size); if (fd >= 0) close(fd); }
+};
+
+bool file_exists(const std::string& path) {
+    struct stat st{};
+    return stat(path.c_str(), &st) == 0;
+}
+
+uint64_t file_size(const std::string& path) {
+    struct stat st{};
+    if (stat(path.c_str(), &st) != 0) return 0;
+    return static_cast<uint64_t>(st.st_size);
+}
+
+}  // namespace
+
+StoragePipeline::StoragePipeline(std::string storage_root, const Bytes32& kek)
+    : storage_root_(std::move(storage_root)),
+      kek_(kek),
+      container_path_(storage_root_ + "/data_container.bin"),
+      mirror_container_path_(storage_root_ + "/data_container_mirror.bin"),
+      index_(storage_root_ + "/global_index.db", kek),
+      keyring_(storage_root_, kek) {}
+
+WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_path,
+                                                       const std::string& original_filename) {
+    MappedFile src(file_path);
+    auto [epoch_id, dek] = keyring_.get_current_dek();  // fetched once, not per chunk
+
+    uint64_t current_offset = file_size(container_path_);
+    int out_fd = open(container_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (out_fd < 0) throw std::runtime_error("failed to open container '" + container_path_ + "' for append: " + strerror(errno));
+
+    // Lazily opened -- most writes never touch either (mirroring is
+    // triggered only when a chunk actually crosses the threshold, and
+    // most chunks in a real vault are only referenced once or twice).
+    int mirror_read_primary_fd = -1;  // reads an ALREADY-STORED chunk's bytes back, to copy them
+    int mirror_write_fd = -1;
+    uint64_t mirror_offset = file_exists(mirror_container_path_) ? file_size(mirror_container_path_) : 0;
+
+    std::vector<Bytes32> block_hashes;
+    size_t cursor = 0;
+    uint64_t rolling_hash = 0;
+    uint64_t new_chunks = 0, dup_chunks = 0;
+
+    index_.begin();
+    try {
+        // Windowed batching (PART 8 item #1): chunk boundary scanning and
+        // per-chunk SHA-256 are unchanged (native, already cheap per the
+        // profiling) -- what changes is that the dedup index is no longer
+        // consulted per chunk. Each window is gathered first (offsets +
+        // digests only, no DB/encryption yet), resolved with ONE batched
+        // `lookup_many` covering the whole window, then walked in order
+        // to apply ref-count/mirroring logic against an in-memory
+        // `local_state` map before flushing with ONE `upsert_many` call.
+        // Repeat occurrences of the same hash within one window (a
+        // self-duplicate chunk inside this file) collapse into a single
+        // final-state row instead of one upsert per occurrence -- and,
+        // unlike the old per-chunk `increment_ref()`, never re-queries
+        // the row a second time internally, since the window's own
+        // lookup_many result (or an earlier occurrence's own local_state
+        // entry) already has everything needed. Final DB state (ref
+        // counts, exactly-once mirror-crossing point) is identical to
+        // what the old one-chunk-at-a-time loop produced -- order of
+        // ref-count increments within a window is preserved by walking
+        // the window in original chunk order, same as before.
+        while (cursor < src.size) {
+            std::vector<ChunkSpan> window;
+            window.reserve(kDedupBatchSize);
+            while (window.size() < kDedupBatchSize && cursor < src.size) {
+                size_t chunk_len = scan_chunk_c(src.data, src.size, cursor, &rolling_hash,
+                                                 kChunkMask, kMinSize, kMaxSize, kGearTable);
+                if (chunk_len == 0) break;
+                Bytes32 digest = sha256(src.data + cursor, chunk_len);
+                block_hashes.push_back(digest);
+                window.push_back(ChunkSpan{cursor, chunk_len, digest});
+                cursor += chunk_len;
+            }
+            if (window.empty()) break;
+
+            std::vector<Bytes32> window_hashes;
+            window_hashes.reserve(window.size());
+            for (const auto& span : window) window_hashes.push_back(span.digest);
+            std::map<Bytes32, BlockEntry> db_state = index_.lookup_many(window_hashes);
+
+            std::map<Bytes32, BlockEntry> local_state;
+            for (const auto& span : window) {
+                const uint8_t* chunk_ptr = src.data + span.offset;
+                bool crossed = false;
+                BlockEntry* entry_ptr = nullptr;
+
+                auto it = local_state.find(span.digest);
+                if (it != local_state.end()) {
+                    it->second.ref_count += 1;
+                    dup_chunks++;
+                    crossed = (it->second.ref_count == StoragePipeline::kMirrorRefThreshold);
+                    entry_ptr = &it->second;
+                } else {
+                    auto dbit = db_state.find(span.digest);
+                    if (dbit != db_state.end()) {
+                        BlockEntry e = dbit->second;
+                        e.ref_count += 1;
+                        auto inserted = local_state.emplace(span.digest, e);
+                        dup_chunks++;
+                        crossed = (e.ref_count == StoragePipeline::kMirrorRefThreshold);
+                        entry_ptr = &inserted.first->second;
+                    } else {
+                        std::vector<uint8_t> encrypted =
+                            aead_encrypt(dek, chunk_ptr, span.length, span.digest.data(), span.digest.size());
+                        if (write(out_fd, encrypted.data(), encrypted.size()) != static_cast<ssize_t>(encrypted.size())) {
+                            throw std::runtime_error("failed writing container");
+                        }
+                        BlockEntry e{current_offset, encrypted.size(), 1, epoch_id};
+                        current_offset += encrypted.size();
+                        new_chunks++;
+                        auto inserted = local_state.emplace(span.digest, e);
+                        entry_ptr = &inserted.first->second;
+                        // crossed stays false -- a chunk born at ref_count
+                        // 1 can't equal kMirrorRefThreshold (3) on arrival.
+                    }
+                }
+
+                // Ancestral Hardening: the moment this chunk's ref count
+                // CROSSES the threshold, mirror it -- copy its already-
+                // encrypted bytes as-is (no re-encryption needed) into
+                // the separate mirror container. Matches pipeline.py's
+                // `ref_count_before + 1 == MIRROR_REF_THRESHOLD` check
+                // exactly (triggers once, not on every subsequent ref).
+                if (crossed && !index_.get_mirror(span.digest)) {
+                    if (mirror_read_primary_fd < 0) {
+                        mirror_read_primary_fd = open(container_path_.c_str(), O_RDONLY);
+                    }
+                    if (mirror_write_fd < 0) {
+                        mirror_write_fd = open(mirror_container_path_.c_str(),
+                                                O_WRONLY | O_CREAT | O_APPEND, 0600);
+                    }
+                    std::vector<uint8_t> mirrored_bytes(entry_ptr->length);
+                    if (pread(mirror_read_primary_fd, mirrored_bytes.data(), entry_ptr->length,
+                              static_cast<off_t>(entry_ptr->offset)) != static_cast<ssize_t>(entry_ptr->length)) {
+                        throw std::runtime_error("failed reading primary chunk to mirror it");
+                    }
+                    if (write(mirror_write_fd, mirrored_bytes.data(), mirrored_bytes.size()) !=
+                        static_cast<ssize_t>(mirrored_bytes.size())) {
+                        throw std::runtime_error("failed writing mirror container");
+                    }
+                    index_.set_mirror(span.digest, mirror_offset, mirrored_bytes.size());
+                    mirror_offset += mirrored_bytes.size();
+                }
+            }
+
+            std::vector<std::tuple<Bytes32, uint64_t, uint64_t, uint32_t, uint32_t>> to_upsert;
+            to_upsert.reserve(local_state.size());
+            for (const auto& [hash, e] : local_state) {
+                to_upsert.emplace_back(hash, e.offset, e.length, e.ref_count, e.epoch_id);
+            }
+            index_.upsert_many(to_upsert);
+        }
+        fsync(out_fd);
+        if (mirror_write_fd >= 0) fsync(mirror_write_fd);
+    } catch (...) {
+        index_.rollback();
+        close(out_fd);
+        if (mirror_read_primary_fd >= 0) close(mirror_read_primary_fd);
+        if (mirror_write_fd >= 0) close(mirror_write_fd);
+        throw;
+    }
+    close(out_fd);
+    if (mirror_read_primary_fd >= 0) close(mirror_read_primary_fd);
+    if (mirror_write_fd >= 0) close(mirror_write_fd);
+
+    // Whole-file hash computed from the already-mmapped buffer -- no
+    // separate read needed (this is what gearhash/pipeline.py's fix,
+    // done in Python earlier this port, achieves via a streaming
+    // incremental hash instead; mmap gets the same "only one real read
+    // of the file" property for free here since the whole buffer is
+    // already addressable).
+    Bytes32 content_sha256 = sha256(src.data, src.size);
+    std::string manifest_filename = manifest_filename_for(content_sha256);
+    std::string manifest_path = storage_root_ + "/" + manifest_filename;
+
+    WriteResult result;
+    result.manifest_path = manifest_path;
+    result.total_blocks = block_hashes.size();
+    result.new_chunks_written = new_chunks;
+    result.duplicate_chunks_found = dup_chunks;
+
+    if (file_exists(manifest_path)) {
+        // Exact duplicate of already-stored content -- every chunk above
+        // hit the "existing" branch, so nothing new was ever physically
+        // appended. Roll back the ref-count bookkeeping instead of
+        // committing it (same fix as gearhash/pipeline.py, applied here
+        // natively rather than needing its own follow-up correction).
+        index_.rollback();
+        result.was_duplicate_of_existing = true;
+        return result;
+    }
+    index_.commit();
+
+    ManifestMetadata meta;
+    meta.original_filename = original_filename;
+    meta.content_sha256 = content_sha256;
+    meta.total_blocks = block_hashes.size();
+    meta.original_size = src.size;
+    meta.new_chunks_written = new_chunks;
+    meta.duplicate_chunks_found = dup_chunks;
+    Phenotype phenotype = detect_phenotype(src.data, std::min<size_t>(src.size, 64));
+    meta.phenotype_mask = phenotype.mask;
+    meta.phenotype_name = phenotype.name;
+
+    // SIMILARITY_PROFILE fingerprint, for the clade tree ('tree'/
+    // 'similar'). Computed synchronously from the SAME already-mmap'd
+    // source buffer (no second file read) -- unlike pfs_cli.py's Python
+    // shell, which backgrounds this on its own thread to avoid stalling
+    // the prompt on a slow interpreter loop, the C++ engine's whole
+    // point is that this loop isn't slow, so no threading complexity is
+    // needed here to get the same "don't block the caller" property.
+    TraitSet fingerprint = extract_similarity_traits(src.data, src.size);
+    meta.similarity_fingerprint = std::vector<Bytes32>(fingerprint.begin(), fingerprint.end());
+
+    Manifest manifest(meta, block_hashes);
+    write_manifest_file(manifest_path, manifest_filename, manifest, kek_);
+    return result;
+}
+
+void StoragePipeline::reconstruct(const std::string& manifest_path, const std::string& output_path) {
+    std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
+    Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
+
+    int primary_fd = open(container_path_.c_str(), O_RDONLY);
+    if (primary_fd < 0) throw std::runtime_error("failed to open container '" + container_path_ + "': " + strerror(errno));
+    int mirror_fd = -1;  // opened lazily, only if a primary copy ever actually fails
+
+    std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        close(primary_fd);
+        throw std::runtime_error("failed to open output file '" + output_path + "': " + strerror(errno));
+    }
+
+    EVP_MD_CTX* hash_ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(hash_ctx, EVP_sha256(), nullptr);
+    uint64_t bytes_written = 0;
+
+    for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
+        auto hash_opt = manifest.lookup(idx);
+        if (!hash_opt) {
+            EVP_MD_CTX_free(hash_ctx);
+            throw std::runtime_error("manifest declares block " + std::to_string(idx) + " but it's missing");
+        }
+        auto loc = index_.lookup(*hash_opt);
+        if (!loc) {
+            EVP_MD_CTX_free(hash_ctx);
+            throw std::runtime_error("block " + std::to_string(idx) + " missing from the global block index");
+        }
+        Bytes32 dek = keyring_.get_dek(loc->epoch_id);
+
+        std::vector<uint8_t> plaintext;
+        bool ok = false;
+        std::string primary_error;
+        try {
+            std::vector<uint8_t> payload(loc->length);
+            if (pread(primary_fd, payload.data(), loc->length, static_cast<off_t>(loc->offset)) !=
+                static_cast<ssize_t>(loc->length)) {
+                throw std::runtime_error("short read");
+            }
+            plaintext = aead_decrypt(dek, payload.data(), payload.size(), hash_opt->data(), hash_opt->size());
+            if (sha256(plaintext.data(), plaintext.size()) == *hash_opt) {
+                ok = true;
+            } else {
+                primary_error = "decrypted content hash doesn't match the manifest's record";
+            }
+        } catch (const std::exception& e) {
+            primary_error = e.what();
+        }
+
+        if (!ok) {
+            // Ancestral Hardening fallback -- always SURFACE that the
+            // primary was bad, never silently recover without saying so.
+            auto mirror_loc = index_.get_mirror(*hash_opt);
+            if (mirror_loc && file_exists(mirror_container_path_)) {
+                if (mirror_fd < 0) mirror_fd = open(mirror_container_path_.c_str(), O_RDONLY);
+                try {
+                    std::vector<uint8_t> mirror_payload(mirror_loc->length);
+                    if (pread(mirror_fd, mirror_payload.data(), mirror_loc->length,
+                              static_cast<off_t>(mirror_loc->offset)) == static_cast<ssize_t>(mirror_loc->length)) {
+                        std::vector<uint8_t> candidate = aead_decrypt(
+                            dek, mirror_payload.data(), mirror_payload.size(), hash_opt->data(), hash_opt->size());
+                        if (sha256(candidate.data(), candidate.size()) == *hash_opt) {
+                            plaintext = std::move(candidate);
+                            ok = true;
+                            fprintf(stderr,
+                                "WARNING: block %llu failed on its primary copy (%s) -- recovered from its "
+                                "Ancestral Hardening mirror instead. The primary copy is damaged.\n",
+                                (unsigned long long)idx, primary_error.c_str());
+                        }
+                    }
+                } catch (const std::exception&) {
+                    // mirror also failed -- ok stays false, handled below
+                }
+            }
+        }
+
+        if (!ok) {
+            close(primary_fd);
+            if (mirror_fd >= 0) close(mirror_fd);
+            EVP_MD_CTX_free(hash_ctx);
+            throw std::runtime_error(
+                "block " + std::to_string(idx) + " failed integrity verification on its primary copy (" +
+                primary_error + "), and either has no Ancestral Hardening mirror or the mirror also failed "
+                "-- this data is genuinely unrecoverable.");
+        }
+
+        out.write(reinterpret_cast<const char*>(plaintext.data()), static_cast<std::streamsize>(plaintext.size()));
+        EVP_DigestUpdate(hash_ctx, plaintext.data(), plaintext.size());
+        bytes_written += plaintext.size();
+    }
+    close(primary_fd);
+    if (mirror_fd >= 0) close(mirror_fd);
+    out.close();
+
+    Bytes32 final_hash{};
+    unsigned int final_len = 0;
+    EVP_DigestFinal_ex(hash_ctx, final_hash.data(), &final_len);
+    EVP_MD_CTX_free(hash_ctx);
+
+    if (bytes_written != manifest.metadata().original_size) {
+        throw std::runtime_error("reconstructed " + std::to_string(bytes_written) + " bytes, expected " +
+                                  std::to_string(manifest.metadata().original_size));
+    }
+    if (final_hash != manifest.metadata().content_sha256) {
+        throw std::runtime_error("reconstructed content hash does not match the manifest's recorded hash");
+    }
+}
+
+void StoragePipeline::delete_file(const std::string& manifest_path) {
+    if (!file_exists(manifest_path)) {
+        throw std::runtime_error("manifest not found: " + manifest_path);
+    }
+    std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
+    Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
+
+    index_.begin();
+    try {
+        for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
+            auto hash_opt = manifest.lookup(idx);
+            if (hash_opt) index_.decrement_ref(*hash_opt);
+        }
+    } catch (...) {
+        index_.rollback();
+        throw;
+    }
+    index_.commit();
+
+    set_immutable(manifest_path, false);
+    if (remove(manifest_path.c_str()) != 0) {
+        throw std::runtime_error("failed to remove manifest '" + manifest_path + "': " + strerror(errno));
+    }
+}
+
+RefCountRepairReport StoragePipeline::rebuild_ref_counts(const std::vector<std::string>& live_manifest_filenames) {
+    std::map<Bytes32, uint64_t> true_counts;
+    for (const auto& manifest_filename : live_manifest_filenames) {
+        std::string manifest_path = storage_root_ + "/" + manifest_filename;
+        if (!file_exists(manifest_path)) continue;
+        Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
+        for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
+            auto hash_opt = manifest.lookup(idx);
+            if (hash_opt) true_counts[*hash_opt]++;
+        }
+    }
+
+    RefCountRepairReport report;
+    index_.begin();
+    try {
+        for (const auto& entry : index_.iter_all()) {
+            report.chunks_checked++;
+            auto it = true_counts.find(entry.content_hash);
+            uint64_t true_count = (it != true_counts.end()) ? it->second : 0;
+            if (true_count != entry.ref_count) {
+                index_.set_ref_count(entry.content_hash, static_cast<uint32_t>(true_count));
+                report.chunks_corrected++;
+            }
+        }
+    } catch (...) {
+        index_.rollback();
+        throw;
+    }
+    index_.commit();
+    return report;
+}
+
+OrphanSweepReport StoragePipeline::sweep_orphaned_manifests(const std::vector<std::string>& live_manifest_filenames) {
+    OrphanSweepReport report;
+    if (!file_exists(storage_root_)) return report;
+
+    std::vector<std::string> live(live_manifest_filenames);
+    std::sort(live.begin(), live.end());
+
+    for (const auto& entry : std::filesystem::directory_iterator(storage_root_)) {
+        std::string fname = entry.path().filename().string();
+        if (fname.size() >= 18 && fname.compare(fname.size() - 18, 18, ".manifest.pfsm.tmp") == 0) {
+            set_immutable(entry.path().string(), false);
+            remove(entry.path().c_str());
+            report.tmp_removed++;
+        } else if (fname.size() >= 14 && fname.compare(fname.size() - 14, 14, ".manifest.pfsm") == 0 &&
+                   !std::binary_search(live.begin(), live.end(), fname)) {
+            set_immutable(entry.path().string(), false);
+            remove(entry.path().c_str());
+            report.removed++;
+        }
+    }
+    return report;
+}
+
+VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manifest_filenames) {
+    RefCountRepairReport repair = rebuild_ref_counts(live_manifest_filenames);
+    OrphanSweepReport orphans = sweep_orphaned_manifests(live_manifest_filenames);
+
+    uint64_t old_size = file_exists(container_path_) ? file_size(container_path_) : 0;
+    std::string tmp_container_path = container_path_ + ".vacuum_tmp";
+
+    std::vector<FullBlockEntry> live_entries;
+    std::vector<Bytes32> dead_hashes;
+    for (const auto& entry : index_.iter_all()) {
+        if (entry.ref_count > 0) {
+            live_entries.push_back(entry);
+        } else {
+            dead_hashes.push_back(entry.content_hash);
+        }
+    }
+
+    uint64_t dead_mirrors = 0;
+    {
+        std::ifstream src(container_path_, std::ios::binary);
+        std::ofstream dst(tmp_container_path, std::ios::binary | std::ios::trunc);
+        if (!dst) throw std::runtime_error("failed to open vacuum temp container '" + tmp_container_path + "': " + strerror(errno));
+
+        uint64_t new_offset = 0;
+        index_.begin();
+        try {
+            for (const auto& entry : live_entries) {
+                std::vector<char> buf(entry.length);
+                src.seekg(static_cast<std::streamoff>(entry.offset));
+                src.read(buf.data(), static_cast<std::streamsize>(entry.length));
+                if (static_cast<uint64_t>(src.gcount()) != entry.length) {
+                    throw std::runtime_error("short read while vacuuming a live chunk");
+                }
+                dst.write(buf.data(), static_cast<std::streamsize>(entry.length));
+                if (new_offset != entry.offset) {
+                    index_.update_offset(entry.content_hash, new_offset);
+                }
+                new_offset += entry.length;
+            }
+            // remove()'s bool return tracks whether THIS dead chunk had a
+            // mirrors row -- dead_mirrors gates the mirror-container
+            // compaction pass below so it's skipped entirely (no file
+            // touched) when nothing mirrored actually died this call.
+            for (const auto& content_hash : dead_hashes) {
+                if (index_.remove(content_hash)) dead_mirrors++;
+            }
+        } catch (...) {
+            index_.rollback();
+            throw;
+        }
+        dst.flush();
+        index_.commit();
+    }
+
+    set_immutable(container_path_, false);
+    std::filesystem::rename(tmp_container_path, container_path_);
+    set_immutable(container_path_, true);
+
+    uint64_t new_size = file_exists(container_path_) ? file_size(container_path_) : 0;
+
+    // Ancestral Hardening's mirror container: the dead-hash sweep above
+    // already dropped every dead chunk's `mirrors` DB row (index_.remove())
+    // -- this physically compacts data_container_mirror.bin itself to
+    // match, the same way the primary container was just compacted above.
+    // Gated on dead_mirrors > 0 (not merely "does the file exist"), so a
+    // vacuum() that killed dead PRIMARY chunks but none of them were ever
+    // mirrored -- the common case -- doesn't pay for a full mirror-
+    // container rewrite for zero actual benefit.
+    uint64_t mirror_old_size = 0;
+    uint64_t mirror_new_size = 0;
+    uint64_t live_mirrors_count = 0;
+    if (dead_mirrors > 0 && file_exists(mirror_container_path_)) {
+        mirror_old_size = file_size(mirror_container_path_);
+        std::string tmp_mirror_path = mirror_container_path_ + ".vacuum_tmp";
+
+        std::vector<FullMirrorEntry> live_mirrors = index_.iter_all_mirrors();
+        live_mirrors_count = live_mirrors.size();
+
+        set_immutable(mirror_container_path_, false);
+        {
+            std::ifstream msrc(mirror_container_path_, std::ios::binary);
+            std::ofstream mdst(tmp_mirror_path, std::ios::binary | std::ios::trunc);
+            if (!mdst) {
+                set_immutable(mirror_container_path_, true);
+                throw std::runtime_error("failed to open vacuum temp mirror container '" + tmp_mirror_path + "': " + strerror(errno));
+            }
+
+            uint64_t new_mirror_offset = 0;
+            index_.begin();
+            try {
+                for (const auto& entry : live_mirrors) {
+                    std::vector<char> buf(entry.length);
+                    msrc.seekg(static_cast<std::streamoff>(entry.offset));
+                    msrc.read(buf.data(), static_cast<std::streamsize>(entry.length));
+                    if (static_cast<uint64_t>(msrc.gcount()) != entry.length) {
+                        throw std::runtime_error("short read while vacuuming a live mirror chunk");
+                    }
+                    mdst.write(buf.data(), static_cast<std::streamsize>(entry.length));
+                    if (new_mirror_offset != entry.offset) {
+                        index_.set_mirror(entry.content_hash, new_mirror_offset, entry.length);
+                    }
+                    new_mirror_offset += entry.length;
+                }
+            } catch (...) {
+                index_.rollback();
+                set_immutable(mirror_container_path_, true);
+                throw;
+            }
+            mdst.flush();
+            index_.commit();
+        }
+        std::filesystem::rename(tmp_mirror_path, mirror_container_path_);
+        set_immutable(mirror_container_path_, true);
+
+        mirror_new_size = file_exists(mirror_container_path_) ? file_size(mirror_container_path_) : 0;
+    }
+    uint64_t mirror_bytes_reclaimed = mirror_old_size - mirror_new_size;
+
+    if (!dead_hashes.empty()) {
+        // SQLite refuses to VACUUM a connection that still has any
+        // prepared statements associated with it -- index_ keeps four
+        // cached ones alive for its whole lifetime (the fix for an
+        // earlier "looked slower than Python" benchmark bug), so
+        // compacting HAS to happen on a brand-new, separate connection
+        // to the same file, exactly like pipeline.py's vacuum() does
+        // (its own comment: "Opened as its own connection, after the
+        // one above is fully closed").
+        DedupIndex compactor(storage_root_ + "/global_index.db", kek_);
+        compactor.compact();
+        // VACUUM rebuilds the whole database file, invalidating index_'s
+        // own cached prepared statements even though IT didn't run the
+        // VACUUM -- without this, the next write's dedup-index upsert
+        // fails ("upsert failed"), a real bug caught by testing write
+        // -> delete -> vacuum -> write, not just vacuum in isolation.
+        index_.refresh_prepared_statements();
+    }
+
+    VacuumReport report;
+    report.old_size = old_size;
+    report.new_size = new_size;
+    report.bytes_reclaimed = old_size - new_size;
+    report.live_chunks = live_entries.size();
+    report.chunks_corrected = repair.chunks_corrected;
+    report.orphaned_manifests_removed = orphans.removed;
+    report.orphaned_tmp_files_removed = orphans.tmp_removed;
+    report.mirror_old_size = mirror_old_size;
+    report.mirror_new_size = mirror_new_size;
+    report.mirror_bytes_reclaimed = mirror_bytes_reclaimed;
+    report.live_mirrors = live_mirrors_count;
+    return report;
+}
+
+FsckReport StoragePipeline::verify_and_repair() {
+    FsckReport report;
+    for (const auto& entry : index_.iter_all()) {
+        if (entry.ref_count == 0) continue;
+        report.scanned++;
+
+        Bytes32 dek = keyring_.get_dek(entry.epoch_id);
+        bool primary_ok = false;
+        if (file_exists(container_path_)) {
+            try {
+                int fd = open(container_path_.c_str(), O_RDONLY);
+                std::vector<uint8_t> payload(entry.length);
+                bool read_ok = fd >= 0 && pread(fd, payload.data(), entry.length,
+                                                 static_cast<off_t>(entry.offset)) == static_cast<ssize_t>(entry.length);
+                if (fd >= 0) close(fd);
+                if (read_ok) {
+                    std::vector<uint8_t> plaintext = aead_decrypt(dek, payload.data(), payload.size(),
+                                                                   entry.content_hash.data(), entry.content_hash.size());
+                    primary_ok = sha256(plaintext.data(), plaintext.size()) == entry.content_hash;
+                }
+            } catch (const std::exception&) {
+                primary_ok = false;
+            }
+        }
+
+        if (primary_ok) {
+            report.healthy++;
+            continue;
+        }
+
+        auto mirror_loc = index_.get_mirror(entry.content_hash);
+        bool mirror_ok = false;
+        std::vector<uint8_t> mirror_payload;
+        if (mirror_loc && file_exists(mirror_container_path_)) {
+            try {
+                int mfd = open(mirror_container_path_.c_str(), O_RDONLY);
+                mirror_payload.resize(mirror_loc->length);
+                bool read_ok = mfd >= 0 && pread(mfd, mirror_payload.data(), mirror_loc->length,
+                                                  static_cast<off_t>(mirror_loc->offset)) ==
+                                              static_cast<ssize_t>(mirror_loc->length);
+                if (mfd >= 0) close(mfd);
+                if (read_ok) {
+                    std::vector<uint8_t> mirror_plain = aead_decrypt(dek, mirror_payload.data(), mirror_payload.size(),
+                                                                      entry.content_hash.data(), entry.content_hash.size());
+                    mirror_ok = sha256(mirror_plain.data(), mirror_plain.size()) == entry.content_hash;
+                }
+            } catch (const std::exception&) {
+                mirror_ok = false;
+            }
+        }
+
+        if (!mirror_ok || mirror_payload.size() != entry.length) {
+            char hex[65];
+            for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", entry.content_hash[i]);
+            report.unrecoverable.emplace_back(hex, 64);
+            continue;
+        }
+
+        set_immutable(container_path_, false);
+        int fd = open(container_path_.c_str(), O_WRONLY);
+        bool wrote_ok = false;
+        if (fd >= 0) {
+            wrote_ok = pwrite(fd, mirror_payload.data(), mirror_payload.size(),
+                              static_cast<off_t>(entry.offset)) == static_cast<ssize_t>(mirror_payload.size());
+            if (wrote_ok) fsync(fd);
+            close(fd);
+        }
+        set_immutable(container_path_, true);
+        if (!wrote_ok) {
+            char hex[65];
+            for (int i = 0; i < 32; i++) snprintf(hex + i * 2, 3, "%02x", entry.content_hash[i]);
+            report.unrecoverable.emplace_back(hex, 64);
+            continue;
+        }
+        report.healed++;
+    }
+    return report;
+}
+
+}  // namespace pfs_engine

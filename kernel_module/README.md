@@ -1,0 +1,246 @@
+# PFS-LKM -- Linux Kernel Module feasibility proof-of-concept
+
+## What this is
+
+This is a **small, deliberately toy-scoped proof-of-concept**, built to
+answer one narrow question raised by this project's own design brief
+(`Project_idea.txt`, section 4, "The Linux Kernel Module (LKM) & Hybrid
+Architectures"): *is it actually feasible to intercept file operations at
+the Linux VFS layer via a `struct file_operations` table, the way a real
+"Phase 3" PFS kernel driver eventually would?*
+
+It is **NOT**:
+
+- A production filesystem. It does not implement a superblock, inodes, or
+  directory entries, and cannot be `mount`ed anywhere.
+- Integrated with the real PFS storage engine in any way. It does not do
+  FastCDC chunking, block deduplication, lineage-graph bookkeeping, or any
+  encryption -- none of that is reasonable to reimplement inside kernel
+  space for a proof-of-concept (kernel code can't link against the
+  `cryptography` package or open a catalog file with ordinary libc calls,
+  and generally must avoid the kind of blocking/allocation patterns
+  userspace storage code uses freely). The real, working PFS engines are
+  the Python engine, the C++ engine, and the existing FUSE mount
+  (`pfs_fuse.py`, `pfs_fuse_cpp.cpp`) documented in `PORTFOLIO.md` -- this
+  module does not touch or replace any of that.
+
+What it **does** demonstrate for real: a loadable kernel module that
+registers a character device (`/dev/pfs_lkm`), wires it to a real
+`struct file_operations` table with real `.open`/`.read`/`.write`/
+`.release` function pointers (exactly the mechanism shown in
+`Project_idea.txt`'s own C snippet), and logs via `printk` every single
+time the kernel calls into one of those functions -- using this project's
+own "speciation event" / "delta synthesis" vocabulary in the log lines, so
+the tie-back to the rest of PFS's design language is explicit rather than
+generic kernel-module boilerplate. Everywhere the real userspace PFS engine
+would actually do its work (chunk, hash, dedupe, record a new lineage
+generation), the code has an explicit comment saying so, backed by a small
+in-kernel memory buffer standing in for real storage just so a `read()`
+after a `write()` has something real to hand back.
+
+See `pfs_lkm.c` itself for a heavily-commented (deliberately more so than
+this codebase's normal style, since this file is meant to be read aloud and
+explained line-by-line to someone who's never seen kernel C before) walk
+through of every function.
+
+## Build status: compiles cleanly to a real `.ko`
+
+This module **was successfully compiled** on this machine. Kernel headers
+for the exact running kernel (`7.0.0-29-generic`) were already installed
+system-wide (`/lib/modules/7.0.0-29-generic/build` -> a valid
+`linux-headers-7.0.0-29-generic` tree), so the non-root
+`apt-get download` + `dpkg -x` vendoring workaround documented elsewhere in
+this project (`cpp_port_plan.txt`, for `libfuse3-dev`) was not needed here.
+
+```
+$ make
+make -C /lib/modules/7.0.0-29-generic/build M=/home/lister/PFS/FastCDC/kernel_module modules
+...
+  CC [M]  pfs_lkm.o
+  MODPOST Module.symvers
+  CC [M]  pfs_lkm.mod.o
+  CC [M]  .module-common.o
+  LD [M]  pfs_lkm.ko
+  BTF [M] pfs_lkm.ko
+Skipping BTF generation for pfs_lkm.ko due to unavailability of vmlinux
+```
+
+(Two harmless warnings appear about the pahole/compiler versions differing
+slightly from whatever exactly built the stock kernel package -- these are
+routine on any dev machine building an out-of-tree module and do not affect
+the result. BTF generation is skipped because no `vmlinux` with debug
+symbols is present -- also routine, and does not affect module
+functionality.)
+
+`modinfo pfs_lkm.ko` on the result confirms a real, correctly-tagged
+module:
+
+```
+filename:       pfs_lkm.ko
+version:        0.1
+description:    PFS-LKM: toy character device demonstrating VFS file_operations interception as a feasibility proof for PFS's 'Phase 3' design, per Project_idea.txt section 4. NOT a production filesystem.
+license:        GPL
+name:           pfs_lkm
+vermagic:       7.0.0-29-generic SMP preempt mod_unload modversions
+```
+
+The `vermagic` line matches this machine's running kernel (`uname -r`)
+exactly, which is required for `insmod` to accept the module at all.
+
+To rebuild from scratch:
+
+```
+cd kernel_module
+make clean   # removes pfs_lkm.o / pfs_lkm.mod.* / pfs_lkm.ko / build litter
+make         # rebuilds pfs_lkm.ko
+```
+
+## !! Loading this module carries real risk -- read before doing it !!
+
+Everything below this line involves **actually loading code into the
+running kernel**. Unlike ordinary userspace bugs, a kernel module bug
+(a bad pointer dereference, a deadlock, an unbalanced lock) can crash or
+destabilize the **entire machine**, not just this one program -- there is
+no process sandbox around code running in kernel space.
+
+**This module has only ever been compiled, never loaded.** No `insmod`,
+`modprobe`, or `rmmod` was run against it while building it, and none of
+the commands below were executed as part of writing this proof-of-concept.
+That was a deliberate safety decision, not an oversight -- loading a kernel
+module is exactly the kind of irreversible, whole-machine-blast-radius
+action that should be a **human's own deliberate choice**, run
+interactively, on a machine they're prepared to reboot if something goes
+wrong (a disposable VM or a machine you can tolerate a hard reset on is the
+safer choice over doing this on your only/primary machine) -- never
+something run unattended or by an automated agent.
+
+If a human operator wants to try it themselves, here is exactly what that
+would involve:
+
+### 1. Load the module (requires root)
+
+```
+sudo insmod pfs_lkm.ko
+```
+
+If this succeeds there is no output on success (that's normal `insmod`
+behavior) -- check the kernel log to confirm:
+
+```
+dmesg | tail
+```
+
+Expect a line like:
+
+```
+PFS-LKM: module loaded. /dev/pfs_lkm is live -- PFS Phylogenetic File
+System VFS-interception feasibility proof-of-concept, NOT a production
+filesystem. Every open/read/write/release against this device will now be
+logged here as it is intercepted.
+```
+
+Confirm it's really listed as loaded:
+
+```
+lsmod | grep pfs_lkm
+```
+
+### 2. Confirm the device node exists
+
+The module uses `misc_register()` with `MISC_DYNAMIC_MINOR`, so on a normal
+desktop/server Linux system with `udev` running, `/dev/pfs_lkm` should be
+created automatically the moment `insmod` succeeds:
+
+```
+ls -l /dev/pfs_lkm
+```
+
+If, on some minimal/non-udev system, the node does **not** appear
+automatically, find the minor number the kernel actually assigned and
+create it manually:
+
+```
+grep pfs_lkm /proc/misc
+# e.g. "58 pfs_lkm" -- 58 is the minor number, MISC major is always 10
+sudo mknod /dev/pfs_lkm c 10 58
+sudo chmod 666 /dev/pfs_lkm
+```
+
+### 3. Trigger the intercepted operations
+
+Any ordinary write into the device triggers `.open`, `.write`, and
+`.release`:
+
+```
+echo "hello from a speciation event" > /dev/pfs_lkm
+```
+
+Reading it back triggers `.open`, `.read`, and `.release`:
+
+```
+cat /dev/pfs_lkm
+```
+
+### 4. Watch the interception log
+
+```
+dmesg | tail -20
+```
+
+Expect to see the real interception log lines, e.g.:
+
+```
+PFS-LKM: open() intercepted -- this is the VFS entry point where a real
+PFS driver would locate/open a lineage node's current tip generation.
+PFS-LKM: write() intercepted, 32 bytes -- this is the speciation-event
+hook point (event #1). The real userspace PFS engine would be invoked
+here: FastCDC-chunk these bytes, hash + dedupe each chunk against the
+global block index, and commit a brand-new lineage generation instead of
+overwriting in place. [toy buffer now holds 32/65536 bytes]
+PFS-LKM: release() intercepted -- file closed; a real PFS driver would
+finalize/commit any pending speciation event here.
+PFS-LKM: open() intercepted -- ...
+PFS-LKM: read() intercepted, 32 bytes requested at offset 0 -- this is the
+delta-synthesis hook point (event #1). The real userspace PFS engine would
+be invoked here: walk the ancestral generation chain and stitch
+chunks/deltas into one reconstructed byte stream before handing it back.
+PFS-LKM: release() intercepted -- ...
+```
+
+(You can also watch these live in a second terminal with
+`sudo dmesg -w` while triggering operations in the first.)
+
+### 5. Unload the module (requires root)
+
+```
+sudo rmmod pfs_lkm
+```
+
+Check `dmesg | tail` again for the unload confirmation line (includes a
+final tally of how many write/read interceptions happened during that
+load):
+
+```
+PFS-LKM: module unloaded. Final tally this load: 1 write() interceptions
+(speciation-event hook points), 1 read() interceptions (delta-synthesis
+hook points). /dev/pfs_lkm is gone.
+```
+
+Confirm it's really gone:
+
+```
+lsmod | grep pfs_lkm   # should print nothing
+ls /dev/pfs_lkm        # should say "No such file or directory"
+```
+
+## Files in this directory
+
+- `pfs_lkm.c` -- the module source. Heavily commented (see the file's own
+  top-of-file note on why the comment density here is unusually high for
+  this codebase).
+- `Makefile` -- standard out-of-tree Kbuild-style module Makefile
+  (`obj-m`, `KDIR := /lib/modules/$(shell uname -r)/build`, delegates the
+  real build to `make -C $(KDIR) M=$(PWD) modules`).
+- `pfs_lkm.ko` -- the compiled module (present after a successful `make`;
+  removed by `make clean`).
+- `README.md` -- this file.

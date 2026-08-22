@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+
+# C++ build artifacts (regenerate: cd cpp_engine/build && cmake .. && make)
+cpp_engine/build/
+
+# Kernel module build litter (regenerate: cd kernel_module && make)
+# The compiled pfs_lkm.ko itself is kept -- source, Makefile, README, and
+# the built module are all meant to be inspectable; only the intermediate
+# Kbuild litter is excluded.
+kernel_module/*.o
+kernel_module/*.mod
+kernel_module/*.mod.c
+kernel_module/.*.cmd
+kernel_module/Module.symvers
+kernel_module/modules.order
+
+# Vault directories -- contain real key material (master.key) and
+# encrypted content from local testing. Never commit these.
+pfs_storage_vault/
+pfs_storage_vault2/
+pfs_storage_vault_cpp/
+my_test_vault_py/
+my_test_vault_cpp/
+demo_self_healing_workspace/
+
+# Old historical checkpoints, superseded, kept locally but not in git
+milestone_backup/
+pre_cpp_binding_checkpoint_2026-07-26/
+gearhash/Backup/
+
+# Stray accidental venv (literal "path/to/venv" dir name -- a leftover
+# from a copy-pasted command that never had its placeholder substituted,
+# not project code). Left on disk, just kept out of git.
+gearhash/path/
+
+# Editor/OS
+.DS_Store
