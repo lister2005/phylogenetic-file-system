@@ -8,13 +8,11 @@
 // at the mount root; files that cluster (2+ members, Jaccard distance
 // <= phylo.hpp's kDefaultCladeThreshold) appear grouped into a computed
 // subdirectory named after the clade's lexicographically-smallest
-// member. Built on phylo.hpp's compute_clades() (the C++ port of
-// TreeConstructor.py's own clade partitioning), over every label's
-// already-stored SIMILARITY_PROFILE fingerprint -- unlike Python, that
-// fingerprint is attached SYNCHRONOUSLY at write time here (see
-// pipeline.cpp), so there's no "still fingerprinting in the background"
-// state to special-case: a file is either grouped as of its last write,
-// or (fingerprint read failure aside) it isn't yet.
+// member. The partition (compute_clades()'s, over every label's stored
+// SIMILARITY_PROFILE fingerprint) is maintained incrementally by a
+// background CladeWorker (clade_worker.hpp), never on the path of a
+// filesystem call: lookups use its latest partition filtered against the
+// live catalog, so a just-written file shows at the root until clustered.
 //
 // Still out of scope for this pass: the daemonization lifecycle (fork/
 // setsid/PID file/status/stop) pfs_fuse.py's CLI wraps around this --
@@ -45,12 +43,15 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
+#include <utility>
 #include <vector>
 
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "clade_worker.hpp"
 #include "manifest.hpp"
 #include "phylo.hpp"
 #include "vault_session.hpp"
@@ -59,11 +60,24 @@ using namespace pfs_engine;
 
 namespace {
 
+// Streaming, memory bounded regardless of file size -- same model as
+// pfs_fuse.py's READ/WRITE MODEL. A handle reads through a
+// ManifestReader (only the chunks each read() touches are decrypted)
+// until its first write/truncate, which copies that version into a
+// scratch file on DISK; from then on reads and writes go to that file,
+// and release() commits it through VaultSession::commit_write().
+// Exactly one of reader / spill_fd is set at a time.
 struct FileHandle {
     std::string label;
-    std::vector<uint8_t> buffer;
+    std::unique_ptr<ManifestReader> reader;
+    int spill_fd = -1;
+    std::string spill_path;
     bool dirty = false;
 };
+
+// How much of a version one ManifestReader::read() pulls at a time when
+// copying it into a scratch file (copy-on-first-write).
+constexpr size_t kSpillCopyBytes = 1 << 20;
 
 struct PfsFuseState {
     std::unique_ptr<VaultSession> session;
@@ -72,14 +86,18 @@ struct PfsFuseState {
     std::map<uint64_t, FileHandle> handles;
     uint64_t next_fh = 1;
 
-    // Two-level clade presentation cache -- the C++ counterpart to
-    // pfs_fuse.py's _clade_cache. has_clade_cache=false means "needs
-    // recomputing"; invalidated on every write/delete/rename, since any
-    // of those can change clade membership. Guarded by `mutex`, same as
-    // catalog/handles -- every *_locked() helper below assumes the
-    // caller already holds it (std::mutex isn't reentrant, unlike
-    // Python's RLock, so callers must never lock twice).
-    bool has_clade_cache = false;
+    // Background clade clustering (clade_worker.hpp), started in
+    // pfs_init(). Declared after `session` so it's destroyed (and its
+    // thread joined) first.
+    std::unique_ptr<CladeWorker> clades;
+    // Filtered view of the worker's latest partition -- 2+ live members
+    // only -- rebuilt when the partition or the catalog changes. Guarded
+    // by `mutex`, same as catalog/handles -- every *_locked() helper
+    // below assumes the caller already holds it (std::mutex isn't
+    // reentrant, unlike Python's RLock, so callers must never lock twice).
+    uint64_t catalog_epoch = 0;
+    uint64_t view_version = UINT64_MAX;
+    uint64_t view_epoch = UINT64_MAX;
     std::map<std::string, std::vector<std::string>> clade_to_labels;  // 2+ members only
     std::map<std::string, std::string> label_to_clade;                // member label -> clade name
 };
@@ -88,57 +106,35 @@ PfsFuseState* state() {
     return static_cast<PfsFuseState*>(fuse_get_context()->private_data);
 }
 
-void invalidate_clade_cache_locked(PfsFuseState* st) { st->has_clade_cache = false; }
-
-// Every label's stored SIMILARITY_PROFILE fingerprint, keyed by label.
-// A manifest that fails to read is silently excluded (same as Python's
-// own "stale"/unreadable exclusion) -- not fatal to the rest of the
-// listing. Synchronous engine-wide: pipeline.cpp attaches this
-// fingerprint at write time here, unlike Python's background thread, so
-// (read failures aside) every write's fingerprint is already available
-// by the time this runs.
-std::map<std::string, TraitSet> gather_named_traits_locked(PfsFuseState* st) {
-    std::map<std::string, TraitSet> named_traits;
-    for (const auto& label : st->session->catalog.labels()) {
-        auto manifest_filename = st->session->catalog.get(label);
-        if (!manifest_filename) continue;
-        std::string manifest_path = st->session->pipeline.storage_root() + "/" + *manifest_filename;
-        try {
-            Manifest m = read_manifest_file(manifest_path, *manifest_filename, st->session->pipeline.kek());
-            if (m.metadata().similarity_fingerprint) {
-                const auto& fp = *m.metadata().similarity_fingerprint;
-                named_traits[label] = TraitSet(fp.begin(), fp.end());
-            }
-        } catch (const std::exception&) {
-            // Excluded, not fatal -- matches Python's own behavior.
-        }
-    }
-    return named_traits;
+// Reports a catalog change to the clade worker. Caller holds st->mutex.
+void label_changed_locked(PfsFuseState* st, const std::string& label) {
+    st->catalog_epoch++;
+    auto manifest_filename = st->session->catalog.get(label);
+    if (manifest_filename && st->clades) st->clades->changed(label, *manifest_filename);
 }
 
-// Recomputes (if the cache is stale) the two-level clade partition.
-// clade_to_labels only ever holds clades with 2+ members -- a "clade"
-// of one is just a file at the root, not a directory, matching
-// pfs_fuse.py's own choice (a mount where every single file gets its
-// own one-entry folder would be technically accurate but genuinely
-// annoying to browse).
+void label_removed_locked(PfsFuseState* st, const std::string& label) {
+    st->catalog_epoch++;
+    if (st->clades) st->clades->removed(label);
+}
+
+// Brings clade_to_labels/label_to_clade up to date with the worker's
+// latest partition, never waiting for a recompute in progress. Filtered
+// against the live catalog, so a label deleted or renamed since the
+// partition was computed never appears; a new label sits at the root
+// until the worker has clustered it. Only clades with 2+ members are
+// directories -- a "clade" of one is just a file at the root, matching
+// pfs_fuse.py.
 void ensure_clades_locked(PfsFuseState* st) {
-    if (st->has_clade_cache) return;
-
-    std::map<std::string, TraitSet> named_traits = gather_named_traits_locked(st);
-    std::map<std::string, std::vector<std::string>> groups;
-    if (named_traits.size() >= 2) {
-        groups = compute_clades(named_traits, kDefaultCladeThreshold);
-    }
-
-    st->clade_to_labels.clear();
-    st->label_to_clade.clear();
-    for (auto& kv : groups) {
-        if (kv.second.size() < 2) continue;
-        st->clade_to_labels[kv.first] = kv.second;
-        for (const auto& member : kv.second) st->label_to_clade[member] = kv.first;
-    }
-    st->has_clade_cache = true;
+    if (!st->clades) return;
+    auto partition = st->clades->snapshot();
+    if (partition->version == st->view_version && st->catalog_epoch == st->view_epoch) return;
+    auto view = filtered_clades(
+        *partition, [st](const std::string& label) { return st->session->catalog.get(label).has_value(); }, 2);
+    st->clade_to_labels = std::move(view.first);
+    st->label_to_clade = std::move(view.second);
+    st->view_version = partition->version;
+    st->view_epoch = st->catalog_epoch;
 }
 
 enum class ResolveKind { kRoot, kCladeDir, kFile };
@@ -201,64 +197,76 @@ bool resolve_locked(PfsFuseState* st, const std::string& path, Resolved* out) {
     return true;
 }
 
-uint64_t new_handle(PfsFuseState* st, const std::string& label, std::vector<uint8_t> buffer, bool dirty) {
+uint64_t new_handle(PfsFuseState* st, FileHandle handle) {
     std::lock_guard<std::mutex> lock(st->mutex);
     uint64_t fh = st->next_fh++;
-    st->handles[fh] = FileHandle{label, std::move(buffer), dirty};
+    st->handles.emplace(fh, std::move(handle));
     return fh;
 }
 
-std::vector<uint8_t> reconstruct_bytes(PfsFuseState* st, const std::string& manifest_path) {
-    std::string tmp_path = st->scratch_dir + "/read_XXXXXX";
-    std::vector<char> tmp_template(tmp_path.begin(), tmp_path.end());
-    tmp_template.push_back('\0');
-    int fd = mkstemp(tmp_template.data());
-    if (fd < 0) throw std::runtime_error("mkstemp failed");
-    close(fd);
-    std::string real_tmp_path(tmp_template.data());
-
-    std::vector<uint8_t> data;
-    try {
-        st->session->pipeline.reconstruct(manifest_path, real_tmp_path);
-        std::ifstream in(real_tmp_path, std::ios::binary);
-        data.assign((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
-    } catch (...) {
-        remove(real_tmp_path.c_str());
-        throw;
-    }
-    remove(real_tmp_path.c_str());
-    return data;
-}
-
-void commit(PfsFuseState* st, const std::string& label, const std::vector<uint8_t>& data) {
+// A new, empty scratch file: {fd, path}. Throws on failure.
+std::pair<int, std::string> new_spill(PfsFuseState* st) {
     std::string tmp_path = st->scratch_dir + "/write_XXXXXX";
     std::vector<char> tmp_template(tmp_path.begin(), tmp_path.end());
     tmp_template.push_back('\0');
     int fd = mkstemp(tmp_template.data());
     if (fd < 0) throw std::runtime_error("mkstemp failed");
-    std::string real_tmp_path(tmp_template.data());
-    ssize_t written = write(fd, data.data(), data.size());
-    close(fd);
-    if (written < 0 || static_cast<size_t>(written) != data.size()) {
-        remove(real_tmp_path.c_str());
-        throw std::runtime_error("failed writing scratch file");
-    }
+    return {fd, std::string(tmp_template.data())};
+}
 
+void copy_into(ManifestReader& reader, int fd) {
+    std::vector<uint8_t> piece(kSpillCopyBytes);
+    uint64_t position = 0;
+    while (position < reader.size()) {
+        size_t n = reader.read(position, piece.size(), piece.data());
+        if (pwrite(fd, piece.data(), n, static_cast<off_t>(position)) != static_cast<ssize_t>(n)) {
+            throw std::runtime_error("failed writing scratch file");
+        }
+        position += n;
+    }
+}
+
+// Copy-on-first-write: moves a handle from streaming reads to its own
+// scratch file, copying the version it opened chunk by chunk (never the
+// whole file in memory). A no-op once done. Caller holds st->mutex.
+void materialize_locked(PfsFuseState* st, FileHandle& handle) {
+    if (handle.spill_fd >= 0) return;
+    auto [fd, path] = new_spill(st);
     try {
-        std::lock_guard<std::mutex> lock(st->mutex);
-        st->session->commit_write(label, real_tmp_path);
-        // Content (and therefore this label's similarity fingerprint)
-        // just changed -- the cached clade partition may be stale.
-        // Synchronous fingerprinting means the NEXT resolve/readdir
-        // already sees the up-to-date grouping, unlike Python's
-        // background-thread version which invalidates a second time
-        // once its job finishes.
-        invalidate_clade_cache_locked(st);
+        copy_into(*handle.reader, fd);
     } catch (...) {
-        remove(real_tmp_path.c_str());
+        close(fd);
+        remove(path.c_str());
         throw;
     }
-    remove(real_tmp_path.c_str());
+    handle.reader.reset();
+    handle.spill_fd = fd;
+    handle.spill_path = path;
+}
+
+off_t handle_size(const FileHandle& handle) {
+    if (handle.spill_fd >= 0) {
+        struct stat sb{};
+        return fstat(handle.spill_fd, &sb) == 0 ? sb.st_size : 0;
+    }
+    return static_cast<off_t>(handle.reader->size());
+}
+
+// The Speciation-on-Write event: hands a complete scratch file to
+// commit_write(), the same path the CLI's 'write' uses. Takes ownership
+// of scratch_path and removes it either way.
+void commit(PfsFuseState* st, const std::string& label, const std::string& scratch_path) {
+    try {
+        std::lock_guard<std::mutex> lock(st->mutex);
+        st->session->commit_write(label, scratch_path);
+        // The fingerprint is attached synchronously by commit_write, so
+        // the worker can cluster the new content right away.
+        label_changed_locked(st, label);
+    } catch (...) {
+        remove(scratch_path.c_str());
+        throw;
+    }
+    remove(scratch_path.c_str());
 }
 
 // ---------- FUSE operation callbacks ----------
@@ -294,7 +302,7 @@ int pfs_getattr(const char* path, struct stat* stbuf, struct fuse_file_info*) {
         if (kv.second.label == label) {
             stbuf->st_mode = S_IFREG | 0644;
             stbuf->st_nlink = 1;
-            stbuf->st_size = static_cast<off_t>(kv.second.buffer.size());
+            stbuf->st_size = handle_size(kv.second);
             stbuf->st_uid = getuid();
             stbuf->st_gid = getgid();
             return 0;
@@ -381,16 +389,20 @@ int pfs_open(const char* path, struct fuse_file_info* fi) {
         manifest_path = st->session->pipeline.storage_root() + "/" + *manifest_filename;
     }
 
-    bool want_trunc = (fi->flags & O_TRUNC) != 0;
-    std::vector<uint8_t> buffer;
-    if (!want_trunc) {
-        try {
-            buffer = reconstruct_bytes(st, manifest_path);
-        } catch (const std::exception&) {
-            return -EIO;
+    FileHandle handle;
+    handle.label = label;
+    try {
+        if (fi->flags & O_TRUNC) {
+            std::tie(handle.spill_fd, handle.spill_path) = new_spill(st);
+            handle.dirty = true;
+        } else {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            handle.reader = std::make_unique<ManifestReader>(st->session->pipeline, manifest_path);
         }
+    } catch (const std::exception&) {
+        return -EIO;
     }
-    fi->fh = new_handle(st, label, std::move(buffer), want_trunc);
+    fi->fh = new_handle(st, std::move(handle));
     return 0;
 }
 
@@ -409,7 +421,15 @@ int pfs_create(const char* path, mode_t, struct fuse_file_info* fi) {
     if (rest.empty() || rest.find('/') != std::string::npos) return -EACCES;
     label = rest;
 
-    fi->fh = new_handle(state(), label, {}, true);
+    FileHandle handle;
+    handle.label = label;
+    try {
+        std::tie(handle.spill_fd, handle.spill_path) = new_spill(state());
+    } catch (const std::exception&) {
+        return -EIO;
+    }
+    handle.dirty = true;
+    fi->fh = new_handle(state(), std::move(handle));
     return 0;
 }
 
@@ -418,11 +438,17 @@ int pfs_read(const char*, char* buf, size_t size, off_t offset, struct fuse_file
     std::lock_guard<std::mutex> lock(st->mutex);
     auto it = st->handles.find(fi->fh);
     if (it == st->handles.end()) return -EBADF;
-    const auto& data = it->second.buffer;
-    if (static_cast<size_t>(offset) >= data.size()) return 0;
-    size_t n = std::min(size, data.size() - static_cast<size_t>(offset));
-    memcpy(buf, data.data() + offset, n);
-    return static_cast<int>(n);
+    FileHandle& handle = it->second;
+    if (handle.spill_fd >= 0) {
+        ssize_t n = pread(handle.spill_fd, buf, size, offset);
+        return n < 0 ? -errno : static_cast<int>(n);
+    }
+    try {
+        return static_cast<int>(handle.reader->read(static_cast<uint64_t>(offset), size,
+                                                    reinterpret_cast<uint8_t*>(buf)));
+    } catch (const std::exception&) {
+        return -EIO;
+    }
 }
 
 int pfs_write(const char*, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
@@ -430,12 +456,18 @@ int pfs_write(const char*, const char* buf, size_t size, off_t offset, struct fu
     std::lock_guard<std::mutex> lock(st->mutex);
     auto it = st->handles.find(fi->fh);
     if (it == st->handles.end()) return -EBADF;
-    auto& data = it->second.buffer;
-    size_t end = static_cast<size_t>(offset) + size;
-    if (data.size() < end) data.resize(end, 0);  // sparse-write gap, zero-filled
-    memcpy(data.data() + offset, buf, size);
-    it->second.dirty = true;
-    return static_cast<int>(size);
+    FileHandle& handle = it->second;
+    try {
+        materialize_locked(st, handle);
+    } catch (const std::exception&) {
+        return -EIO;
+    }
+    // Writing past the end leaves a hole the OS reads back as zeros --
+    // the same zero-filled sparse-write gap as before.
+    ssize_t n = pwrite(handle.spill_fd, buf, size, offset);
+    if (n < 0) return -errno;
+    handle.dirty = true;
+    return static_cast<int>(n);
 }
 
 int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
@@ -444,7 +476,12 @@ int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
         std::lock_guard<std::mutex> lock(st->mutex);
         auto it = st->handles.find(fi->fh);
         if (it != st->handles.end()) {
-            it->second.buffer.resize(static_cast<size_t>(length), 0);
+            try {
+                materialize_locked(st, it->second);
+            } catch (const std::exception&) {
+                return -EIO;
+            }
+            if (ftruncate(it->second.spill_fd, length) != 0) return -errno;
             it->second.dirty = true;
             return 0;
         }
@@ -460,14 +497,52 @@ int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
             return (length == 0) ? 0 : -ENOENT;
         }
         label = r.name;
+
+        // A path truncate while the file is open applies to every open
+        // handle on it; each commits the truncated content on release()
+        // -- committing a separate truncated version here instead would
+        // be silently overwritten by those handles' pre-truncate copies.
+        // Same rule as pfs_fuse.py's truncate().
+        bool any_open = false;
+        for (auto& kv : st->handles) {
+            if (kv.second.label != label) continue;
+            any_open = true;
+            try {
+                materialize_locked(st, kv.second);
+            } catch (const std::exception&) {
+                return -EIO;
+            }
+            if (ftruncate(kv.second.spill_fd, length) != 0) return -errno;
+            kv.second.dirty = true;
+        }
+        if (any_open) return 0;
+
         auto manifest_filename = st->session->catalog.get(label);
         if (!manifest_filename) return -ENOENT;
         manifest_path = st->session->pipeline.storage_root() + "/" + *manifest_filename;
     }
+    // No open handle covers this path (truncate called standalone) --
+    // copy into a scratch file, resize it, and commit now.
     try {
-        std::vector<uint8_t> data = reconstruct_bytes(st, manifest_path);
-        data.resize(static_cast<size_t>(length), 0);
-        commit(st, label, data);
+        std::unique_ptr<ManifestReader> reader;
+        {
+            std::lock_guard<std::mutex> lock(st->mutex);
+            reader = std::make_unique<ManifestReader>(st->session->pipeline, manifest_path);
+        }
+        auto [fd, path] = new_spill(st);
+        bool ok = true;
+        try {
+            copy_into(*reader, fd);
+            ok = ftruncate(fd, length) == 0;
+        } catch (...) {
+            ok = false;
+        }
+        close(fd);
+        if (!ok) {
+            remove(path.c_str());
+            return -EIO;
+        }
+        commit(st, label, path);
     } catch (const std::exception&) {
         return -EIO;
     }
@@ -484,9 +559,15 @@ int pfs_release(const char*, struct fuse_file_info* fi) {
         handle = std::move(it->second);
         st->handles.erase(it);
     }
-    if (handle.dirty) {
+    handle.reader.reset();
+    if (handle.spill_fd >= 0) {
+        close(handle.spill_fd);
+        if (!handle.dirty) {
+            remove(handle.spill_path.c_str());
+            return 0;
+        }
         try {
-            commit(st, handle.label, handle.buffer);
+            commit(st, handle.label, handle.spill_path);
         } catch (const std::exception&) {
             return -EIO;
         }
@@ -506,7 +587,7 @@ int pfs_unlink(const char* path) {
     // dedups to the same manifest) or by this label's own older
     // generations -- only actually free it once nothing else needs it.
     st->session->delete_label(r.name);
-    invalidate_clade_cache_locked(st);
+    label_removed_locked(st, r.name);
     return 0;
 }
 
@@ -541,7 +622,8 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
     st->session->catalog.remove(old_label);
     st->session->catalog.set(new_label, *manifest_filename);
     st->session->lineage.rename_label(old_label, new_label);
-    invalidate_clade_cache_locked(st);
+    st->catalog_epoch++;
+    if (st->clades) st->clades->renamed(old_label, new_label);
     return 0;
 }
 
@@ -561,7 +643,31 @@ void* pfs_init(struct fuse_conn_info*, struct fuse_config* cfg) {
     cfg->entry_timeout = 0;
     cfg->attr_timeout = 0;
     cfg->negative_timeout = 0;
-    return fuse_get_context()->private_data;
+
+    auto* st = static_cast<PfsFuseState*>(fuse_get_context()->private_data);
+    std::string root = st->session->pipeline.storage_root();
+    Bytes32 kek = st->session->pipeline.kek();
+    // Runs on the worker thread: reads and decrypts one manifest file,
+    // named by the event, and nothing else (VaultSession isn't thread-safe).
+    auto loader = [root, kek](const std::string&, const std::string& manifest_filename) -> std::optional<SortedTraits> {
+        Manifest m = read_manifest_file(root + "/" + manifest_filename, manifest_filename, kek);
+        if (!m.metadata().similarity_fingerprint) return std::nullopt;
+        SortedTraits traits = *m.metadata().similarity_fingerprint;
+        std::sort(traits.begin(), traits.end());
+        traits.erase(std::unique(traits.begin(), traits.end()), traits.end());
+        return traits;
+    };
+    std::vector<std::pair<std::string, std::string>> labels;
+    {
+        std::lock_guard<std::mutex> lock(st->mutex);
+        for (const auto& label : st->session->catalog.labels()) {
+            auto manifest_filename = st->session->catalog.get(label);
+            if (manifest_filename) labels.push_back({label, *manifest_filename});
+        }
+    }
+    st->clades = std::make_unique<CladeWorker>(loader);
+    st->clades->start(labels);
+    return st;
 }
 
 const struct fuse_operations kOperations = [] {

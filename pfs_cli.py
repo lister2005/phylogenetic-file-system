@@ -14,6 +14,7 @@ import os
 import sys
 import getpass
 import pickle
+import shlex
 import time
 import secrets
 import hashlib
@@ -25,11 +26,13 @@ sys.path.insert(0, os.getcwd())
 from gearhash.master_key_store import (load_vault_key, create_new_vault_key, change_passphrase,
                                         WrongPassphraseError, MASTER_KEY_FILENAME)
 from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME
+from gearhash import fingerprint as stored_fingerprint
 from gearhash.fks_index import FKSLookupEngine
 from gearhash.keyring import KEYRING_FILENAME
 from gearhash.immutability import set_immutable
 from reconstruct import reconstruct, ReconstructionError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE, MIN_RELIABLE_TRAIT_COUNT
+from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
 from TreeConstructor import TreeConstructor
 from vault_session import VaultSession, VaultUnlockError, MutationConflictError, CATALOG_FILENAME, HISTORY_FILENAME
 from lineage import LINEAGE_FILENAME
@@ -104,7 +107,116 @@ def _index_probe(storage_root, crypto) -> bool:
     return True
 
 
-class PFSShell(cmd.Cmd):
+def _split_args(arg: str):
+    """Splits a command's arguments the way a Unix shell would, so a
+    label or file path containing spaces can be given in quotes:
+        write "/home/lister/Q3 report.pdf" "q3 report"
+    Both shells parse through this, so quoting works the same on both
+    engines. Returns None (after saying why) on unbalanced quotes --
+    e.g. an unquoted apostrophe; wrap that word in double quotes."""
+    try:
+        return shlex.split(arg)
+    except ValueError as e:
+        print(f"Couldn't parse that command line ({e}) -- check your quotes.")
+        return None
+
+
+def _join_args(arg: str):
+    """For commands that take exactly one label or path: accepts it
+    quoted ('info "q3 report"') or unquoted ('info q3 report'), same
+    result either way. None on unbalanced quotes, like _split_args."""
+    parts = _split_args(arg)
+    return None if parts is None else " ".join(parts)
+
+
+# How long one successful passphrase re-entry covers later reauth-gated
+# commands in the same shell. Measured from the re-entry itself, not
+# extended by commands run inside the window.
+REAUTH_GRACE_SECONDS = 300
+
+
+def _reauth_grace_seconds() -> float:
+    """REAUTH_GRACE_SECONDS, optionally SHORTENED by the
+    PFS_REAUTH_GRACE_SECONDS environment variable (0 = ask every time,
+    the shells' pre-grace-period behavior; scripted test drivers use
+    that to keep one passphrase line per gated command). The variable
+    can never lengthen the window past the default -- it's clamped --
+    and an unparseable value is ignored."""
+    raw = os.environ.get("PFS_REAUTH_GRACE_SECONDS")
+    if raw is None:
+        return REAUTH_GRACE_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return REAUTH_GRACE_SECONDS
+    return min(max(value, 0.0), REAUTH_GRACE_SECONDS)
+
+
+# How long 'clade' waits for the background clade worker to catch up
+# before answering from its last partition instead.
+CLADE_WAIT_SECONDS = 60
+
+
+def _clade_members(worker: CladeWorker, label: str, live_labels):
+    """`label`'s clade (sorted members) from the shell's background clade
+    worker, or None if `label` has no fingerprint in it. Waits for any
+    pending recompute first -- 'clade' is an explicit command, so it
+    answers from an up-to-date partition (incremental, so normally
+    instant), not merely the last one; if the worker is still busy after
+    CLADE_WAIT_SECONDS it says so and uses the last partition."""
+    if not worker.wait_idle(CLADE_WAIT_SECONDS):
+        print(f"Note: clade clustering is still catching up after {CLADE_WAIT_SECONDS}s -- "
+              f"showing the most recent complete result.")
+    clades, label_to_clade = filtered_view(worker.snapshot(), live_labels)
+    name = label_to_clade.get(label)
+    return None if name is None else clades[name]
+
+
+class _ReauthMixin:
+    """The one re-auth policy both shells (PFSShell, CppPFSShell) share,
+    so the two engines can't drift apart on it. Being unlocked once at
+    shell startup isn't enough -- an attacker who finds an already-open,
+    unattended terminal shouldn't be able to just type a command and see
+    or change vault contents. The first gated command asks for the
+    passphrase again; after a correct answer, further gated commands
+    run without asking until the grace window (REAUTH_GRACE_SECONDS)
+    expires. A wrong answer closes the window immediately. Commands
+    passed always_ask=True (delete, panic) ask every time regardless.
+
+    Subclasses provide storage_root and _current_kek()."""
+
+    # time.monotonic() of the last correct passphrase re-entry, or None.
+    # monotonic, not wall-clock: a system clock change can't extend the window.
+    _reauth_ok_at = None
+
+    def _current_kek(self) -> bytes:
+        raise NotImplementedError
+
+    def _require_reauth(self, action_description: str = "do this", always_ask: bool = False) -> bool:
+        """Returns True if the command may proceed: either inside the
+        grace window (and not always_ask), or on an exact match of the
+        re-entered passphrase's KEK against the currently-loaded one."""
+        if not always_ask and self._reauth_ok_at is not None:
+            if time.monotonic() - self._reauth_ok_at < _reauth_grace_seconds():
+                return True
+        pw = getpass.getpass(f"Re-enter vault passphrase to {action_description}: ")
+        try:
+            kek = load_vault_key(self.storage_root, pw)
+        except WrongPassphraseError:
+            self._reauth_ok_at = None
+            print("Wrong passphrase. Cancelled.")
+            return False
+        if kek != self._current_kek():
+            # Shouldn't happen since the file didn't change underneath
+            # us, but never accept a near-match -- require exact equality.
+            self._reauth_ok_at = None
+            print("Wrong passphrase. Cancelled.")
+            return False
+        self._reauth_ok_at = time.monotonic()
+        return True
+
+
+class PFSShell(_ReauthMixin, cmd.Cmd):
     intro = (
         "\nPhylogenetic File System -- interactive shell.\n"
         "Type 'help' for the full command list, 'help <command>' for details.\n\n"
@@ -137,6 +249,27 @@ class PFSShell(cmd.Cmd):
         # from yet and must be told to run 'clade <label>' first.
         self._focus_label = None
         self._unlock_or_create()
+        # Background clade clustering (clade_worker.py) for 'clade'. Fed by
+        # diffing the catalog after every command (onecmd) plus each
+        # background fingerprint job's completion.
+        self._catalog_seen = dict(self.catalog)
+        self._clades = CladeWorker(python_session_loader(self._session),
+                                   name="cli-clade-worker").start(self._catalog_seen)
+
+    def _report_catalog_changes(self) -> None:
+        """Tells the clade worker about every label whose tip changed,
+        appeared or vanished since the last command -- catches every
+        command that touches the catalog (write, fork, graft, merge,
+        delete, rename, ...) without each having to report itself. A
+        rename shows up as a removal plus a new label, which the worker
+        handles correctly (it just reloads that one fingerprint)."""
+        current = self.catalog
+        for label in self._catalog_seen.keys() - current.keys():
+            self._clades.removed(label)
+        for label, manifest_filename in current.items():
+            if self._catalog_seen.get(label) != manifest_filename:
+                self._clades.changed(label)
+        self._catalog_seen = dict(current)
 
     # crypto/pipeline/catalog live on the shared VaultSession now (so
     # pfs_fuse.py can use the exact same unlock/catalog logic without
@@ -262,24 +395,8 @@ class PFSShell(cmd.Cmd):
     def _save_catalog(self) -> None:
         self._session.save_catalog()
 
-    def _require_reauth(self, action_description: str = "do this") -> bool:
-        """Re-verifies the vault passphrase before a sensitive operation.
-        Being unlocked once at shell startup isn't enough -- an attacker
-        who finds an already-open, unattended terminal shouldn't be able
-        to just type a command and see or change vault contents. Returns
-        True only on an exact match against the currently-loaded KEK."""
-        pw = getpass.getpass(f"Re-enter vault passphrase to {action_description}: ")
-        try:
-            kek = load_vault_key(self.storage_root, pw)
-        except WrongPassphraseError:
-            print("Wrong passphrase. Cancelled.")
-            return False
-        if kek != self.crypto.key:
-            # Shouldn't happen since the file didn't change underneath
-            # us, but never accept a near-match -- require exact equality.
-            print("Wrong passphrase. Cancelled.")
-            return False
-        return True
+    def _current_kek(self) -> bytes:
+        return self.crypto.key
 
     # ---------- core commands ----------
 
@@ -289,11 +406,20 @@ class PFSShell(cmd.Cmd):
 Example:
   write /home/lister/Documents/report.pdf
   write /home/lister/Documents/report.pdf my_report
+  write "/home/lister/Documents/Q3 report.pdf" "q3 report"
 (if you skip [label], the file's own basename is used as the label;
 a relative file_path resolves against 'navigate's directory, if set)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if not parts:
             print("Usage: write <file_path> [label]")
+            return
+        if len(parts) > 2:
+            # Refuse rather than silently dropping the extra words (an
+            # unquoted label with spaces used to be cut to its first word).
+            print('Usage: write <file_path> [label]  (put a path or label containing spaces '
+                  'in quotes: write "my file.txt" "my label")')
             return
         file_path = self._resolve_path(parts[0])
         label = parts[1] if len(parts) > 1 else os.path.basename(parts[0])
@@ -340,7 +466,9 @@ already has later descendants (i.e. it's not the tip), this creates a
 second, genuinely divergent branch -- see 'lineage <label>' afterward
 to see both heads. Use 'merge' later to reconcile two branches back
 together, or just keep both indefinitely; nothing forces a merge.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: fork <label> <generation> <file_path>")
             return
@@ -390,6 +518,7 @@ together, or just keep both indefinitely; nothing forces a merge.)"""
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(file_path)
                 self.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
+                self._clades.changed(label)  # before the message, so 'clade' after it sees this
                 print(f"\n[background] fingerprint ready for '{label}' -- 'tree' can now include it.\n{self.prompt}", end="", flush=True)
             except Exception as e:
                 print(f"\n[background] fingerprinting '{label}' failed: {type(e).__name__}: {e} "
@@ -413,7 +542,9 @@ Example:
   read my_report /home/lister/Desktop/report_restored.pdf
 (use 'list' first to see which labels exist; a relative output_path
 resolves against 'navigate's directory, if set)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: read <label> <output_path>")
             return
@@ -453,7 +584,9 @@ default catalog order -- the design doc's "High-to-Low Volumetric Grid.")"""
         if not self.catalog:
             print("(vault is empty)")
             return
-        tokens = arg.split()
+        tokens = _split_args(arg)
+        if tokens is None:
+            return
         sort_by_size = any(t.lower() == "size" for t in tokens)
         type_filter = next((t.lower() for t in tokens if t.lower() != "size"), "")
 
@@ -473,14 +606,19 @@ default catalog order -- the design doc's "High-to-Low Volumetric Grid.")"""
         if sort_by_size:
             rows.sort(key=lambda row: row[2]["original_size"], reverse=True)
 
-        print(f"{'Label':<25}{'Type':<24}{'Size':>12}  {'Chunks':>8}  {'Dedup':>7}")
+        # Columns grow to fit the longest label/type (never narrower than
+        # the original fixed widths), so long values can't run into the
+        # next column.
+        label_w = max([25] + [len(label) + 2 for label in [r[0] for r in rows] + missing])
+        type_w = max([24] + [len(r[1]) + 2 for r in rows])
+        print(f"{'Label':<{label_w}}{'Type':<{type_w}}{'Size':>12}  {'Chunks':>8}  {'Dedup':>7}")
         for label, phenotype_name, meta in rows:
             total = meta["total_blocks"] or 1
             dedup_pct = 100 * meta["duplicate_chunks_found"] / total
-            print(f"{label:<25}{phenotype_name:<24}{meta['original_size']:>12,}  "
+            print(f"{label:<{label_w}}{phenotype_name:<{type_w}}{meta['original_size']:>12,}  "
                   f"{meta['total_blocks']:>8}  {dedup_pct:>6.1f}%")
         for label in missing:
-            print(f"{label:<25}{'(missing manifest!)':>12}")
+            print(f"{label:<{label_w}}(missing manifest!)")
         if type_filter and not rows:
             print(f"(no files matched type filter '{type_filter}')")
 
@@ -503,7 +641,9 @@ covering the whole batch -- each is deleted independently, so one
 missing or refused label doesn't stop the rest. 'force' (if present,
 anywhere in the argument list) applies to every label in the batch;
 add it to override the 'protected' tag.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if not parts:
             print("Usage: delete <label> [<label2> ...] [force]")
             return
@@ -521,7 +661,7 @@ add it to override the 'protected' tag.)"""
             return
 
         noun = f"'{labels[0]}'" if len(labels) == 1 else f"{len(labels)} labels"
-        if not self._require_reauth(f"delete {noun}"):
+        if not self._require_reauth(f"delete {noun}", always_ask=True):
             return
 
         failures = []
@@ -905,7 +1045,7 @@ as something that fires on its own."""
         print("by you. This asks twice not to be annoying, but because there is genuinely")
         print("no undo past this point.\n")
 
-        if not self._require_reauth("permanently destroy this vault"):
+        if not self._require_reauth("permanently destroy this vault", always_ask=True):
             return
 
         confirm = input("Type exactly DESTROY VAULT to proceed (anything else cancels): ")
@@ -986,7 +1126,7 @@ as something that fires on its own."""
             if not os.path.exists(manifest_path):
                 continue
             meta = self._read_manifest_metadata(manifest_path)
-            fingerprint = meta.get("similarity_fingerprint")
+            fingerprint = stored_fingerprint.unpack(meta.get("similarity_fingerprint"))
             if fingerprint is None:
                 missing.append(label)
             else:
@@ -1052,7 +1192,7 @@ Example:
 -- just reported as a ranked list against ONE chosen file instead of a
 whole tree. 0.0 = identical content, 1.0 = nothing in common; this is
 the design doc's "Proximity Matrix" sort)"""
-        label = arg.strip()
+        label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1101,7 +1241,7 @@ structure of its own, just membership, so this never invents a fake
 "clade root". Sets this shell's 'current focus' to <label> itself, so
 'checkout @tip'/'ancestor N' can be used afterward without repeating
 the label.)"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: clade <label>")
             return
@@ -1111,19 +1251,17 @@ the label.)"""
         if not self._require_reauth(f"find '{label}'s clade"):
             return
 
-        named_traits = self._gather_named_traits("this clade lookup")
-        if label not in named_traits:
+        members = _clade_members(self._clades, label, self.catalog)
+        if members is None:
             print(f"'{label}' has no stored fingerprint yet -- it may still be fingerprinting in "
                   f"the background, or it predates this feature. Re-run 'write' on it to fix that.")
             return
 
-        analyzer = PhylogeneticAnalyzer(SIMILARITY_PROFILE)
-        tc = TreeConstructor(analyzer)
-        clades = tc.compute_clades(named_traits)
-        members = sorted(next(m for m in clades.values() if label in m))
-
-        unreliable = {m: len(named_traits[m]) for m in members
-                      if not analyzer.trait_set_is_reliable(named_traits[m])}
+        trait_counts = {}
+        for m in members:
+            meta = self._read_manifest_metadata(os.path.join(self.storage_root, self.catalog[m]))
+            trait_counts[m] = stored_fingerprint.count(meta.get("similarity_fingerprint"))
+        unreliable = {m: n for m, n in trait_counts.items() if n < MIN_RELIABLE_TRAIT_COUNT}
         if unreliable:
             print(_reliability_warning(unreliable))
 
@@ -1156,7 +1294,7 @@ the label.)"""
 
 Example:
   info my_report"""
-        label = arg.strip()
+        label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1179,7 +1317,7 @@ Example:
         print(f"  deduped at write time: {meta.get('duplicate_chunks_found')}")
         print(f"Content SHA-256:         {meta.get('content_sha256')}")
         print(f"Similarity fingerprint:  "
-              f"{'stored (' + str(len(fp)) + ' traits)' if fp is not None else 'not stored (predates this feature)'}")
+              f"{'stored (' + str(stored_fingerprint.count(fp)) + ' traits)' if fp is not None else 'not stored (predates this feature)'}")
         tags = self._session.lineage.get_tags(label)
         print(f"Epigenetic tags:         "
               f"{', '.join(f'{k}={v}' for k, v in tags.items()) if tags else '(none)'}")
@@ -1206,7 +1344,7 @@ Example:
 (each generation is a real, reconstructible past version of THIS label
 -- distinct from 'tree', which groups DIFFERENT files by similarity,
 not one file's own history; use 'checkout' to pull an old generation)"""
-        label = arg.strip()
+        label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1281,7 +1419,12 @@ mutation" the design doc describes: 'protected' blocks delete/prune
 unless forced, 'no_graft_source' blocks this label from being used in
 'graft'. Any other key is stored and inherited the same way but is
 purely informational.)"""
-        parts = arg.split(maxsplit=2)
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        if len(parts) > 3:
+            # An unquoted multi-word value still works, as before quoting existed.
+            parts = parts[:2] + [" ".join(parts[2:])]
         if len(parts) != 3:
             print("Usage: tag <label> <key> <value>")
             return
@@ -1308,7 +1451,9 @@ Example:
 won't inherit it either. Does NOT retroactively change any past
 generation's own tag record -- see 'prune's docstring for what that
 means for a specific already-tagged past generation.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: untag <label> <key>")
             return
@@ -1344,7 +1489,9 @@ manifest is still shared with something else in the vault -- another
 label with identical content, or a graft that used it as a lateral
 parent -- nothing is actually freed yet; run 'vacuum' afterward
 regardless to reclaim whatever became reclaimable.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) not in (2, 3):
             print("Usage: prune <label> <generation> [force]")
             return
@@ -1390,7 +1537,9 @@ earlier writes, this typically introduces very few genuinely new
 chunks -- watch the 'new' count in the output, it's a direct
 demonstration of the shared chunk pool across what were, until now,
 two completely unrelated lineages.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: graft <label_a> <label_b> <new_label>")
             return
@@ -1433,7 +1582,9 @@ chunk changed DIFFERENTLY by both branches is a genuine Mutation
 Conflict -- this refuses to guess a winner and commits nothing. The
 design doc's EvolutionaryDivergenceException, made real: no data is
 silently discarded either way.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: merge <label> <generation_a> <generation_b>")
             return
@@ -1482,7 +1633,9 @@ Example:
 label's current head generation" -- the same generation plain 'read'
 already gives you -- instead of a specific number; the output path
 resolves against 'navigate's directory, if set)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) == 2:
             gen_str, output_path = parts
             if gen_str != "@tip":
@@ -1551,7 +1704,9 @@ branches off of. If you omit output_path, it's written as
 '<label>_ancestor_<N>_gen<G>.<ext-less>' next to 'navigate's directory
 (or this process's own working directory if unset), and the real path
 used is always printed.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) not in (1, 2):
             print("Usage: ancestor <N> [output_path]")
             return
@@ -1620,7 +1775,7 @@ used is always printed.)"""
 
 Example:
   verify my_report"""
-        label = arg.strip()
+        label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1646,7 +1801,9 @@ Example:
   rename my_report q3_report
 (the label's full recorded history moves with it -- 'lineage q3_report'
 shows what used to be under 'lineage my_report')"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: rename <old_label> <new_label>")
             return
@@ -1798,7 +1955,9 @@ Only affects how relative paths you type into 'write' and 'read' get
 resolved -- absolute paths and '~' always pass through untouched. Never
 touches the vault's own storage_root. Per-session only, not saved
 between runs (unlike 'history', this is meant to be reset each time)."""
-        target = arg.strip()
+        target = _join_args(arg)
+        if target is None:
+            return
         if not target:
             if self._nav_dir:
                 print(f"Current navigate directory: {self._nav_dir}")
@@ -1849,6 +2008,7 @@ Example:
             print(f"Waiting for {len(pending)} background fingerprint job(s) to finish: {labels} ...")
             for _label, thread in pending:
                 thread.join()
+        self._clades.stop(timeout=10)
         # Release the vault lock (vault_lock.py) explicitly here rather
         # than leaving it to __del__/process exit -- this is the
         # NORMAL clean-close path (as opposed to a crash), so it should
@@ -1872,13 +2032,18 @@ Example:
             result = super().onecmd(line)
         except Exception as e:
             print(f"Error: {type(e).__name__}: {e}")
+            self._report_catalog_changes()
             return False
+        if result:
+            self._clades.stop(timeout=10)  # exiting (exit/panic)
+            return result
+        self._report_catalog_changes()
         if stripped:
             self._record_history(stripped)
         return result
 
 
-class CppPFSShell(cmd.Cmd):
+class CppPFSShell(_ReauthMixin, cmd.Cmd):
     """Interactive shell for the compiled C++ storage engine
     (cpp_engine/), reached via 'python3 pfs_cli.py --engine cpp'.
 
@@ -1931,6 +2096,18 @@ class CppPFSShell(cmd.Cmd):
         except PfsEngineError as e:
             print(f"Couldn't open the C++ vault: {e}")
             sys.exit(1)
+        # Kept for _require_reauth's exact-match check, the same role
+        # self.crypto.key plays in PFSShell.
+        self._kek = kek
+        # Background clade clustering (clade_worker.py) for 'clade'. Each
+        # command that changes a label's tip reports it (write, fork,
+        # graft, merge, delete, rename); 'test'/'attack' only touch
+        # throwaway labels they delete again, so they don't.
+        self._clades = CladeWorker(cpp_session_loader(self._session),
+                                   name="cli-cpp-clade-worker").start(self._session.list_labels())
+
+    def _current_kek(self) -> bytes:
+        return self._kek
 
     def _unlock_or_create(self) -> bytes:
         key_path = os.path.join(self.storage_root, MASTER_KEY_FILENAME)
@@ -1967,16 +2144,27 @@ class CppPFSShell(cmd.Cmd):
 Example:
   write /home/lister/Documents/report.pdf
   write /home/lister/Documents/report.pdf my_report
+  write "/home/lister/Documents/Q3 report.pdf" "q3 report"
 (if you skip [label], the file's own basename is used as the label; a
 relative file_path resolves against 'navigate's directory, if set)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if not parts:
             print("Usage: write <file_path> [label]")
+            return
+        if len(parts) > 2:
+            # Refuse rather than silently dropping the extra words (an
+            # unquoted label with spaces used to be cut to its first word).
+            print('Usage: write <file_path> [label]  (put a path or label containing spaces '
+                  'in quotes: write "my file.txt" "my label")')
             return
         file_path = self._resolve_path(parts[0])
         label = parts[1] if len(parts) > 1 else os.path.basename(parts[0])
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
+            return
+        if not self._require_reauth("store a file"):
             return
         try:
             start = time.perf_counter()
@@ -1985,6 +2173,7 @@ relative file_path resolves against 'navigate's directory, if set)"""
         except PfsEngineError as e:
             print(f"Write failed: {e}")
             return
+        self._clades.changed(label)
         info = self._session.get_manifest_info(label)
         total = info["total_blocks"] or 1
         dedup_pct = 100 * info["duplicate_chunks_found"] / total
@@ -1999,12 +2188,16 @@ relative file_path resolves against 'navigate's directory, if set)"""
 Example:
   read my_report /home/lister/Desktop/report_restored.pdf
 (a relative output_path resolves against 'navigate's directory, if set)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: read <label> <output_path>")
             return
         label, output_path = parts
         output_path = self._resolve_path(output_path)
+        if not self._require_reauth(f"read '{label}'"):
+            return
         try:
             self._session.reconstruct_label(label, output_path)
         except PfsEngineError as e:
@@ -2023,17 +2216,22 @@ manifest is only actually freed once nothing else in the vault --
 another label sharing identical content, or a graft that used it as a
 lateral parent -- still references it. Refused if the current tip is
 tagged 'protected' unless you add 'force'.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) not in (1, 2):
             print("Usage: delete <label> [force]")
             return
         label = parts[0]
         force = len(parts) == 2 and parts[1].lower() == "force"
+        if not self._require_reauth(f"delete '{label}'", always_ask=True):
+            return
         try:
             report = self._session.delete_label(label, force=force)
         except PfsEngineError as e:
             print(f"Delete failed: {e}")
             return
+        self._clades.removed(label)
         if report["manifests_kept_shared"]:
             print(f"Deleted '{label}'. {report['manifests_freed']} manifest(s) freed; "
                   f"{report['manifests_kept_shared']} kept because something else in the vault "
@@ -2050,7 +2248,9 @@ Example:
 (writes file_path's content as a NEW, divergent version descending from
 generation N of <label> -- NOT from the current tip. Use 'lineage' to
 see the resulting branch heads, 'merge' to reconcile them later.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: fork <label> <generation> <file_path>")
             return
@@ -2064,11 +2264,14 @@ see the resulting branch heads, 'merge' to reconcile them later.)"""
         if not os.path.exists(file_path):
             print(f"File not found: {file_path}")
             return
+        if not self._require_reauth(f"fork '{label}' from generation {generation}"):
+            return
         try:
             manifest = self._session.fork_write(label, file_path, generation)
         except PfsEngineError as e:
             print(f"Fork failed: {e}")
             return
+        self._clades.changed(label)
         heads = self._session.get_heads(label)
         print(f"Forked '{label}' from generation {generation} -> {manifest}")
         print(f"  '{label}' now has {len(heads)} branch head(s): "
@@ -2084,16 +2287,21 @@ Example:
 (concatenates label_a's current content + label_b's current content
 into a new label, descending from BOTH lineages at once. Refused if
 either source is tagged 'no_graft_source'.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: graft <label_a> <label_b> <new_label>")
             return
         label_a, label_b, new_label = parts
+        if not self._require_reauth(f"graft '{label_a}' and '{label_b}' into '{new_label}'"):
+            return
         try:
             manifest = self._session.graft(label_a, label_b, new_label)
         except PfsEngineError as e:
             print(f"Graft failed: {e}")
             return
+        self._clades.changed(new_label)
         info = self._session.get_manifest_info(new_label)
         print(f"Grafted '{label_a}' + '{label_b}' -> '{new_label}' -> {manifest}")
         print(f"  {info['total_blocks']} chunks ({info['new_chunks_written']} genuinely new -- the "
@@ -2108,7 +2316,9 @@ Example:
 ancestor: a chunk changed by only one branch -- or identically by both
 -- merges automatically; a chunk changed DIFFERENTLY by both is a
 genuine Mutation Conflict -- refuses to guess, commits nothing.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 3:
             print("Usage: merge <label> <generation_a> <generation_b>")
             return
@@ -2118,11 +2328,14 @@ genuine Mutation Conflict -- refuses to guess, commits nothing.)"""
         except ValueError:
             print("Usage: merge <label> <generation_a> <generation_b>  (generations must be integers)")
             return
+        if not self._require_reauth(f"merge '{label}' generations {generation_a} and {generation_b}"):
+            return
         try:
             manifest = self._session.merge_branches(label, generation_a, generation_b)
         except PfsEngineError as e:
             print(f"MUTATION CONFLICT or merge failure -- nothing was committed.\n  {e}")
             return
+        self._clades.changed(label)
         print(f"Merged '{label}' generations {generation_a} + {generation_b} -> {manifest}")
 
     def do_checkout(self, arg):
@@ -2136,7 +2349,9 @@ Example:
 ('@tip' means "this label's current head generation" -- the same
 generation plain 'read' already gives you -- instead of a specific
 number)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) == 2:
             gen_str, output_path = parts
             if gen_str != "@tip":
@@ -2172,6 +2387,8 @@ number)"""
                 print("Usage: checkout <label> <generation> <output_path>  "
                       "(generation must be an integer or '@tip')")
                 return
+        if not self._require_reauth(f"check out '{label}' generation {generation}"):
+            return
         try:
             self._session.checkout(label, generation, output_path)
         except PfsEngineError as e:
@@ -2195,7 +2412,9 @@ branches off of. If you omit output_path, it's written as
 '<label>_ancestor_<N>_gen<G>.bin' next to 'navigate's directory (or
 this process's own working directory if unset), and the real path used
 is always printed.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) not in (1, 2):
             print("Usage: ancestor <N> [output_path]")
             return
@@ -2245,6 +2464,9 @@ is always printed.)"""
             base_dir = self._nav_dir or os.getcwd()
             output_path = os.path.join(base_dir, f"{label}_ancestor_{n}_gen{node.generation_index}.bin")
 
+        if not self._require_reauth(f"check out '{label}' generation {node.generation_index} "
+                                    f"({n} generation(s) back from tip)"):
+            return
         try:
             self._session.checkout(label, node.generation_index, output_path)
         except PfsEngineError as e:
@@ -2258,16 +2480,21 @@ is always printed.)"""
 
 Example:
   rename my_report q3_report"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: rename <old_label> <new_label>")
             return
         old_label, new_label = parts
+        if not self._require_reauth(f"rename '{old_label}'"):
+            return
         try:
             self._session.rename_label(old_label, new_label)
         except PfsEngineError as e:
             print(f"Rename failed: {e}")
             return
+        self._clades.renamed(old_label, new_label)
         print(f"Renamed '{old_label}' -> '{new_label}'")
 
     @staticmethod
@@ -2289,12 +2516,19 @@ Example:
 (true/false/yes/no/1/0 become real booleans; anything else stays text.
 'protected' blocks delete/prune unless forced, 'no_graft_source' blocks
 this label from being used in 'graft'.)"""
-        parts = arg.split(maxsplit=2)
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        if len(parts) > 3:
+            # An unquoted multi-word value still works, as before quoting existed.
+            parts = parts[:2] + [" ".join(parts[2:])]
         if len(parts) != 3:
             print("Usage: tag <label> <key> <value>")
             return
         label, key, raw_value = parts
         value = self._parse_tag_value(raw_value)
+        if not self._require_reauth(f"tag '{label}'"):
+            return
         try:
             self._session.set_tag(label, key, value)
         except PfsEngineError as e:
@@ -2307,11 +2541,15 @@ this label from being used in 'graft'.)"""
 
 Example:
   untag legal_contract protected"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) != 2:
             print("Usage: untag <label> <key>")
             return
         label, key = parts
+        if not self._require_reauth(f"untag '{label}'"):
+            return
         try:
             removed = self._session.remove_tag(label, key)
         except PfsEngineError as e:
@@ -2328,7 +2566,9 @@ Example:
 (keeps the label and all its OTHER generations intact. Cannot prune the
 current tip -- use 'delete' for that. Refused if this exact generation
 is tagged 'protected' unless you add 'force'.)"""
-        parts = arg.split()
+        parts = _split_args(arg)
+        if parts is None:
+            return
         if len(parts) not in (2, 3):
             print("Usage: prune <label> <generation> [force]")
             return
@@ -2338,6 +2578,8 @@ is tagged 'protected' unless you add 'force'.)"""
             generation = int(gen_str)
         except ValueError:
             print("Usage: prune <label> <generation> [force]  (generation must be an integer)")
+            return
+        if not self._require_reauth(f"prune generation {generation} of '{label}'"):
             return
         try:
             freed = self._session.prune_generation(label, generation, force=force)
@@ -2355,9 +2597,11 @@ is tagged 'protected' unless you add 'force'.)"""
 
 Example:
   lineage my_report"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: lineage <label>")
+            return
+        if not self._require_reauth(f"view lineage for '{label}'"):
             return
         try:
             history = self._session.get_history(label)
@@ -2389,6 +2633,8 @@ Example:
 Example:
   vacuum
 (safe to run any time; does nothing if nothing was deleted or pruned)"""
+        if not self._require_reauth("vacuum the vault"):
+            return
         report = self._session.vacuum()
         print(f"Before:    {report['old_size']:,} bytes")
         print(f"After:     {report['new_size']:,} bytes")
@@ -2415,6 +2661,8 @@ Example:
 (a chunk that fails its integrity check but has an Ancestral Hardening
 mirror -- shared by 3+ manifests -- is repaired in place. A chunk that
 fails with no working mirror is reported, not silently ignored.)"""
+        if not self._require_reauth("scan the vault for corruption"):
+            return
         print("Scanning every live chunk (this reads and verifies your entire vault -- may take a while)...")
         report = self._session.fsck()
         print(f"Scanned:  {report['scanned']}")
@@ -2432,6 +2680,8 @@ fails with no working mirror is reported, not silently ignored.)"""
 
 Example:
   rotate"""
+        if not self._require_reauth("rotate keys"):
+            return
         new_epoch = self._session.rotate_key()
         print(f"Rotated to epoch {new_epoch}. New writes use the new key; existing files are unaffected.")
 
@@ -2441,6 +2691,8 @@ Example:
 Example:
   stats
 (takes no arguments)"""
+        if not self._require_reauth("view vault statistics"):
+            return
         stats = self._session.get_stats()
         print(f"Container size:        {stats['container_size']:,} bytes")
         print(f"Unique chunks stored:  {stats['total_chunks']} ({stats['dead_chunks']} reclaimable via 'vacuum')")
@@ -2463,6 +2715,8 @@ manifest/keyring formats -- 'wrong key is rejected' is actually STRONGER
 here: a second session opened under the wrong key fails immediately, since
 the keyring itself can't be decrypted, rather than only failing later on a
 specific read.)"""
+        if not self._require_reauth("run an attack test"):
+            return
         choice = input("Run 'virtual attack' or 'real attack'? ").strip().lower()
         if choice in ("real", "real attack", "realattack"):
             self._attack_real()
@@ -2608,6 +2862,8 @@ vacuum, fsck -- against a throwaway label, not just checks that files
 exist. Functional check, not adversarial; see 'attack' for deliberate
 corruption tests. Same check names as the Python engine's 'test' where
 the operation is genuinely equivalent.)"""
+        if not self._require_reauth("run a self test"):
+            return
         print("=== PFS Power-On Self Test (C++ engine) ===\n")
         results = []
         label = "__post_test__"
@@ -2702,7 +2958,9 @@ Example:
   navigate /home/lister/Documents/test_batch
   navigate
   navigate -"""
-        target = arg.strip()
+        target = _join_args(arg)
+        if target is None:
+            return
         if not target:
             if self._nav_dir:
                 print(f"Current navigate directory: {self._nav_dir}")
@@ -2726,6 +2984,8 @@ Example:
 
     def do_list(self, arg):
         """list  -- show all labels currently stored (C++ engine)"""
+        if not self._require_reauth("view the vault contents"):
+            return
         labels = sorted(self._session.list_labels())
         if not labels:
             print("(empty vault)")
@@ -2738,9 +2998,11 @@ Example:
 
 Example:
   history my_report"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: history <label>")
+            return
+        if not self._require_reauth(f"view history for '{label}'"):
             return
         try:
             history = self._session.get_history(label)
@@ -2761,9 +3023,11 @@ Example:
 
 Example:
   info my_report"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: info <label>")
+            return
+        if not self._require_reauth(f"view details for '{label}'"):
             return
         try:
             info = self._session.get_manifest_info(label)
@@ -2792,6 +3056,8 @@ time, so it never re-reads or re-decrypts your original files)"""
         if algorithm not in ("upgma", "nj"):
             print("Usage: tree [upgma|nj]")
             return
+        if not self._require_reauth("view the clade tree"):
+            return
         try:
             rendering = self._session.build_tree(algorithm)
         except PfsEngineError as e:
@@ -2818,9 +3084,11 @@ time, so it never re-reads or re-decrypts your original files)"""
 Example:
   similar my_report
 (0.0 = identical content, 1.0 = nothing in common)"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: similar <label>")
+            return
+        if not self._require_reauth(f"find files similar to '{label}'"):
             return
         try:
             ranked = self._session.similar(label)
@@ -2858,16 +3126,20 @@ structure of its own, just membership, so this never invents a fake
 "clade root". Sets this shell's 'current focus' to <label> itself, so
 'checkout @tip'/'ancestor N' can be used afterward without repeating
 the label.)"""
-        label = arg.strip()
+        label = _join_args(arg)
         if not label:
             print("Usage: clade <label>")
             return
-        try:
-            _representative, members = self._session.compute_clades(label)
-        except PfsEngineError as e:
-            print(f"Failed: {e}")
+        if not self._require_reauth(f"find '{label}'s clade"):
             return
-        members = sorted(members)
+        live = set(self._session.list_labels())
+        if label not in live:
+            print(f"Failed: no such label: '{label}'")
+            return
+        members = _clade_members(self._clades, label, live)
+        if members is None:
+            print(f"Failed: '{label}' has no stored similarity fingerprint")
+            return
 
         try:
             all_unreliable = self._session.unreliable_fingerprint_labels()
@@ -2911,6 +3183,7 @@ the label.)"""
 
     def do_exit(self, arg):
         "exit  -- close the shell"
+        self._clades.stop(timeout=10)
         self._session.close()
         print("Goodbye.")
         return True
@@ -2939,8 +3212,10 @@ if __name__ == "__main__":
                          help="vault directory (default: ./pfs_storage_vault, or "
                               "./pfs_storage_vault_cpp with --engine cpp)")
     parser.add_argument("--engine", choices=["python", "cpp"], default="python",
-                         help="'python' (default, full feature set) or 'cpp' (experimental, "
-                              "compiled engine, write/read/delete/list/history/info only)")
+                         help="'python' (default) or 'cpp' (the compiled engine: the same shell "
+                              "commands except 'panic' and 'verify', and 'list' without type/size "
+                              "filters -- see manual.txt PART 9.10). A vault belongs to the engine "
+                              "that created it; the other engine refuses to open it.")
     args = parser.parse_args()
 
     if args.engine == "cpp":

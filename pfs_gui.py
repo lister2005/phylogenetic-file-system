@@ -1290,6 +1290,8 @@ class VaultGraphWindow(QMainWindow):
     def __init__(self, engine):
         super().__init__()
         self.engine = engine
+        self.engine.start_clade_worker()
+        self._clade_version_drawn = None
         self.setWindowTitle("Phylogenetic File System")
         self.resize(1440, 940)
         self.setAcceptDrops(True)  # defensive: drops are handled by self.view, but some
@@ -1353,6 +1355,12 @@ class VaultGraphWindow(QMainWindow):
         self._edit_poll_timer = QTimer(self)
         self._edit_poll_timer.timeout.connect(self._poll_edited_files)
         self._edit_poll_timer.start(1500)
+        # Redraw the clade outlines when the background clade worker
+        # publishes a newer partition (e.g. a recompute that finished
+        # after the last redraw).
+        self._clade_poll_timer = QTimer(self)
+        self._clade_poll_timer.timeout.connect(self._poll_clade_updates)
+        self._clade_poll_timer.start(700)
 
         self._rebuild()
         self._maybe_show_tour()
@@ -2345,12 +2353,12 @@ class VaultGraphWindow(QMainWindow):
         self._clear_clade_blobs()
         if self._mode != "web":
             return
-        _labels, _meta, fingerprints, _histories = self._gather()
+        # Short wait: answers from a fresh partition after a change made a
+        # moment ago, without ever stalling the UI on a long recompute
+        # (_poll_clade_updates redraws once that lands).
+        clades, _label_to_clade, self._clade_version_drawn = self.engine.clades(wait=0.5)
         clade_cards = []
-        if len(fingerprints) >= 2:
-            analyzer = PhylogeneticAnalyzer()
-            tc = TreeConstructor(analyzer)
-            clades = tc.compute_clades(fingerprints, threshold=TreeConstructor.DEFAULT_CLADE_THRESHOLD)
+        if clades:
             idx = 0
             for clade_name, members in clades.items():
                 if len(members) < 2:
@@ -2420,6 +2428,16 @@ class VaultGraphWindow(QMainWindow):
                                  "note": "Need 2+ files sharing 80%+ content -- every file still "
                                          "has its own faint individual outline."})
         self._render_cards("Clades", clade_cards)
+
+    def closeEvent(self, event):
+        self._clade_poll_timer.stop()
+        super().closeEvent(event)
+
+    def _poll_clade_updates(self):
+        if self._mode != "web" or not self.clade_action.isChecked():
+            return
+        if self.engine.clade_version() != self._clade_version_drawn:
+            self._draw_clade_blobs()
 
     def _on_clade_toggle(self, checked: bool):
         if checked:
@@ -3618,9 +3636,10 @@ def main():
     parser = argparse.ArgumentParser(description="PFS Cosmic Web GUI")
     parser.add_argument("storage_root", help="vault directory")
     parser.add_argument("--engine", choices=["python", "cpp"], default="python",
-                         help="storage backend -- 'python' (default, full feature set) or 'cpp' "
-                              "(compiled engine; 'tree'/'similar' clade views work, phenotype "
-                              "detection ported, but see cpp_port_plan.txt for the remaining gaps)")
+                         help="storage backend -- 'python' (default) or 'cpp' (the compiled "
+                              "engine, same GUI feature set -- see manual.txt PART 10). A vault "
+                              "belongs to the engine that created it; the other engine refuses "
+                              "to open it.")
     args = parser.parse_args()
 
     app = QApplication(sys.argv)
@@ -3633,7 +3652,9 @@ def main():
 
     window = VaultGraphWindow(engine)
     window.show()
-    sys.exit(app.exec())
+    rc = app.exec()
+    engine.stop_clade_worker()
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

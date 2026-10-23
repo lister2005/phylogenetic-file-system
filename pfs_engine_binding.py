@@ -22,7 +22,9 @@ warning, added 2026-08-21). Still Python-only: phenotype detection --
 see cpp_port_plan.txt.
 """
 import ctypes
+import functools
 import os
+import threading
 from typing import Optional
 
 _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -257,6 +259,42 @@ def _generation_info_from_c(info) -> GenerationInfo:
     )
 
 
+def _serialize_calls(cls):
+    """Runs every method and property of `cls` under its instance's own
+    reentrant lock (self._call_lock). The C++ VaultSession behind a
+    handle isn't thread-safe, and the clade worker (clade_worker.py)
+    loads fingerprints from its own thread while the front end keeps
+    using the same session -- so calls into one session must take turns.
+    Reentrant because some methods call others. Error text needs no
+    lock: pfs_last_error() is thread_local in c_api.cpp.
+
+    Also refuses any call on a closed session with PfsEngineError --
+    passing the C API a NULL handle would crash the whole process."""
+    lifecycle = {"close", "__enter__", "__exit__", "__del__"}
+
+    def locked(fn):
+        @functools.wraps(fn)
+        def wrapper(self, *args, **kwargs):
+            lock = getattr(self, "_call_lock", None)  # absent if __init__ failed early
+            if lock is None:
+                return fn(self, *args, **kwargs)
+            with lock:
+                if fn.__name__ not in lifecycle and getattr(self, "_handle", None) is None:
+                    raise PfsEngineError("this vault session is closed")
+                return fn(self, *args, **kwargs)
+        return wrapper
+
+    for name, member in list(vars(cls).items()):
+        if name == "__init__":
+            continue
+        if isinstance(member, property):
+            setattr(cls, name, property(locked(member.fget)))
+        elif callable(member):
+            setattr(cls, name, locked(member))
+    return cls
+
+
+@_serialize_calls
 class CppVaultSession:
     """The C++-engine-backed counterpart to vault_session.py's
     VaultSession -- same operations, compiled backend. `kek` is the
@@ -266,6 +304,7 @@ class CppVaultSession:
     def __init__(self, storage_root: str, kek: bytes):
         if len(kek) != 32:
             raise ValueError(f"kek must be exactly 32 bytes, got {len(kek)}")
+        self._call_lock = threading.RLock()  # see _serialize_calls
         os.makedirs(storage_root, exist_ok=True)
         kek_buf = (ctypes.c_uint8 * 32).from_buffer_copy(kek)
         handle = _lib.pfs_open(storage_root.encode("utf-8"), kek_buf)

@@ -4,6 +4,7 @@ import hashlib
 import pickle
 from typing import Any, Optional
 from gearhash.fks_index import FKSIndexBuilder, FKSLookupEngine
+from gearhash import fingerprint as stored_fingerprint
 from gearhash.hasher import Hasher
 from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME, _lookup_key
 from gearhash.keyring import KeyRing, KEYRING_FILENAME
@@ -366,7 +367,8 @@ class StoragePipeline:
                 # later WITHOUT re-reading or re-chunking the original
                 # file. Entirely optional and decoupled from the storage
                 # chunking above; None if the caller didn't ask for it.
-                "similarity_fingerprint": similarity_fingerprint,
+                # Stored packed -- see gearhash/fingerprint.py for why.
+                "similarity_fingerprint": None if similarity_fingerprint is None else stored_fingerprint.pack(similarity_fingerprint),
                 "phenotype_mask": phenotype.mask,
                 "phenotype_name": phenotype.name,
             },
@@ -416,7 +418,7 @@ class StoragePipeline:
             "m2_sizes": engine.m2_sizes,
             "secondary_tables": engine.secondary_tables,
             "n_total": engine.n_total,
-            "metadata": {**engine.metadata, "similarity_fingerprint": similarity_fingerprint},
+            "metadata": {**engine.metadata, "similarity_fingerprint": stored_fingerprint.pack(similarity_fingerprint)},
         }
         new_raw_manifest = pickle.dumps(state)
         new_encrypted_manifest = self.crypto.encrypt_block(new_raw_manifest, associated_data=manifest_filename.encode())

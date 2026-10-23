@@ -290,6 +290,65 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
     return result;
 }
 
+std::vector<uint8_t> StoragePipeline::fetch_verified_block(uint64_t idx, const Bytes32& content_hash,
+                                                            const BlockEntry& loc, int primary_fd, int& mirror_fd) {
+    Bytes32 dek = keyring_.get_dek(loc.epoch_id);
+
+    std::vector<uint8_t> plaintext;
+    bool ok = false;
+    std::string primary_error;
+    try {
+        std::vector<uint8_t> payload(loc.length);
+        if (pread(primary_fd, payload.data(), loc.length, static_cast<off_t>(loc.offset)) !=
+            static_cast<ssize_t>(loc.length)) {
+            throw std::runtime_error("short read");
+        }
+        plaintext = aead_decrypt(dek, payload.data(), payload.size(), content_hash.data(), content_hash.size());
+        if (sha256(plaintext.data(), plaintext.size()) == content_hash) {
+            ok = true;
+        } else {
+            primary_error = "decrypted content hash doesn't match the manifest's record";
+        }
+    } catch (const std::exception& e) {
+        primary_error = e.what();
+    }
+
+    if (!ok) {
+        // Ancestral Hardening fallback -- always SURFACE that the
+        // primary was bad, never silently recover without saying so.
+        auto mirror_loc = index_.get_mirror(content_hash);
+        if (mirror_loc && file_exists(mirror_container_path_)) {
+            if (mirror_fd < 0) mirror_fd = open(mirror_container_path_.c_str(), O_RDONLY);
+            try {
+                std::vector<uint8_t> mirror_payload(mirror_loc->length);
+                if (pread(mirror_fd, mirror_payload.data(), mirror_loc->length,
+                          static_cast<off_t>(mirror_loc->offset)) == static_cast<ssize_t>(mirror_loc->length)) {
+                    std::vector<uint8_t> candidate = aead_decrypt(
+                        dek, mirror_payload.data(), mirror_payload.size(), content_hash.data(), content_hash.size());
+                    if (sha256(candidate.data(), candidate.size()) == content_hash) {
+                        plaintext = std::move(candidate);
+                        ok = true;
+                        fprintf(stderr,
+                            "WARNING: block %llu failed on its primary copy (%s) -- recovered from its "
+                            "Ancestral Hardening mirror instead. The primary copy is damaged.\n",
+                            (unsigned long long)idx, primary_error.c_str());
+                    }
+                }
+            } catch (const std::exception&) {
+                // mirror also failed -- ok stays false, handled below
+            }
+        }
+    }
+
+    if (!ok) {
+        throw std::runtime_error(
+            "block " + std::to_string(idx) + " failed integrity verification on its primary copy (" +
+            primary_error + "), and either has no Ancestral Hardening mirror or the mirror also failed "
+            "-- this data is genuinely unrecoverable.");
+    }
+    return plaintext;
+}
+
 void StoragePipeline::reconstruct(const std::string& manifest_path, const std::string& output_path) {
     std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
     Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
@@ -308,78 +367,26 @@ void StoragePipeline::reconstruct(const std::string& manifest_path, const std::s
     EVP_DigestInit_ex(hash_ctx, EVP_sha256(), nullptr);
     uint64_t bytes_written = 0;
 
-    for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
-        auto hash_opt = manifest.lookup(idx);
-        if (!hash_opt) {
-            EVP_MD_CTX_free(hash_ctx);
-            throw std::runtime_error("manifest declares block " + std::to_string(idx) + " but it's missing");
-        }
-        auto loc = index_.lookup(*hash_opt);
-        if (!loc) {
-            EVP_MD_CTX_free(hash_ctx);
-            throw std::runtime_error("block " + std::to_string(idx) + " missing from the global block index");
-        }
-        Bytes32 dek = keyring_.get_dek(loc->epoch_id);
-
-        std::vector<uint8_t> plaintext;
-        bool ok = false;
-        std::string primary_error;
-        try {
-            std::vector<uint8_t> payload(loc->length);
-            if (pread(primary_fd, payload.data(), loc->length, static_cast<off_t>(loc->offset)) !=
-                static_cast<ssize_t>(loc->length)) {
-                throw std::runtime_error("short read");
+    try {
+        for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
+            auto hash_opt = manifest.lookup(idx);
+            if (!hash_opt) {
+                throw std::runtime_error("manifest declares block " + std::to_string(idx) + " but it's missing");
             }
-            plaintext = aead_decrypt(dek, payload.data(), payload.size(), hash_opt->data(), hash_opt->size());
-            if (sha256(plaintext.data(), plaintext.size()) == *hash_opt) {
-                ok = true;
-            } else {
-                primary_error = "decrypted content hash doesn't match the manifest's record";
+            auto loc = index_.lookup(*hash_opt);
+            if (!loc) {
+                throw std::runtime_error("block " + std::to_string(idx) + " missing from the global block index");
             }
-        } catch (const std::exception& e) {
-            primary_error = e.what();
+            std::vector<uint8_t> plaintext = fetch_verified_block(idx, *hash_opt, *loc, primary_fd, mirror_fd);
+            out.write(reinterpret_cast<const char*>(plaintext.data()), static_cast<std::streamsize>(plaintext.size()));
+            EVP_DigestUpdate(hash_ctx, plaintext.data(), plaintext.size());
+            bytes_written += plaintext.size();
         }
-
-        if (!ok) {
-            // Ancestral Hardening fallback -- always SURFACE that the
-            // primary was bad, never silently recover without saying so.
-            auto mirror_loc = index_.get_mirror(*hash_opt);
-            if (mirror_loc && file_exists(mirror_container_path_)) {
-                if (mirror_fd < 0) mirror_fd = open(mirror_container_path_.c_str(), O_RDONLY);
-                try {
-                    std::vector<uint8_t> mirror_payload(mirror_loc->length);
-                    if (pread(mirror_fd, mirror_payload.data(), mirror_loc->length,
-                              static_cast<off_t>(mirror_loc->offset)) == static_cast<ssize_t>(mirror_loc->length)) {
-                        std::vector<uint8_t> candidate = aead_decrypt(
-                            dek, mirror_payload.data(), mirror_payload.size(), hash_opt->data(), hash_opt->size());
-                        if (sha256(candidate.data(), candidate.size()) == *hash_opt) {
-                            plaintext = std::move(candidate);
-                            ok = true;
-                            fprintf(stderr,
-                                "WARNING: block %llu failed on its primary copy (%s) -- recovered from its "
-                                "Ancestral Hardening mirror instead. The primary copy is damaged.\n",
-                                (unsigned long long)idx, primary_error.c_str());
-                        }
-                    }
-                } catch (const std::exception&) {
-                    // mirror also failed -- ok stays false, handled below
-                }
-            }
-        }
-
-        if (!ok) {
-            close(primary_fd);
-            if (mirror_fd >= 0) close(mirror_fd);
-            EVP_MD_CTX_free(hash_ctx);
-            throw std::runtime_error(
-                "block " + std::to_string(idx) + " failed integrity verification on its primary copy (" +
-                primary_error + "), and either has no Ancestral Hardening mirror or the mirror also failed "
-                "-- this data is genuinely unrecoverable.");
-        }
-
-        out.write(reinterpret_cast<const char*>(plaintext.data()), static_cast<std::streamsize>(plaintext.size()));
-        EVP_DigestUpdate(hash_ctx, plaintext.data(), plaintext.size());
-        bytes_written += plaintext.size();
+    } catch (...) {
+        close(primary_fd);
+        if (mirror_fd >= 0) close(mirror_fd);
+        EVP_MD_CTX_free(hash_ctx);
+        throw;
     }
     close(primary_fd);
     if (mirror_fd >= 0) close(mirror_fd);
@@ -397,6 +404,90 @@ void StoragePipeline::reconstruct(const std::string& manifest_path, const std::s
     if (final_hash != manifest.metadata().content_sha256) {
         throw std::runtime_error("reconstructed content hash does not match the manifest's recorded hash");
     }
+}
+
+ManifestReader::ManifestReader(StoragePipeline& pipeline, const std::string& manifest_path)
+    : pipeline_(pipeline) {
+    std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
+    Manifest manifest = read_manifest_file(manifest_path, manifest_filename, pipeline_.kek());
+
+    uint64_t total_blocks = manifest.metadata().total_blocks;
+    hashes_.reserve(total_blocks);
+    for (uint64_t idx = 0; idx < total_blocks; idx++) {
+        auto hash_opt = manifest.lookup(idx);
+        if (!hash_opt) {
+            throw std::runtime_error("manifest declares block " + std::to_string(idx) + " but it's missing");
+        }
+        hashes_.push_back(*hash_opt);
+    }
+
+    std::map<Bytes32, BlockEntry> found = pipeline_.dedup_index().lookup_many(hashes_);
+    locations_.reserve(total_blocks);
+    starts_.reserve(total_blocks);
+    uint64_t position = 0;
+    for (uint64_t idx = 0; idx < total_blocks; idx++) {
+        auto it = found.find(hashes_[idx]);
+        if (it == found.end()) {
+            throw std::runtime_error("block " + std::to_string(idx) + " missing from the global block index");
+        }
+        if (it->second.length < kAeadOverhead) {
+            throw std::runtime_error("block " + std::to_string(idx) + " has an impossible stored length");
+        }
+        locations_.push_back(it->second);
+        starts_.push_back(position);
+        position += it->second.length - kAeadOverhead;
+    }
+    if (position != manifest.metadata().original_size) {
+        throw std::runtime_error("chunk table adds up to " + std::to_string(position) + " bytes, manifest records " +
+                                  std::to_string(manifest.metadata().original_size));
+    }
+    size_ = position;
+
+    primary_fd_ = open(pipeline_.container_path().c_str(), O_RDONLY);
+    if (primary_fd_ < 0) {
+        throw std::runtime_error("failed to open container '" + pipeline_.container_path() + "': " + strerror(errno));
+    }
+}
+
+ManifestReader::~ManifestReader() {
+    if (primary_fd_ >= 0) close(primary_fd_);
+    if (mirror_fd_ >= 0) close(mirror_fd_);
+}
+
+const std::vector<uint8_t>& ManifestReader::chunk(uint64_t idx) {
+    auto it = cache_.find(idx);
+    if (it != cache_.end()) return it->second;
+    std::vector<uint8_t> plaintext =
+        pipeline_.fetch_verified_block(idx, hashes_[idx], locations_[idx], primary_fd_, mirror_fd_);
+    if (plaintext.size() != locations_[idx].length - kAeadOverhead) {
+        throw std::runtime_error("block " + std::to_string(idx) + " decrypted to an unexpected length");
+    }
+    if (cache_.size() >= kCacheChunks) {
+        cache_.erase(cache_order_.front());
+        cache_order_.pop_front();
+    }
+    cache_order_.push_back(idx);
+    return cache_.emplace(idx, std::move(plaintext)).first->second;
+}
+
+size_t ManifestReader::read(uint64_t offset, size_t size, uint8_t* out) {
+    if (offset >= size_ || size == 0) return 0;
+    uint64_t end = std::min<uint64_t>(offset + size, size_);
+    // Last block starting at or before `offset`.
+    uint64_t idx = static_cast<uint64_t>(std::upper_bound(starts_.begin(), starts_.end(), offset) - starts_.begin()) - 1;
+    uint64_t position = offset;
+    size_t copied = 0;
+    while (position < end) {
+        const std::vector<uint8_t>& data = chunk(idx);
+        uint64_t start = starts_[idx];
+        uint64_t take_from = position - start;
+        uint64_t take_to = std::min<uint64_t>(data.size(), end - start);
+        memcpy(out + copied, data.data() + take_from, take_to - take_from);
+        copied += take_to - take_from;
+        position = start + take_to;
+        idx++;
+    }
+    return copied;
 }
 
 void StoragePipeline::delete_file(const std::string& manifest_path) {

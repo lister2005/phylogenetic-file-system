@@ -119,8 +119,14 @@ target_link_libraries(keyring_rotation_test PRIVATE gearhash_core dedup_index ma
 # similarity fingerprint at write time using it.
 add_library(phenotype STATIC src/phenotype.cpp)
 
+# The repo root (parent of cpp_engine/), baked into the two tests that
+# shell out to the REAL Python modules for cross-verification, so they
+# follow the project wherever it lives instead of a hardcoded path.
+get_filename_component(PFS_REPO_ROOT "${CMAKE_CURRENT_SOURCE_DIR}" DIRECTORY)
+
 add_executable(phenotype_test bench/phenotype_test.cpp)
 target_link_libraries(phenotype_test PRIVATE phenotype)
+target_compile_definitions(phenotype_test PRIVATE PFS_REPO_ROOT="${PFS_REPO_ROOT}")
 
 add_library(phylo STATIC src/phylo.cpp)
 target_link_libraries(phylo PUBLIC crypto_utils gearhash_core)
@@ -133,6 +139,9 @@ target_link_libraries(pipeline_test PRIVATE pipeline)
 
 add_executable(pipeline_mirroring_test bench/pipeline_mirroring_test.cpp)
 target_link_libraries(pipeline_mirroring_test PRIVATE pipeline)
+
+add_executable(manifest_reader_test bench/manifest_reader_test.cpp)
+target_link_libraries(manifest_reader_test PRIVATE pipeline)
 
 add_executable(vacuum_fsck_test bench/vacuum_fsck_test.cpp)
 target_link_libraries(vacuum_fsck_test PRIVATE pipeline)
@@ -148,6 +157,15 @@ target_link_libraries(graft_test PRIVATE vault_session)
 # docstring for why the two must not be conflated).
 add_executable(phylo_test bench/phylo_test.cpp)
 target_link_libraries(phylo_test PRIVATE phylo)
+target_compile_definitions(phylo_test PRIVATE PFS_REPO_ROOT="${PFS_REPO_ROOT}")
+
+add_library(clade_worker STATIC src/clade_worker.cpp)
+target_link_libraries(clade_worker PUBLIC phylo)
+find_package(Threads REQUIRED)
+target_link_libraries(clade_worker PUBLIC Threads::Threads)
+
+add_executable(clade_worker_test bench/clade_worker_test.cpp)
+target_link_libraries(clade_worker_test PRIVATE clade_worker)
 
 add_executable(migration_verify_test bench/migration_verify_test.cpp)
 target_link_libraries(migration_verify_test PRIVATE pipeline)
@@ -190,7 +208,7 @@ target_link_libraries(vault_session_test PRIVATE vault_session)
 if(FUSE3_FOUND)
     add_executable(pfs_fuse_cpp src/pfs_fuse_cpp.cpp)
     target_include_directories(pfs_fuse_cpp PRIVATE ${FUSE3_INCLUDE_DIR})
-    target_link_libraries(pfs_fuse_cpp PRIVATE vault_session manifest ${FUSE3_LIBRARY})
+    target_link_libraries(pfs_fuse_cpp PRIVATE vault_session manifest clade_worker ${FUSE3_LIBRARY})
     target_compile_definitions(pfs_fuse_cpp PRIVATE _FILE_OFFSET_BITS=64)
 endif()
 

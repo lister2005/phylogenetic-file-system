@@ -17,6 +17,8 @@
 // pfs_engine_read) -- a thin C wrapper around this class is what a
 // ctypes binding from Python (CLI/GUI) would call.
 #include <cstdint>
+#include <deque>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -25,6 +27,13 @@
 #include "keyring.hpp"
 
 namespace pfs_engine {
+
+// Bytes aead_encrypt() adds to every chunk: a 12-byte IV prefix and a
+// 16-byte GCM tag (crypto_utils.hpp). A chunk's plaintext length is its
+// stored length minus this -- what lets ManifestReader map byte offsets
+// to chunks without any per-chunk length in the manifest itself.
+// Matches reconstruct.py's AEAD_OVERHEAD.
+constexpr uint64_t kAeadOverhead = 28;
 
 struct WriteResult {
     std::string manifest_path;
@@ -99,6 +108,16 @@ public:
     // a block has no working copy at all.
     void reconstruct(const std::string& manifest_path, const std::string& output_path);
 
+    // One chunk's verified plaintext: primary copy (from primary_fd)
+    // first, then its Ancestral Hardening mirror, with the same WARNING
+    // on mirror recovery and the same throw on no working copy as
+    // reconstruct(). mirror_fd is opened lazily (only on a primary
+    // failure) and left open for the caller to close. The one
+    // implementation behind both reconstruct() and ManifestReader, so
+    // the two can't drift apart on integrity checks or self-healing.
+    std::vector<uint8_t> fetch_verified_block(uint64_t idx, const Bytes32& content_hash,
+                                              const BlockEntry& loc, int primary_fd, int& mirror_fd);
+
     // Decrements the ref count on every chunk manifest_path's file
     // referenced, then removes the manifest itself. Does NOT reclaim
     // container space immediately -- chunks that drop to ref_count=0
@@ -166,6 +185,53 @@ private:
     std::string mirror_container_path_;
     DedupIndex index_;
     KeyRing keyring_;
+};
+
+// Random-access, read-only view of one stored file version: serves any
+// byte range by decrypting only the chunks that range overlaps, instead
+// of reconstructing the whole file first -- what lets pfs_fuse_cpp
+// stream reads of large files with bounded memory. The C++ counterpart
+// of reconstruct.py's ManifestReader.
+//
+// The constructor decrypts the manifest and resolves every chunk's
+// container location in one batched index query; that chunk table is a
+// snapshot of this version, so a later commit to the same label doesn't
+// change what an already-open reader returns. Every chunk returned is
+// individually authenticated (AES-GCM with its hash as AAD, then its
+// SHA-256 against the authenticated manifest's hash for that position)
+// via fetch_verified_block(), mirror self-healing included. A partial
+// read can NOT check the whole-file content_sha256 (that needs every
+// byte); the total size is checked against the manifest up front.
+// Holds a reference to `pipeline`, which must outlive it. Not
+// thread-safe on its own -- callers serialize access (pfs_fuse_cpp runs
+// single-threaded).
+class ManifestReader {
+public:
+    static constexpr size_t kCacheChunks = 8;  // recently-decrypted chunks kept, for small sequential reads
+
+    ManifestReader(StoragePipeline& pipeline, const std::string& manifest_path);
+    ~ManifestReader();
+    ManifestReader(const ManifestReader&) = delete;
+    ManifestReader& operator=(const ManifestReader&) = delete;
+
+    uint64_t size() const { return size_; }
+    // Copies up to `size` bytes starting at `offset` into `out`; returns
+    // the number copied (0 at or past the end). Throws on a chunk with
+    // no working copy.
+    size_t read(uint64_t offset, size_t size, uint8_t* out);
+
+private:
+    const std::vector<uint8_t>& chunk(uint64_t idx);
+
+    StoragePipeline& pipeline_;
+    std::vector<Bytes32> hashes_;
+    std::vector<BlockEntry> locations_;
+    std::vector<uint64_t> starts_;  // plaintext byte offset where each block begins
+    uint64_t size_ = 0;
+    int primary_fd_ = -1;
+    int mirror_fd_ = -1;
+    std::map<uint64_t, std::vector<uint8_t>> cache_;
+    std::deque<uint64_t> cache_order_;  // oldest first
 };
 
 }  // namespace pfs_engine

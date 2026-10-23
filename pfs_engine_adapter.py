@@ -23,6 +23,8 @@ import os
 import re
 import tempfile
 
+from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
+from gearhash import fingerprint as stored_fingerprint
 from reconstruct import reconstruct
 from vault_session import MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
@@ -67,7 +69,53 @@ class NodeInfo:
         self.lateral_parent_uuids = list(lateral_parent_uuids)
 
 
-class PythonEngineAdapter:
+class _CladeTracking:
+    """Keeps a background clade worker (clade_worker.py) in step with
+    every change made through the adapter, so the GUI's clade outlines
+    come from a maintained partition instead of decrypting every manifest
+    and comparing every pair on each redraw."""
+
+    _clade_worker = None
+    _clade_stopped = False
+
+    def _clade_loader(self):
+        raise NotImplementedError
+
+    def start_clade_worker(self) -> None:
+        if self._clade_worker is None and not self._clade_stopped:
+            self._clade_worker = CladeWorker(self._clade_loader(), name="gui-clade-worker").start(self.labels())
+
+    def stop_clade_worker(self) -> None:
+        """Stops it for good -- nothing restarts it afterwards."""
+        self._clade_stopped = True
+        if self._clade_worker is not None:
+            self._clade_worker.stop(timeout=10)
+            self._clade_worker = None
+
+    def clade_version(self) -> int:
+        self.start_clade_worker()
+        return self._clade_worker.snapshot().version if self._clade_worker else 0
+
+    def clades(self, wait: float = 0.0):
+        """(clade_to_labels, label_to_clade, version): clades with 2+
+        current members, from the worker's latest partition, after
+        waiting up to `wait` seconds for a pending recompute."""
+        self.start_clade_worker()
+        if self._clade_worker is None:
+            return {}, {}, 0
+        if wait:
+            self._clade_worker.wait_idle(wait)
+        snapshot = self._clade_worker.snapshot()
+        clade_to_labels, label_to_clade = filtered_view(snapshot, set(self.labels()), min_members=2)
+        return clade_to_labels, label_to_clade, snapshot.version
+
+    def _clade_event(self, kind: str, *labels) -> None:
+        # Before the worker starts there's nothing to update: start() loads every label.
+        if self._clade_worker is not None:
+            getattr(self._clade_worker, kind)(*labels)
+
+
+class PythonEngineAdapter(_CladeTracking):
     """Wraps vault_session.VaultSession."""
 
     def __init__(self, session):
@@ -104,7 +152,7 @@ class PythonEngineAdapter:
             "duplicate_chunks_found": meta.get("duplicate_chunks_found", 0),
             "original_size": meta.get("original_size", 0),
             "phenotype_name": meta.get("phenotype_name", "Unknown Binary"),
-            "similarity_fingerprint": meta.get("similarity_fingerprint"),
+            "similarity_fingerprint": stored_fingerprint.unpack(meta.get("similarity_fingerprint")),
             "manifest_filename": manifest_filename,
         }
 
@@ -163,21 +211,26 @@ class PythonEngineAdapter:
         fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(path)
         manifest_path = self._session.commit_write(
             label, path, fork_from_generation=fork_from_generation, similarity_fingerprint=fingerprint)
+        self._clade_event("changed", label)
         return manifest_path
 
     def delete_label(self, label: str, force: bool = False) -> dict:
-        return self._session.delete_label(label, force=force)
+        report = self._session.delete_label(label, force=force)
+        self._clade_event("removed", label)
+        return report
 
     def rename_label(self, old_label: str, new_label: str) -> None:
         self._session.catalog[new_label] = self._session.catalog.pop(old_label)
         self._session.lineage.rename_label(old_label, new_label)
         self._session.save_catalog()
+        self._clade_event("renamed", old_label, new_label)
 
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
         self._session.prune_generation(label, generation_index, force=force)
 
     def merge_branches(self, label: str, generation_a: int, generation_b: int) -> None:
         self._session.merge_branches(label, generation_a, generation_b)
+        self._clade_event("changed", label)
 
     def checkout(self, label: str, generation_index: int, out_path: str) -> None:
         node = self._session.lineage.get_generation(label, generation_index)
@@ -201,15 +254,20 @@ class PythonEngineAdapter:
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+        self._clade_event("changed", new_label)
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> None:
         # lateral_gene_transfer already computes+attaches its own
         # fingerprint internally (see vault_session.py) -- no fix
         # needed here, unlike duplicate_label/commit_write above.
         self._session.lateral_gene_transfer(label_a, label_b, new_label)
+        self._clade_event("changed", new_label)
+
+    def _clade_loader(self):
+        return python_session_loader(self._session)
 
 
-class CppEngineAdapter:
+class CppEngineAdapter(_CladeTracking):
     """Wraps pfs_engine_binding.CppVaultSession."""
 
     def __init__(self, session):
@@ -297,12 +355,16 @@ class CppEngineAdapter:
             self._session.fork_write(label, path, fork_from_generation)
         else:
             self._session.commit_write(label, path)
+        self._clade_event("changed", label)
 
     def delete_label(self, label: str, force: bool = False) -> dict:
-        return self._session.delete_label(label, force=force)
+        report = self._session.delete_label(label, force=force)
+        self._clade_event("removed", label)
+        return report
 
     def rename_label(self, old_label: str, new_label: str) -> None:
         self._session.rename_label(old_label, new_label)
+        self._clade_event("renamed", old_label, new_label)
 
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
         self._session.prune_generation(label, generation_index, force=force)
@@ -315,6 +377,7 @@ class CppEngineAdapter:
             if positions or "changed differently" in str(e):
                 raise MutationConflictError(positions) from e
             raise
+        self._clade_event("changed", label)
 
     def checkout(self, label: str, generation_index: int, out_path: str) -> None:
         self._session.checkout(label, generation_index, out_path)
@@ -331,9 +394,15 @@ class CppEngineAdapter:
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
+        self._clade_event("changed", new_label)
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> None:
         self._session.graft(label_a, label_b, new_label)
+        self._clade_event("changed", new_label)
+
+    def _clade_loader(self):
+        return cpp_session_loader(self._session)
 
     def close(self) -> None:
+        self.stop_clade_worker()
         self._session.close()

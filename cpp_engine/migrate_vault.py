@@ -51,6 +51,7 @@ import argparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from gearhash.fks_index import FKSLookupEngine
+from gearhash import fingerprint as stored_fingerprint
 from gearhash.crypto import CryptoEngine
 from gearhash.master_key_store import load_vault_key, WrongPassphraseError
 from lineage import LineageStore
@@ -105,7 +106,7 @@ def migrate_manifest(old_path: str, crypto: CryptoEngine) -> str:
     phenotype_bytes = meta.get("phenotype_name", "Unknown Binary").encode("utf-8")
     buf += struct.pack("<H", len(phenotype_bytes)) + phenotype_bytes
 
-    fingerprint = meta.get("similarity_fingerprint")
+    fingerprint = stored_fingerprint.unpack(meta.get("similarity_fingerprint"))
     if fingerprint:
         # Sorted ascending, matching pfs_engine::Manifest's own
         # normalization -- a `set`'s iteration order isn't otherwise

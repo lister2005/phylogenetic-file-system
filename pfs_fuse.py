@@ -27,6 +27,12 @@ intentional -- it mirrors the design doc's own "automatic evolutionary
 self-organization" -- not a bug, but worth knowing about if a path that
 worked a moment ago suddenly doesn't.
 
+The partition is maintained by a background worker (clade_worker.py),
+incrementally, never on the path of a filesystem call: lookups use its
+latest partition, filtered against the live catalog, so a deleted or
+renamed file never lingers in a clade directory, and a just-written file
+shows at the root until the worker has clustered it.
+
 Two concrete, OBSERVED consequences of that dynamism, confirmed against
 a real mount (2026-07-23), not just theorized:
 1. Editing a file that currently lives inside a clade directory clears
@@ -48,17 +54,22 @@ a real mount (2026-07-23), not just theorized:
    about a second; neither has been observed to leave anything
    inconsistent once it settles.
 
-READ/WRITE MODEL: this does NOT stream. open() reconstructs a file's
-full current content into memory once (spilling through a scratch temp
-file so it can reuse the exact same tested reconstruct() and
-secure_and_persist_file() codepaths the CLI uses, rather than
-duplicating that logic to work on raw in-memory buffers). write()
-mutates that in-memory buffer; release() (the file actually being
+READ/WRITE MODEL: streaming, with memory bounded regardless of file
+size. open() does NOT reconstruct the file: it opens a
+reconstruct.ManifestReader, which resolves the version's chunk table
+once and then serves each read() by decrypting only the chunks that
+byte range overlaps (same per-chunk integrity checks and mirror
+self-healing as reconstruct()). The first write() or truncate() on a
+handle copies that version into a scratch file on DISK (never RAM) and
+from then on reads and writes go to that file; open(O_TRUNC)/create()
+start with an empty scratch file. release() (the file actually being
 closed) is the real commit point -- this IS the design doc's
-"Speciation on Write": nothing lands in the vault until the file
-handle closes. This is a genuine, documented limitation for very large
-files (the design doc's own "Deep Lineage Read Penalty" territory
-applies here too) -- a streaming version is future work.
+"Speciation on Write": nothing lands in the vault until the file handle
+closes, and the scratch file is handed to VaultSession.commit_write(),
+the same tested path the CLI's 'write' uses. A commit re-chunks the
+whole file (unchanged chunks still dedup, so storage only grows by what
+actually changed); a write needs temporary disk space equal to the
+file's size.
 
 CONCURRENCY: mounted with nothreads=True on purpose. The storage engine
 underneath (SQLite connections, the crypto engine, the catalog dict)
@@ -111,12 +122,14 @@ import subprocess
 from fuse import FUSE, FuseOSError, Operations
 
 from vault_session import VaultSession, VaultUnlockError
-from reconstruct import reconstruct
+from reconstruct import ManifestReader
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
-from TreeConstructor import TreeConstructor
+from clade_worker import CladeWorker, filtered_view, python_session_loader
 
 SCRATCH_DIRNAME = ".fuse_scratch"
-CLADE_THRESHOLD = TreeConstructor.DEFAULT_CLADE_THRESHOLD
+# How much of a file version one read() pulls through ManifestReader at a
+# time when copying it into a scratch file (copy-on-first-write).
+SPILL_COPY_BYTES = 1 << 20
 PID_FILENAME = ".fuse_daemon.pid"
 LOG_FILENAME = ".fuse_daemon.log"
 
@@ -130,7 +143,10 @@ class PFSFuse(Operations):
         os.makedirs(self.scratch_dir, exist_ok=True)
 
         self._next_fh = 1
-        # fh -> {"label": str, "buffer": bytearray, "dirty": bool}
+        # fh -> {"label": str, "reader": ManifestReader or None,
+        #        "spill_fd": int or None, "spill_path": str or None, "dirty": bool}
+        # Exactly one of reader/spill_fd is set: reader until the first
+        # write/truncate, scratch file after (see READ/WRITE MODEL).
         self._handles = {}
         # Guards catalog mutation and the handle/job tables. FUSE itself
         # is mounted single-threaded (nothreads=True) so callbacks never
@@ -140,11 +156,15 @@ class PFSFuse(Operations):
         # this.
         self._lock = threading.RLock()
         self._fingerprint_jobs = []  # (label, Thread) currently running
-        # (clade_to_labels, label_to_clade) -- see _get_clades(). None
-        # means "needs recomputing"; invalidated on every write/delete/
-        # rename/fingerprint-attach, since any of those can change
-        # clade membership.
-        self._clade_cache = None
+        # Background clade clustering (clade_worker.py). Started in
+        # init(), not here: in daemon mode do_mount() forks AFTER this
+        # constructor, and a thread doesn't survive fork().
+        self._clades = None
+        # Filtered view of the worker's latest snapshot, cached until the
+        # snapshot or the catalog changes -- see _get_clades().
+        self._catalog_epoch = 0
+        self._clade_view = None
+        self._clade_view_key = None
 
     # ---------- setup ----------
 
@@ -171,40 +191,37 @@ class PFSFuse(Operations):
 
     # ---------- clade computation (cached) ----------
 
+    def init(self, path):
+        """Called by FUSE once mounted, in the process that serves the
+        mount (after any daemon fork)."""
+        with self._lock:
+            labels = list(self.session.catalog.keys())
+        self._clades = CladeWorker(python_session_loader(self.session), name="fuse-clade-worker").start(labels)
+
+    def _catalog_changed(self) -> None:
+        with self._lock:
+            self._catalog_epoch += 1
+
     def _get_clades(self):
-        """Returns (clade_to_labels, label_to_clade), cached until
-        invalidated. clade_to_labels only contains clades with 2+
-        members -- a "clade" of one is just a file at the root, not a
-        directory (avoids a mount where every single file is its own
-        one-entry folder, which would be technically accurate to the
-        design doc but genuinely annoying to browse)."""
+        """Returns (clade_to_labels, label_to_clade) from the clade
+        worker's latest snapshot, never waiting for a recompute in
+        progress. Only clades with 2+ current members are directories --
+        a "clade" of one is just a file at the root, not a directory
+        (avoids a mount where every single file is its own one-entry
+        folder, which would be technically accurate to the design doc
+        but genuinely annoying to browse). Filtered against the live
+        catalog, so a label deleted or renamed since the snapshot was
+        computed never appears; a new label sits at the root until the
+        worker has clustered it."""
+        if self._clades is None:
+            return {}, {}
+        snapshot = self._clades.snapshot()
         with self._lock:
-            if self._clade_cache is not None:
-                return self._clade_cache
-
-            named_traits = {}
-            for label, manifest_filename in self.session.catalog.items():
-                manifest_path = os.path.join(self.session.storage_root, manifest_filename)
-                meta = self.session.read_manifest_metadata(manifest_path)
-                fp = meta.get("similarity_fingerprint")
-                if fp is not None:
-                    named_traits[label] = fp
-
-            groups = {}
-            if len(named_traits) >= 2:
-                analyzer = PhylogeneticAnalyzer(SIMILARITY_PROFILE)
-                tc = TreeConstructor(analyzer)
-                groups = tc.compute_clades(named_traits, threshold=CLADE_THRESHOLD)
-
-            clade_to_labels = {name: members for name, members in groups.items() if len(members) >= 2}
-            label_to_clade = {m: name for name, members in clade_to_labels.items() for m in members}
-
-            self._clade_cache = (clade_to_labels, label_to_clade)
-            return self._clade_cache
-
-    def _invalidate_clade_cache(self) -> None:
-        with self._lock:
-            self._clade_cache = None
+            key = (snapshot.version, self._catalog_epoch)
+            if self._clade_view_key != key:
+                self._clade_view = filtered_view(snapshot, self.session.catalog, min_members=2)
+                self._clade_view_key = key
+            return self._clade_view
 
     # ---------- path resolution ----------
 
@@ -263,7 +280,7 @@ class PFSFuse(Operations):
             for handle in self._handles.values():
                 if handle["label"] == label:
                     return dict(st_mode=(stat.S_IFREG | 0o644), st_nlink=1,
-                                st_size=len(handle["buffer"]),
+                                st_size=self._handle_size(handle),
                                 st_uid=os.getuid(), st_gid=os.getgid(),
                                 st_ctime=now, st_mtime=now, st_atime=now)
             if label not in self.session.catalog:
@@ -297,16 +314,44 @@ class PFSFuse(Operations):
 
     # ---------- read path ----------
 
-    def _reconstruct_bytes(self, manifest_path: str) -> bytes:
-        fd, tmp_path = tempfile.mkstemp(dir=self.scratch_dir, prefix="read_")
-        os.close(fd)
+    def _open_reader(self, manifest_path: str) -> ManifestReader:
         try:
-            reconstruct(manifest_path, self.session.pipeline.container_path, tmp_path, self.session.crypto.key)
-            with open(tmp_path, "rb") as f:
-                return f.read()
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+            return ManifestReader(manifest_path, self.session.pipeline.container_path,
+                                  self.session.crypto.key)
+        except Exception:
+            raise FuseOSError(errno.EIO)
+
+    def _new_spill(self):
+        return tempfile.mkstemp(dir=self.scratch_dir, prefix="write_")
+
+    def _copy_into(self, reader: ManifestReader, fd: int) -> None:
+        position = 0
+        while position < reader.size:
+            piece = reader.read(position, SPILL_COPY_BYTES)
+            os.pwrite(fd, piece, position)
+            position += len(piece)
+
+    def _materialize(self, handle: dict) -> None:
+        """Copy-on-first-write: moves a handle from streaming reads to its
+        own scratch file, copying the version it opened chunk by chunk
+        (never the whole file in memory). A no-op once it's been done."""
+        if handle["spill_fd"] is not None:
+            return
+        fd, path = self._new_spill()
+        try:
+            self._copy_into(handle["reader"], fd)
+        except Exception:
+            os.close(fd)
+            os.remove(path)
+            raise FuseOSError(errno.EIO)
+        handle["reader"].close()
+        handle["reader"] = None
+        handle["spill_fd"], handle["spill_path"] = fd, path
+
+    def _handle_size(self, handle: dict) -> int:
+        if handle["spill_fd"] is not None:
+            return os.fstat(handle["spill_fd"]).st_size
+        return handle["reader"].size
 
     def open(self, path, flags):
         resolved = self._resolve(path)
@@ -316,9 +361,9 @@ class PFSFuse(Operations):
         with self._lock:
             manifest_path = self.session.manifest_path_for(label)
 
-        want_trunc = bool(flags & os.O_TRUNC)
-        buffer = bytearray() if want_trunc else bytearray(self._reconstruct_bytes(manifest_path))
-        return self._new_handle(label, buffer, dirty=want_trunc)
+        if flags & os.O_TRUNC:
+            return self._new_handle(label, spill=self._new_spill(), dirty=True)
+        return self._new_handle(label, reader=self._open_reader(manifest_path))
 
     def create(self, path, mode, fi=None):
         # Clade directories are computed, not a place to manually drop
@@ -328,13 +373,15 @@ class PFSFuse(Operations):
         parts = [p for p in path.split("/") if p]
         if len(parts) != 1:
             raise FuseOSError(errno.EACCES)
-        return self._new_handle(parts[0], bytearray(), dirty=True)
+        return self._new_handle(parts[0], spill=self._new_spill(), dirty=True)
 
-    def _new_handle(self, label: str, buffer: bytearray, dirty: bool) -> int:
+    def _new_handle(self, label: str, reader: ManifestReader = None, spill=None, dirty: bool = False) -> int:
+        spill_fd, spill_path = spill if spill is not None else (None, None)
         with self._lock:
             fh = self._next_fh
             self._next_fh += 1
-            self._handles[fh] = {"label": label, "buffer": buffer, "dirty": dirty}
+            self._handles[fh] = {"label": label, "reader": reader, "spill_fd": spill_fd,
+                                 "spill_path": spill_path, "dirty": dirty}
         return fh
 
     def read(self, path, size, offset, fh):
@@ -342,7 +389,12 @@ class PFSFuse(Operations):
             handle = self._handles.get(fh)
         if handle is None:
             raise FuseOSError(errno.EBADF)
-        return bytes(handle["buffer"][offset:offset + size])
+        if handle["spill_fd"] is not None:
+            return os.pread(handle["spill_fd"], size, offset)
+        try:
+            return handle["reader"].read(offset, size)
+        except Exception:
+            raise FuseOSError(errno.EIO)
 
     # ---------- write path ----------
 
@@ -351,23 +403,22 @@ class PFSFuse(Operations):
             handle = self._handles.get(fh)
             if handle is None:
                 raise FuseOSError(errno.EBADF)
-            buf = handle["buffer"]
-            end = offset + len(data)
-            if len(buf) < end:
-                buf.extend(b"\x00" * (end - len(buf)))  # sparse-write gap, zero-filled
-            buf[offset:end] = data
+            self._materialize(handle)
+            # Writing past the end leaves a hole the OS reads back as
+            # zeros -- the same zero-filled sparse-write gap as before.
+            os.pwrite(handle["spill_fd"], data, offset)
             handle["dirty"] = True
         return len(data)
+
+    def _truncate_handle(self, handle: dict, length: int) -> None:
+        self._materialize(handle)
+        os.ftruncate(handle["spill_fd"], length)
+        handle["dirty"] = True
 
     def truncate(self, path, length, fh=None):
         with self._lock:
             if fh is not None and fh in self._handles:
-                buf = self._handles[fh]["buffer"]
-                if length < len(buf):
-                    del buf[length:]
-                else:
-                    buf.extend(b"\x00" * (length - len(buf)))
-                self._handles[fh]["dirty"] = True
+                self._truncate_handle(self._handles[fh], length)
                 return
 
         resolved = self._resolve(path)
@@ -377,35 +428,60 @@ class PFSFuse(Operations):
             raise FuseOSError(errno.ENOENT)
         label = resolved[1]
 
+        # A path truncate while the file is open applies to every open
+        # handle on it; each commits the truncated content on release().
+        # This is also how fusepy (libfuse2) delivers open(O_TRUNC): a
+        # plain open() and then truncate(path, 0) with no fh. Committing
+        # a separate truncated version here instead would be silently
+        # overwritten by those handles' pre-truncate copies on release.
+        with self._lock:
+            open_handles = [h for h in self._handles.values() if h["label"] == label]
+            for handle in open_handles:
+                self._truncate_handle(handle, length)
+        if open_handles:
+            return
+
         # No open handle covers this path (truncate called standalone,
         # e.g. the `truncate` command) -- there's no release() to defer
-        # to, so reconstruct, resize, and commit immediately.
+        # to, so copy into a scratch file, resize it, and commit now.
         manifest_path = self.session.manifest_path_for(label)
-        data = bytearray(self._reconstruct_bytes(manifest_path))
-        if length < len(data):
-            del data[length:]
-        else:
-            data.extend(b"\x00" * (length - len(data)))
-        self._commit(label, bytes(data))
+        reader = self._open_reader(manifest_path)
+        fd, tmp_path = self._new_spill()
+        try:
+            self._copy_into(reader, fd)
+            os.ftruncate(fd, length)
+        except Exception:
+            os.remove(tmp_path)
+            raise FuseOSError(errno.EIO)
+        finally:
+            reader.close()
+            os.close(fd)
+        self._commit(label, tmp_path)
 
     def release(self, path, fh):
         with self._lock:
             handle = self._handles.pop(fh, None)
-        if handle is not None and handle["dirty"]:
-            self._commit(handle["label"], bytes(handle["buffer"]))
+        if handle is None:
+            return 0
+        if handle["reader"] is not None:
+            handle["reader"].close()
+        if handle["spill_fd"] is not None:
+            os.close(handle["spill_fd"])
+            if handle["dirty"]:
+                self._commit(handle["label"], handle["spill_path"])
+            else:
+                os.remove(handle["spill_path"])
         return 0
 
-    def _commit(self, label: str, data: bytes) -> None:
-        """The actual Speciation-on-Write event: spills the buffer to a
-        scratch temp file and hands it to VaultSession.commit_write() --
-        the exact same path pfs_cli.py's 'write' command uses, so this
-        gets the same lineage-generation tracking and catalog handling
-        for free, with no separate, unreviewed ingestion path for FUSE
-        writes."""
-        fd, tmp_path = tempfile.mkstemp(dir=self.scratch_dir, prefix="write_")
+    def _commit(self, label: str, tmp_path: str) -> None:
+        """The actual Speciation-on-Write event: hands a complete scratch
+        file to VaultSession.commit_write() -- the exact same path
+        pfs_cli.py's 'write' command uses, so this gets the same
+        lineage-generation tracking and catalog handling for free, with
+        no separate, unreviewed ingestion path for FUSE writes. Takes
+        ownership of tmp_path: the background fingerprint job deletes it
+        once it's done reading it (or this does, on failure)."""
         try:
-            with os.fdopen(fd, "wb") as f:
-                f.write(data)
             with self._lock:
                 manifest_path = self.session.commit_write(label, tmp_path)
         except Exception:
@@ -413,7 +489,10 @@ class PFSFuse(Operations):
                 os.remove(tmp_path)
             raise FuseOSError(errno.EIO)
 
-        self._invalidate_clade_cache()
+        # The new content's fingerprint isn't attached yet (background
+        # job below), so this drops the label from clustering until it is.
+        self._catalog_changed()
+        self._clades.changed(label)
         self._start_background_fingerprint(label, tmp_path, manifest_path)
 
     def _start_background_fingerprint(self, label: str, tmp_path: str, manifest_path: str) -> None:
@@ -434,7 +513,7 @@ class PFSFuse(Operations):
             finally:
                 if os.path.exists(tmp_path):
                     os.remove(tmp_path)
-                self._invalidate_clade_cache()  # fingerprint availability changed -- clustering may too
+                self._clades.changed(label)  # fingerprint attached -- cluster it
                 with self._lock:
                     self._fingerprint_jobs = [
                         (l, t) for l, t in self._fingerprint_jobs if t is not threading.current_thread()
@@ -460,7 +539,8 @@ class PFSFuse(Operations):
             # it once nothing else still needs it. See VaultSession.
             # delete_label's docstring for the bug this fixes.
             self.session.delete_label(label)
-        self._invalidate_clade_cache()
+        self._catalog_changed()
+        self._clades.removed(label)
 
     def rename(self, old, new):
         # A clade-dir prefix on the destination, if any, is ignored --
@@ -484,7 +564,8 @@ class PFSFuse(Operations):
             self.session.catalog[new_label] = self.session.catalog.pop(old_label)
             self.session.lineage.rename_label(old_label, new_label)
             self.session.save_catalog()
-        self._invalidate_clade_cache()
+        self._catalog_changed()
+        self._clades.renamed(old_label, new_label)
 
     # ---------- clean shutdown ----------
 
@@ -495,6 +576,8 @@ class PFSFuse(Operations):
             pending = list(self._fingerprint_jobs)
         for _label, thread in pending:
             thread.join()
+        if self._clades is not None:
+            self._clades.stop(timeout=10)
         try:
             os.rmdir(self.scratch_dir)
         except OSError:

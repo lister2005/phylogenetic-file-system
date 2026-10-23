@@ -1,0 +1,18 @@
+# Python dependencies for PFS, pinned to the versions in the project venv
+# that the test suite and judge_verification.py pass against.
+#   python3 -m venv .venv && .venv/bin/python3 -m pip install -r requirements.txt
+# (Python 3.12. The C++ engine has its own, non-Python build -- see README.md.)
+
+# Core engine (encryption) -- needed by everything
+cryptography==49.0.0
+
+# GUI (pfs_gui.py) and the GUI/lineage-diff tests
+PySide6==6.11.1
+networkx==3.6.1
+
+# FUSE mount for the Python engine (pfs_fuse.py)
+fusepy==3.0.1
+
+# Optional: only make_demo_reel.py and generate_manual_pdf.py use these
+pillow==12.3.0
+reportlab==5.0.0
