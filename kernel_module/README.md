@@ -244,3 +244,66 @@ ls /dev/pfs_lkm        # should say "No such file or directory"
 - `pfs_lkm.ko` -- the compiled module (present after a successful `make`;
   removed by `make clean`).
 - `README.md` -- this file.
+
+---
+
+# pfsfs.ko -- PFS's storage model as a mountable filesystem
+
+**Status: written and compiled against kernel 7.0.0-38 headers (clean,
+including `make W=1`); never loaded or run. Unverified.**
+
+`pfsfs.c` is a second, separate module. Unlike `pfs_lkm`, it is a real
+filesystem you can mount:
+
+- A file's working copy lives in the page cache (ramfs's `ram_aops`).
+- When a file that was written is closed (or truncated with no writer
+  open), it gets a new **generation**: its content is cut into
+  content-defined chunks with the same Gear table (`pfs_gear_table.h`,
+  generated from `gearhash/table.py`) and parameters (mask `0x1FFF`,
+  4–16 KiB) as the userspace engines, each chunk is SHA-256 hashed, and
+  each distinct chunk is stored once per mount. A byte-identical resave
+  adds no generation. Deleting a file drops its whole history.
+- `.pfs_lineage` (read-only) lists every file's generations and the dedup
+  totals. `.pfs_checkout`: write `"<name> <generation>"`, then read back
+  that generation, rebuilt from its chunks with every chunk's hash
+  re-checked (generations up to 64 MiB).
+- Flat namespace (no subdirectories). No encryption, no persistence
+  (unmount discards everything), no clade clustering -- those stay in
+  userspace.
+
+## Testing it (on a disposable machine or VM)
+
+```sh
+make
+sudo insmod pfsfs.ko
+sudo mkdir -p /mnt/pfs && sudo mount -t pfsfs none /mnt/pfs
+head -c 200000 /dev/urandom | sudo tee /mnt/pfs/a > /dev/null
+sudo cp /mnt/pfs/a /mnt/pfs/b               # same content: no new chunks
+echo edit | sudo tee -a /mnt/pfs/a > /dev/null
+cat /mnt/pfs/.pfs_lineage                   # a: generations 0 and 1; b: 0
+# generation 0 of a, rebuilt from its chunks, must equal a's first 200000 bytes
+sudo python3 -c '
+f = open("/mnt/pfs/.pfs_checkout", "r+b", buffering=0)
+f.write(b"a 0"); f.seek(0); old = f.read()
+print(old == open("/mnt/pfs/a", "rb").read(200000))'
+sudo umount /mnt/pfs && sudo rmmod pfsfs
+```
+
+`.pfs_checkout` keeps the rebuilt generation per open file, so the
+request and the read must use the same open file, as above.
+
+## Where it is most likely to be wrong
+
+The compile checks names, types and exported symbols, not behaviour.
+Places that depend on kernel-version semantics this machine couldn't
+check (only headers were available, no kernel sources):
+
+- Kernel 7.0's persistent-dentry API: `d_make_persistent()` in create and
+  for the two control files (with `simple_start_creating()` /
+  `simple_done_creating()`), `simple_unlink()` making the dentry
+  discardable again, and `kill_anon_super()` cleaning up persistent
+  dentries at unmount (it replaced `kill_litter_super()`).
+- `pfs_setattr()` speciates when `i_writecount` shows no writer; the
+  O_TRUNC open path is expected to see the opener counted already.
+- `pfs_speciate()` reads the page cache with `read_mapping_folio()` while
+  holding the mount's mutex.

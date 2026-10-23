@@ -16,7 +16,7 @@
 # kernel image). Because the module is named pfs_lkm, Kbuild automatically
 # compiles pfs_lkm.c into pfs_lkm.o and then links that into pfs_lkm.ko --
 # no explicit compile rule needed, this is Kbuild's own naming convention.
-obj-m += pfs_lkm.o
+obj-m += pfs_lkm.o pfsfs.o
 
 # KDIR points at the running kernel's build directory (headers + Kbuild
 # infrastructure matching `uname -r` exactly). This must exist -- it comes
