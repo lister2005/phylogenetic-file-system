@@ -22,7 +22,6 @@ sys.path.insert(0, os.getcwd())
 from gearhash.master_key_store import (load_vault_key, create_new_vault_key, change_passphrase,
                                         WrongPassphraseError, MASTER_KEY_FILENAME)
 from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME
-from gearhash import fingerprint as stored_fingerprint
 from gearhash.fks_index import FKSLookupEngine
 from gearhash.keyring import KEYRING_FILENAME
 from gearhash.immutability import set_immutable
@@ -610,7 +609,7 @@ Example:
                   f"nothing in the vault, freed directly).")
         if report["orphaned_tmp_files_removed"]:
             print(f"Interrupted-write leftovers removed: {report['orphaned_tmp_files_removed']} "
-                  f"'.manifest.fks.tmp' file(s) from a write that never completed.")
+                  f".tmp file(s) from a write that never completed.")
         if report.get("mirror_bytes_reclaimed"):
             print(f"Ancestral Hardening mirror container also compacted: "
                   f"{report['mirror_old_size']:,} -> {report['mirror_new_size']:,} bytes "
@@ -949,7 +948,7 @@ vault is then deleted best-effort; it is already unrecoverable by then."""
             os.path.join(self.storage_root, LINEAGE_FILENAME),
         ]
         for fname in os.listdir(self.storage_root):
-            if fname.endswith(".manifest.fks") or fname.endswith(".manifest.fks.tmp"):
+            if fname.endswith((".manifest.fks", ".traits.fks", ".manifest.fks.tmp", ".traits.fks.tmp")):
                 cleanup_targets.append(os.path.join(self.storage_root, fname))
         for path in cleanup_targets:
             try:
@@ -993,8 +992,7 @@ vault is then deleted best-effort; it is already unrecoverable by then."""
             manifest_path = os.path.join(self.storage_root, manifest_filename)
             if not os.path.exists(manifest_path):
                 continue
-            meta = self._read_manifest_metadata(manifest_path)
-            fingerprint = stored_fingerprint.unpack(meta.get("similarity_fingerprint"))
+            fingerprint = self._session.read_similarity_fingerprint(manifest_path)
             if fingerprint is None:
                 missing.append(label)
             else:
@@ -1118,8 +1116,8 @@ not a lineage and has no root. Sets the shell's focus to <label>.)"""
 
         trait_counts = {}
         for m in members:
-            meta = self._read_manifest_metadata(os.path.join(self.storage_root, self.catalog[m]))
-            trait_counts[m] = stored_fingerprint.count(meta.get("similarity_fingerprint"))
+            trait_counts[m] = self._session.similarity_fingerprint_count(
+                os.path.join(self.storage_root, self.catalog[m])) or 0
         unreliable = {m: n for m, n in trait_counts.items() if n < MIN_RELIABLE_TRAIT_COUNT}
         if unreliable:
             print(_reliability_warning(unreliable))
@@ -1156,7 +1154,7 @@ Example:
             return
         manifest_path = os.path.join(self.storage_root, self.catalog[label])
         meta = self._read_manifest_metadata(manifest_path)
-        fp = meta.get("similarity_fingerprint")
+        fp_count = self._session.similarity_fingerprint_count(manifest_path, meta)
         phenotype_mask = meta.get("phenotype_mask")
         print(f"Label:                   {label}")
         print(f"Manifest file:           {os.path.basename(manifest_path)}")
@@ -1171,7 +1169,7 @@ Example:
         print(f"  deduped at write time: {meta.get('duplicate_chunks_found')}")
         print(f"Content SHA-256:         {meta.get('content_sha256')}")
         print(f"Similarity fingerprint:  "
-              f"{'stored (' + str(stored_fingerprint.count(fp)) + ' traits)' if fp is not None else 'not stored (predates this feature)'}")
+              f"{'stored (' + str(fp_count) + ' traits)' if fp_count is not None else 'not stored (predates this feature)'}")
         tags = self._session.lineage.get_tags(label)
         print(f"Epigenetic tags:         "
               f"{', '.join(f'{k}={v}' for k, v in tags.items()) if tags else '(none)'}")

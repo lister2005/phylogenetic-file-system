@@ -1,12 +1,9 @@
 """
-How a Python-engine manifest stores a similarity fingerprint.
-
-New manifests store it packed: the sorted 32-byte traits concatenated,
-as in the C++ manifest. Older ones hold a pickled set, which costs one
-Python object per trait on every manifest read. Measured at 16 MB
-(~50,000 traits): reading peaks at 9.4 MB and keeps 5.1 MB for the old
-form, 5.1 MB and 1.5 MB packed. Both forms are read; only packed is
-written; nothing is migrated. unpack() builds the set; count() doesn't.
+The stored form of a Python-engine similarity fingerprint: the sorted
+32-byte traits concatenated, as in the C++ manifest. It is written to a
+separate encrypted file per manifest (gearhash/pipeline.py, TRAITS_SUFFIX).
+Older manifests hold it inside, packed or as a pickled set; unpack()
+accepts both. unpack() builds the set; count() doesn't.
 """
 from typing import Iterable, Optional, Set
 

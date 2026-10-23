@@ -30,6 +30,62 @@ MIRROR_CONTAINER_FILENAME = "data_container_mirror.bin"
 # (up to 600) under SQLite's limit (999 before 3.32).
 DEDUP_INDEX_BATCH_SIZE = 300
 
+MANIFEST_SUFFIX = ".manifest.fks"
+# A manifest's similarity fingerprint lives in a sibling file, so reading a
+# manifest costs only its chunk list, however large the fingerprint is.
+TRAITS_SUFFIX = ".traits.fks"
+_AEAD_OVERHEAD = 28  # IV + GCM tag added by encrypt_block
+
+
+def traits_path_for(manifest_path: str) -> str:
+    """The fingerprint file belonging to a manifest."""
+    if not manifest_path.endswith(MANIFEST_SUFFIX):
+        raise ValueError(f"not a manifest path: {manifest_path}")
+    return manifest_path[: -len(MANIFEST_SUFFIX)] + TRAITS_SUFFIX
+
+
+def _read_manifest_metadata(manifest_path: str, crypto) -> dict:
+    with open(manifest_path, "rb") as f:
+        encrypted = f.read()
+    raw = crypto.decrypt_block(encrypted, associated_data=os.path.basename(manifest_path).encode())
+    return FKSLookupEngine(raw_bytes=raw).metadata
+
+
+def read_similarity_fingerprint(manifest_path: str, crypto, metadata: Optional[dict] = None) -> Optional[set]:
+    """A manifest's similarity fingerprint (set of 32-byte traits), or None.
+    Read from its fingerprint file; manifests written before those existed
+    carry it inside (`metadata`, read here if not given).
+    """
+    traits_path = traits_path_for(manifest_path)
+    try:
+        with open(traits_path, "rb") as f:
+            encrypted = f.read()
+    except FileNotFoundError:
+        if metadata is None:
+            try:
+                metadata = _read_manifest_metadata(manifest_path, crypto)
+            except FileNotFoundError:
+                return None
+        return stored_fingerprint.unpack(metadata.get("similarity_fingerprint"))
+    packed = crypto.decrypt_block(encrypted, associated_data=os.path.basename(traits_path).encode())
+    return stored_fingerprint.unpack(packed)
+
+
+def similarity_fingerprint_count(manifest_path: str, crypto, metadata: Optional[dict] = None) -> Optional[int]:
+    """Number of traits in a manifest's fingerprint, or None if it has none.
+    A fingerprint file's size gives the count without decrypting it.
+    """
+    traits_path = traits_path_for(manifest_path)
+    if os.path.exists(traits_path):
+        return (os.path.getsize(traits_path) - _AEAD_OVERHEAD) // stored_fingerprint.TRAIT_BYTES
+    if metadata is None:
+        try:
+            metadata = _read_manifest_metadata(manifest_path, crypto)
+        except FileNotFoundError:
+            return None
+    stored = metadata.get("similarity_fingerprint")
+    return None if stored is None else stored_fingerprint.count(stored)
+
 
 def _atomic_write(path: str, data: bytes) -> None:
     """Writes via temp file + rename + fsync, so `path` holds either the old
@@ -75,7 +131,7 @@ class StoragePipeline:
         """Manifest filename: the content hash only, never the original name, so
         a directory listing leaks nothing.
         """
-        return f"{content_hash}.manifest.fks"
+        return f"{content_hash}{MANIFEST_SUFFIX}"
 
     def reset_vault(self) -> None:
         """Wipes the container, manifests, dedup index and keyring."""
@@ -92,7 +148,7 @@ class StoragePipeline:
                 os.remove(path)
         if os.path.exists(self.storage_root):
             for fname in os.listdir(self.storage_root):
-                if fname.endswith(".manifest.fks"):
+                if fname.endswith((MANIFEST_SUFFIX, TRAITS_SUFFIX)):
                     path = os.path.join(self.storage_root, fname)
                     set_immutable(path, False)
                     os.remove(path)
@@ -262,8 +318,8 @@ class StoragePipeline:
                 "original_size": original_size,
                 "new_chunks_written": new_chunks_written,
                 "duplicate_chunks_found": duplicate_chunks_found,
-                # Optional SIMILARITY_PROFILE fingerprint, stored packed (gearhash/fingerprint.py).
-                "similarity_fingerprint": None if similarity_fingerprint is None else stored_fingerprint.pack(similarity_fingerprint),
+                # The similarity fingerprint goes in its own file (see TRAITS_SUFFIX).
+                "similarity_fingerprint": None,
                 "phenotype_mask": phenotype.mask,
                 "phenotype_name": phenotype.name,
             },
@@ -277,39 +333,32 @@ class StoragePipeline:
         )
         _atomic_write(manifest_path, encrypted_manifest)
         set_immutable(manifest_path, True)
+        if similarity_fingerprint is not None:
+            self._write_traits(manifest_path, similarity_fingerprint)
 
         return manifest_path
 
+    def _write_traits(self, manifest_path: str, similarity_fingerprint) -> None:
+        traits_path = traits_path_for(manifest_path)
+        encrypted = self.crypto.encrypt_block(
+            stored_fingerprint.pack(similarity_fingerprint),
+            associated_data=os.path.basename(traits_path).encode(),
+        )
+        if os.path.exists(traits_path):
+            set_immutable(traits_path, False)
+        _atomic_write(traits_path, encrypted)
+        set_immutable(traits_path, True)
+
+    def read_similarity_fingerprint(self, manifest_path: str, metadata: Optional[dict] = None) -> Optional[set]:
+        return read_similarity_fingerprint(manifest_path, self.crypto, metadata)
+
     def attach_similarity_fingerprint(self, manifest_path: str, similarity_fingerprint: set) -> None:
-        """Replaces a manifest's stored similarity fingerprint (fingerprinting
-        runs after the write, in the background). The block-lookup structure is
-        carried over unchanged.
+        """Stores (or replaces) a manifest's similarity fingerprint. Writes only
+        the fingerprint file; the manifest is untouched.
         """
         if not os.path.exists(manifest_path):
             raise FileNotFoundError(manifest_path)
-
-        manifest_filename = os.path.basename(manifest_path)
-        with open(manifest_path, "rb") as f:
-            encrypted_manifest = f.read()
-        raw_manifest = self.crypto.decrypt_block(encrypted_manifest, associated_data=manifest_filename.encode())
-        engine = FKSLookupEngine(raw_bytes=raw_manifest)
-
-        state = {
-            "m1": engine.m1,
-            "a1": engine.a1,
-            "a2_multipliers": engine.a2_multipliers,
-            "m2_sizes": engine.m2_sizes,
-            "secondary_tables": engine.secondary_tables,
-            "n_total": engine.n_total,
-            "metadata": {**engine.metadata, "similarity_fingerprint": stored_fingerprint.pack(similarity_fingerprint)},
-        }
-        new_raw_manifest = pickle.dumps(state)
-        new_encrypted_manifest = self.crypto.encrypt_block(new_raw_manifest, associated_data=manifest_filename.encode())
-
-        # Clear +i, atomic write, re-set +i.
-        set_immutable(manifest_path, False)
-        _atomic_write(manifest_path, new_encrypted_manifest)
-        set_immutable(manifest_path, True)
+        self._write_traits(manifest_path, similarity_fingerprint)
 
     def delete_file(self, manifest_path: str) -> None:
         """Decrements the ref count of every chunk the manifest references and
@@ -343,6 +392,10 @@ class StoragePipeline:
 
         set_immutable(manifest_path, False)
         os.remove(manifest_path)
+        traits_path = traits_path_for(manifest_path)
+        if os.path.exists(traits_path):
+            set_immutable(traits_path, False)
+            os.remove(traits_path)
 
     def rebuild_ref_counts(self, live_manifest_filenames) -> dict:
         """Recomputes every chunk's ref_count from the manifests that are still
@@ -388,25 +441,30 @@ class StoragePipeline:
         return {"chunks_checked": checked, "chunks_corrected": corrected}
 
     def sweep_orphaned_manifests(self, live_manifest_filenames) -> dict:
-        """Removes manifests nothing references, plus leftover .manifest.fks.tmp
-        files from interrupted atomic writes.
+        """Removes manifests nothing references (with their fingerprint files),
+        fingerprint files whose manifest isn't live, and leftover .tmp files
+        from interrupted atomic writes.
 
-        Returns {"removed": int, "tmp_removed": int}.
+        Returns {"removed": int, "tmp_removed": int}; "removed" counts manifests.
         """
         removed = 0
         tmp_removed = 0
         if not os.path.exists(self.storage_root):
             return {"removed": removed, "tmp_removed": tmp_removed}
+        live = set(live_manifest_filenames)
         for fname in os.listdir(self.storage_root):
             path = os.path.join(self.storage_root, fname)
-            if fname.endswith(".manifest.fks.tmp"):
+            if fname.endswith((MANIFEST_SUFFIX + ".tmp", TRAITS_SUFFIX + ".tmp")):
                 set_immutable(path, False)
                 os.remove(path)
                 tmp_removed += 1
-            elif fname.endswith(".manifest.fks") and fname not in live_manifest_filenames:
+            elif fname.endswith(MANIFEST_SUFFIX) and fname not in live:
                 set_immutable(path, False)
                 os.remove(path)
                 removed += 1
+            elif fname.endswith(TRAITS_SUFFIX) and fname[: -len(TRAITS_SUFFIX)] + MANIFEST_SUFFIX not in live:
+                set_immutable(path, False)
+                os.remove(path)
         return {"removed": removed, "tmp_removed": tmp_removed}
 
     def vacuum(self) -> dict:

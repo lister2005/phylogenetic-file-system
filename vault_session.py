@@ -9,7 +9,8 @@ import pickle
 import hashlib
 from cryptography.exceptions import InvalidTag
 from gearhash.master_key_store import create_new_vault_key, load_vault_key, WrongPassphraseError, MASTER_KEY_FILENAME
-from gearhash.pipeline import StoragePipeline
+from gearhash.pipeline import (StoragePipeline, MANIFEST_SUFFIX, TRAITS_SUFFIX,
+                               read_similarity_fingerprint, similarity_fingerprint_count)
 from gearhash.crypto import CryptoEngine
 from gearhash.dedup_index import DB_FILENAME, GlobalBlockIndex
 from gearhash.keyring import KEYRING_FILENAME
@@ -142,7 +143,7 @@ class VaultSession:
                 os.remove(path)
                 removed.append(fname)
         for fname in os.listdir(self.storage_root):
-            if fname.endswith(".manifest.fks") or fname.endswith(".manifest.fks.tmp"):
+            if fname.endswith((MANIFEST_SUFFIX, TRAITS_SUFFIX, MANIFEST_SUFFIX + ".tmp", TRAITS_SUFFIX + ".tmp")):
                 os.remove(os.path.join(self.storage_root, fname))
                 removed.append(fname)
         return removed
@@ -175,6 +176,12 @@ class VaultSession:
         raw = self.crypto.decrypt_block(encrypted, associated_data=manifest_filename.encode())
         engine = FKSLookupEngine(raw_bytes=raw)
         return engine.metadata
+
+    def read_similarity_fingerprint(self, manifest_path: str, metadata: dict = None):
+        return read_similarity_fingerprint(manifest_path, self.crypto, metadata)
+
+    def similarity_fingerprint_count(self, manifest_path: str, metadata: dict = None):
+        return similarity_fingerprint_count(manifest_path, self.crypto, metadata)
 
     def manifest_path_for(self, label: str) -> str:
         return os.path.join(self.storage_root, self.catalog[label])

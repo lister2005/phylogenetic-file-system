@@ -9,7 +9,6 @@ import re
 import tempfile
 
 from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
-from gearhash import fingerprint as stored_fingerprint
 from reconstruct import reconstruct
 from vault_session import MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
@@ -128,7 +127,7 @@ class PythonEngineAdapter(_CladeTracking):
             "duplicate_chunks_found": meta.get("duplicate_chunks_found", 0),
             "original_size": meta.get("original_size", 0),
             "phenotype_name": meta.get("phenotype_name", "Unknown Binary"),
-            "similarity_fingerprint": stored_fingerprint.unpack(meta.get("similarity_fingerprint")),
+            "similarity_fingerprint": self._session.read_similarity_fingerprint(manifest_path, meta),
             "manifest_filename": manifest_filename,
         }
 

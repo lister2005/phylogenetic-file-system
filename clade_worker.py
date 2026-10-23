@@ -58,7 +58,7 @@ def filtered_view(snapshot: CladeSnapshot, live_labels, min_members: int = 1):
 
 
 def python_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
-    """Loader for a VaultSession: reads and decrypts one manifest file (no
+    """Loader for a VaultSession: reads and decrypts one fingerprint file (no
     SQLite), so it's safe on the worker thread. Deleted labels load as None.
     """
     import os
@@ -67,11 +67,7 @@ def python_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
         manifest_filename = session.catalog.get(label)
         if manifest_filename is None:
             return None
-        try:
-            meta = session.read_manifest_metadata(os.path.join(session.storage_root, manifest_filename))
-        except FileNotFoundError:
-            return None
-        return stored_fingerprint.unpack(meta.get("similarity_fingerprint"))
+        return session.read_similarity_fingerprint(os.path.join(session.storage_root, manifest_filename))
     return load
 
 

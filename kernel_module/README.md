@@ -108,7 +108,7 @@ action that should be a **human's own deliberate choice**, run
 interactively, on a machine they're prepared to reboot if something goes
 wrong (a disposable VM or a machine you can tolerate a hard reset on is the
 safer choice over doing this on your only/primary machine) -- never
-something run unattended or by an automated agent.
+something run unattended or by an automated tool.
 
 If a human operator wants to try it themselves, here is exactly what that
 would involve:
