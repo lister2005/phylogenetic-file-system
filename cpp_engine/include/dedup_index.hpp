@@ -1,13 +1,7 @@
 #pragma once
-// C++ port of gearhash/dedup_index.py's GlobalBlockIndex -- links
-// libsqlite3 directly (the SAME global_index.db file Python already
-// creates; SQLite's format is language-agnostic) and OpenSSL for the
-// HKDF/HMAC/AES-256-GCM confidentiality scheme, replicated to match
-// exactly (verified byte-for-byte against the Python reference via
-// hkdf_check.cpp before this was written). Goal: remove the Python
-// object-construction overhead profiling flagged (hmac.new() building a
-// fresh object per lookup, sqlite3 Python-module call overhead) without
-// changing anything about what's actually stored on disk.
+// C++ port of dedup_index.py's GlobalBlockIndex: the same global_index.db,
+// with the same HKDF/HMAC/AES-256-GCM scheme (checked byte-for-byte by
+// hkdf_check.cpp).
 
 #include <array>
 #include <cstdint>
@@ -36,12 +30,9 @@ struct MirrorEntry {
     uint64_t length;
 };
 
-// Like BlockEntry, but with the content hash included -- what a full
-// table scan (iter_all) needs, since a plain BlockEntry alone gives you
-// no way to know WHICH chunk you're looking at. content_hash is packed
-// inside the encrypted value itself (see pack_value in dedup_index.cpp),
-// not derivable from lookup_key (that's a one-way HMAC), so a scan has
-// to decrypt every row anyway -- exactly what Python's iter_all() does.
+// A row with its content hash, for full scans. The hash is inside the
+// encrypted value (the lookup key is a one-way HMAC), so a scan decrypts
+// every row.
 struct FullBlockEntry {
     Bytes32 content_hash;
     uint64_t offset;
@@ -50,12 +41,8 @@ struct FullBlockEntry {
     uint32_t epoch_id;
 };
 
-// What a full scan of the mirrors table needs. Unlike FullBlockEntry,
-// content_hash isn't stored in the mirrors table's own encrypted payload
-// (set_mirror only ever packs offset+length -- content_hash is used
-// purely as part of the AAD, not as plaintext) -- iter_all_mirrors()
-// recovers it by joining against the blocks table on the shared
-// lookup_key instead. See dedup_index.cpp for the exact mechanism.
+// A mirror row with its content hash, for full scans. Mirror payloads
+// don't hold the hash; iter_all_mirrors() joins with `blocks` to get it.
 struct FullMirrorEntry {
     Bytes32 content_hash;
     uint64_t offset;
@@ -64,9 +51,7 @@ struct FullMirrorEntry {
 
 class DedupIndex {
 public:
-    // kek: the 32-byte master Key-Encryption-Key (VaultSession's
-    // crypto.key in the Python code). Subkeys are derived here, once,
-    // matching _derive_subkeys() exactly.
+    // kek: the 32-byte KEK. Subkeys are derived once, as _derive_subkeys() does.
     DedupIndex(const std::string& db_path, const Bytes32& kek);
     ~DedupIndex();
 
@@ -79,70 +64,38 @@ public:
 
     std::optional<BlockEntry> lookup(const Bytes32& content_hash);
 
-    // Batched form of lookup() (PART 8 item #1 -- see cpp_port_plan.txt's
-    // 1.5GB-benchmark profiling, ~19% of the core write loop was one
-    // SELECT + one INSERT per chunk): ONE `WHERE lookup_key IN (...)`
-    // query for N hashes at once instead of N individual point lookups.
-    // content_hashes may contain duplicates (harmless -- SQLite doesn't
-    // care about repeated IN-clause values, and the result map naturally
-    // collapses them since they'd decrypt to the same row anyway). Only
-    // hashes actually found in the table appear as keys in the result,
-    // matching lookup()'s "None means not found" contract per-entry.
+    // Batched lookup(): one IN (...) query. Duplicates are fine; missing
+    // hashes are absent from the result.
     std::map<Bytes32, BlockEntry> lookup_many(const std::vector<Bytes32>& content_hashes);
 
     void register_new(const Bytes32& content_hash, uint64_t offset, uint64_t length, uint32_t epoch_id);
     void increment_ref(const Bytes32& content_hash);
-    uint32_t decrement_ref(const Bytes32& content_hash);  // returns new ref_count
-    void set_ref_count(const Bytes32& content_hash, uint32_t ref_count);  // rebuild_ref_counts' repair path
-    void update_offset(const Bytes32& content_hash, uint64_t new_offset);  // vacuum's compaction path
+    uint32_t decrement_ref(const Bytes32& content_hash);  // returns the new ref_count
+    void set_ref_count(const Bytes32& content_hash, uint32_t ref_count);  // for rebuild_ref_counts
+    void update_offset(const Bytes32& content_hash, uint64_t new_offset);  // for vacuum
 
-    // Drops the row from BOTH blocks and mirrors -- vacuum's dead-chunk
-    // sweep. Returns true iff a mirrors row actually existed and was
-    // dropped, so the caller (vacuum's mirror-container compaction pass)
-    // can tell whether this dead chunk was ever mirrored at all, without
-    // a second query.
+    // Drops a chunk's row from blocks and mirrors. True if it had a mirror
+    // row (vacuum uses this to decide on mirror compaction).
     bool remove(const Bytes32& content_hash);
 
     std::optional<MirrorEntry> get_mirror(const Bytes32& content_hash);
     void set_mirror(const Bytes32& content_hash, uint64_t offset, uint64_t length);
 
-    // Batched form of the private upsert() the single-chunk register_new/
-    // increment_ref/etc. all funnel through: ONE multi-row
-    // `INSERT ... VALUES (?,?),(?,?),... ON CONFLICT DO UPDATE` for all
-    // given (content_hash, offset, length, ref_count, epoch_id) rows
-    // instead of one upsert statement execution per row. Used by the
-    // write-loop's per-window flush -- see pipeline.cpp's
-    // secure_and_persist_file for how repeat occurrences of the same hash
-    // within one window are folded into a single final-state row here,
-    // rather than one row write per occurrence.
+    // Batched upsert: one multi-row INSERT ... ON CONFLICT DO UPDATE for
+    // (content_hash, offset, length, ref_count, epoch_id) rows, one per hash.
     void upsert_many(const std::vector<std::tuple<Bytes32, uint64_t, uint64_t, uint32_t, uint32_t>>& entries);
 
-    // Full table scan, every row decrypted -- rebuild_ref_counts/vacuum/
-    // fsck's shared authoritative source (matches Python's iter_all()).
+    // Every row, decrypted (for rebuild_ref_counts, vacuum, fsck).
     std::vector<FullBlockEntry> iter_all();
 
-    // Full scan of the mirrors table, content_hash recovered via a join
-    // against blocks (see FullMirrorEntry) -- vacuum()'s mirror-container
-    // compaction pass, matching Python's iter_all_mirrors().
+    // Every mirror row, with its content hash from a join on `blocks`.
     std::vector<FullMirrorEntry> iter_all_mirrors();
 
-    // SQLite's own VACUUM -- only worth calling after remove() actually
-    // dropped rows (it rewrites the whole index file regardless of how
-    // little there is to reclaim). Must run OUTSIDE any transaction.
+    // SQLite VACUUM. Rewrites the whole file; outside any transaction.
     void compact();
 
-    // Re-prepares the 4 cached statements against the database's
-    // CURRENT structure. Must be called after ANY VACUUM on the same
-    // underlying file, even one run through a completely separate
-    // DedupIndex/connection (as StoragePipeline::vacuum() does, since
-    // SQLite refuses to VACUUM a connection that has prepared
-    // statements outstanding, and this object's are never finalized
-    // during its lifetime otherwise) -- VACUUM rebuilds the whole file
-    // in place, so any OTHER connection's statements, prepared against
-    // the old structure, silently fail on their next use ("upsert
-    // failed") if not refreshed. A real bug, caught by testing the
-    // exact sequence a session actually goes through: write, delete,
-    // vacuum, write again.
+    // Re-prepares the cached statements. Needed after any VACUUM of the same
+    // file, even from another connection, or the next use fails.
     void refresh_prepared_statements();
 
 private:
@@ -151,13 +104,7 @@ private:
     Bytes32 hmac_key_{};
     Bytes32 value_key_{};
 
-    // Prepared once, reused via sqlite3_reset()/sqlite3_clear_bindings()
-    // on every call instead of re-parsing the SQL from scratch each
-    // time -- matches what Python's sqlite3 module already does for you
-    // automatically (its own internal statement cache). Without this,
-    // an early version of this benchmark was, misleadingly, SLOWER than
-    // Python -- not because C++ has no advantage here, but because it
-    // was silently redoing work Python was already skipping.
+    // Prepared once and reused (reset + clear bindings), like Python's statement cache.
     sqlite3_stmt* stmt_lookup_block_ = nullptr;
     sqlite3_stmt* stmt_upsert_block_ = nullptr;
     sqlite3_stmt* stmt_lookup_mirror_ = nullptr;

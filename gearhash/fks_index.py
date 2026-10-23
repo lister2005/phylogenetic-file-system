@@ -25,7 +25,7 @@ class FKSIndexBuilder:
         return ((a * key) % FKS_PRIME) % m
 
     def build(self) -> None:
-        rng = random.Random()  # unseeded -> draws from OS entropy, not deterministic
+        rng = random.Random()  # OS entropy: not deterministic
         
         while True:
             self.a1 = rng.randint(1, FKS_PRIME - 1)
@@ -74,9 +74,7 @@ class FKSIndexBuilder:
                     break
 
     def serialize(self) -> bytes:
-        """Returns the pickled state as bytes, without touching disk --
-        callers that need this encrypted (e.g. the storage pipeline)
-        encrypt these bytes themselves before writing them anywhere."""
+        """The pickled state as bytes; callers encrypt it themselves."""
         state = {
             "m1": self.m1,
             "a1": self.a1,
@@ -89,9 +87,7 @@ class FKSIndexBuilder:
         return pickle.dumps(state)
 
     def save_to_file(self, filepath: str) -> None:
-        """Unencrypted save. Fine for non-sensitive uses; anything holding
-        real filenames/sizes/hashes should use serialize() + your own
-        crypto engine instead (see StoragePipeline)."""
+        """Unencrypted save; sensitive data should use serialize() and encrypt."""
         with open(filepath, "wb") as f:
             f.write(self.serialize())
 
@@ -130,10 +126,7 @@ class FKSLookupEngine:
         return None
 
     def enumerate_all(self):
-        """Yields every (key, value) pair currently stored in this index.
-        FKS is a static structure -- this is how a growing index (like the
-        cross-file dedup block index) gets reloaded before being rebuilt
-        with new entries added."""
+        """Yields every stored (key, value)."""
         for bucket in self.secondary_tables:
             for entry in bucket:
                 if entry is not None:

@@ -1,38 +1,14 @@
 #!/usr/bin/env python3
 """
-Interactive-passphrase launcher for the compiled C++ FUSE driver
-(cpp_engine/build/pfs_fuse_cpp).
-
-WHY THIS EXISTS: pfs_fuse_cpp.cpp takes its 32-byte KEK directly via the
-PFS_KEK_HEX environment variable (see its own top-of-file comment) --
-master_key_store.py's scrypt-based passphrase -> KEK derivation was
-deliberately never ported to C++. This project's established split
-(cpp_port_plan.txt's binding section, and c_api.h's own docstring):
-Python keeps owning "passphrase -> KEK"; C++ owns "given a key, do fast
-storage operations". Reimplementing scrypt natively in C++ would mean
-maintaining a second, independent copy of security-critical KDF code
-with no real benefit -- this script instead reuses the EXISTING,
-ALREADY-CORRECT create_new_vault_key()/load_vault_key() (the same two
-functions pfs_cli.py's CppPFSShell already calls to unlock a C++-engine
-vault interactively), derives the real KEK, and then execs the compiled
-binary with it -- no new crypto, just wiring the proven code up to the
-FUSE entry point that was missing it.
+Passphrase launcher for the C++ FUSE driver, which takes its KEK in
+PFS_KEK_HEX. The passphrase -> KEK step (scrypt) stays in Python
+(master_key_store), as everywhere else; this derives the KEK and
+os.execv()s the binary, so the key is never on disk or in argv.
 
 Usage:
   python3 mount_pfs_cpp.py <storage_root> <mountpoint> [fuse options...]
 
-Prompts for the vault passphrase on a real TTY (new vault: set +
-confirm; existing vault: enter once), derives the KEK, sets
-PFS_KEK_HEX in this process's environment, then os.execv()s the
-compiled pfs_fuse_cpp binary -- replacing this process outright rather
-than forking, so the KEK never sits around in a Python process that
-then has to remember to clean it up, and never touches disk or a
-command-line argument (visible to other users via `ps`).
-
-Scope, deliberately matching pfs_fuse_cpp.cpp's own: foreground mount
-only -- that binary doesn't daemonize itself (see its top-of-file
-comment), so neither does this launcher. Unmount with
-`fusermount3 -u <mountpoint>`, same as any other FUSE mount.
+Foreground only. Unmount with fusermount3 -u <mountpoint>.
 """
 import getpass
 import os
@@ -45,10 +21,7 @@ from gearhash.master_key_store import (
 _CPP_BINARY = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "cpp_engine", "build", "pfs_fuse_cpp")
 
-# The same marker files pfs_cli.py's _existing_vault_engine() checks --
-# duplicated narrowly here (two filenames each) rather than importing
-# pfs_cli.py itself, which would pull in the entire Python-engine
-# interactive shell just to reuse a helper function.
+# The engines' marker files (as in pfs_cli.py), without importing the whole shell.
 _CPP_CATALOG_FILENAME = "catalog.pfsc"
 _CPP_KEYRING_FILENAME = "keyring.pfsk"
 _PY_CATALOG_FILENAME = "catalog.enc"
@@ -69,10 +42,7 @@ def _existing_vault_engine(storage_root: str):
 
 
 def unlock_or_create(storage_root: str) -> bytes:
-    """Prompts on the controlling terminal and returns the real 32-byte
-    KEK -- same create_new_vault_key()/load_vault_key() calls
-    pfs_cli.py's CppPFSShell already makes, so a vault created/unlocked
-    through one is fully interoperable with the other."""
+    """Prompts on the terminal and returns the 32-byte KEK."""
     os.makedirs(storage_root, exist_ok=True)
 
     engine = _existing_vault_engine(storage_root)
@@ -124,11 +94,7 @@ def main():
 
     kek = unlock_or_create(storage_root)
 
-    # Set in THIS process's environment, then exec (not fork+exec) --
-    # execv replaces the process image in place but keeps the current
-    # environment, so PFS_KEK_HEX carries straight over to the
-    # replacement without ever being written to disk or passed as a
-    # visible argv entry.
+    # execv keeps the environment, so PFS_KEK_HEX reaches the binary without argv or disk.
     os.environ["PFS_KEK_HEX"] = kek.hex()
 
     print(f"Mounting at {mountpoint} (foreground). Unmount with: fusermount3 -u {mountpoint}")

@@ -17,11 +17,7 @@ namespace {
 
 std::optional<LineageNode> find_common_ancestor(const LineageStore& lineage, const LineageNode& node_a,
                                                   const LineageNode& node_b) {
-    // Walks PRIMARY parent pointers back from both nodes -- a simple
-    // linear walk, fine at this project's scale (one label's own
-    // history), not the kind of graph size that needs a real LCA
-    // algorithm. Matches vault_session.py's _find_common_ancestor
-    // exactly.
+    // Lowest common ancestor along primary parents (a linear walk: one label's history is small).
     std::set<NodeUuid> ancestors_a;
     std::optional<LineageNode> node = node_a;
     while (node) {
@@ -36,9 +32,7 @@ std::optional<LineageNode> find_common_ancestor(const LineageStore& lineage, con
     return std::nullopt;
 }
 
-// This generation's ordered (block_index -> content_hash) list -- the
-// real, already-stored data merge_branches diffs against, no separate
-// delta storage needed. Matches vault_session.py's _manifest_chunk_list.
+// A generation's ordered chunk hashes.
 std::vector<Bytes32> manifest_chunk_list(const std::string& storage_root, const std::string& manifest_filename,
                                           const Bytes32& kek) {
     std::string manifest_path = storage_root + "/" + manifest_filename;
@@ -87,13 +81,7 @@ MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, con
     std::vector<Bytes32> chunks_a = manifest_chunk_list(storage_root, node_a.manifest_filename, kek);
     std::vector<Bytes32> chunks_b = manifest_chunk_list(storage_root, node_b.manifest_filename, kek);
 
-    // std::optional<Bytes32> as the _ABSENT sentinel: nullopt compares
-    // unequal to any real hash and equal to itself, exactly what "this
-    // branch's chunk list doesn't reach this position" needs -- same
-    // reasoning as Python's dedicated `_ABSENT = object()` sentinel
-    // (not None, which a real chunk hash could never equal anyway, but
-    // this project's Python side uses an explicit sentinel for
-    // clarity; std::optional gives the identical semantics natively).
+    // nullopt means "this branch has no chunk at this position": unequal to any hash.
     auto at = [](const std::vector<Bytes32>& v, size_t i) -> std::optional<Bytes32> {
         if (i < v.size()) return v[i];
         return std::nullopt;
@@ -118,20 +106,15 @@ MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, con
         } else if (b_changed && !a_changed) {
             winner = b;
         } else if (a == b) {
-            winner = a;  // both changed, but agree (including both truncating here) -- no real conflict
+            winner = a;  // both changed the same way (including both truncating)
         } else {
-            // Both changed, DIFFERENTLY -- including "one branch
-            // truncated here while the other made an unrelated real
-            // edit at this same position", a genuine delete-vs-edit
-            // divergence, not something to silently pick a winner for.
+            // Changed differently by both, including truncation vs. edit.
             conflicts.push_back(static_cast<uint64_t>(i));
             continue;
         }
 
         if (!winner) {
-            // The winning choice at this position is "doesn't exist" --
-            // one or both branches truncated the file here. Stop the
-            // merged sequence here rather than emitting a placeholder.
+            // Truncated here: end the merged sequence.
             break;
         }
         merged.push_back(*winner);

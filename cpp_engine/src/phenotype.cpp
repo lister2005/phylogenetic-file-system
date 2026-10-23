@@ -15,8 +15,7 @@ struct Signature {
     const char* name;
 };
 
-// (magic bytes, offset, mask, name) -- checked in order, first match
-// wins. Byte-for-byte the same table as phenotype.py's _SIGNATURES.
+// (magic bytes, offset, mask, name), first match wins: phenotype.py's _SIGNATURES.
 const Signature kSignatures[] = {
     {"%PDF-", 5, 0, 0x0001, "PDF Document"},
     {"\x89PNG\r\n\x1a\n", 8, 0, 0x0002, "PNG Image"},
@@ -24,11 +23,7 @@ const Signature kSignatures[] = {
     {"GIF87a", 6, 0, 0x0004, "GIF Image"},
     {"GIF89a", 6, 0, 0x0004, "GIF Image"},
     {"PK\x03\x04", 4, 0, 0x0005, "ZIP Archive (or ZIP-based format: docx/xlsx/jar/apk...)"},
-    // "\x7f" "ELF", not "\x7fELF" -- C++ hex escapes are greedy and 'E'
-    // is itself a valid hex digit, so \x7fELF would parse as the
-    // (out-of-range, silently wrong) escape \x7fE followed by "LF".
-    // Caught by phenotype_test.cpp's cross-check against real Python,
-    // which is exactly the kind of bug that check exists to catch.
+    // "\x7f" "ELF": a greedy hex escape would swallow the E.
     {"\x7f" "ELF", 4, 0, 0x0006, "ELF Binary"},
     {"ID3", 3, 0, 0x0007, "MP3 Audio"},
     {"ftyp", 4, 4, 0x0008, "MP4/MOV Media"},
@@ -38,12 +33,8 @@ const Signature kSignatures[] = {
     {"BM", 2, 0, 0x000C, "BMP Image"},
 };
 
-// Minimal UTF-8 well-formedness check -- close enough to what Python's
-// bytes.decode("utf-8") accepts/rejects for this heuristic's purpose
-// (leading-byte shape + continuation-byte shape), not a byte-exact
-// port of Python's strict decoder (doesn't reject overlong encodings
-// or surrogate code points) -- an acceptable divergence for a
-// best-effort phenotype GUESS, not a security-relevant check.
+// Minimal UTF-8 well-formedness check for the text heuristic (doesn't
+// reject overlong encodings or surrogates, unlike Python's decoder).
 bool is_valid_utf8(const uint8_t* data, size_t len) {
     size_t i = 0;
     while (i < len) {

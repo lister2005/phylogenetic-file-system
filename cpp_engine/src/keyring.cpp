@@ -17,7 +17,7 @@ namespace {
 
 constexpr char kMagic[4] = {'P', 'F', 'S', 'K'};
 constexpr uint16_t kVersion = 1;
-constexpr size_t kWrappedDekSize = 12 + 32 + 16;  // IV + DEK + GCM tag -- always exactly this size
+constexpr size_t kWrappedDekSize = 12 + 32 + 16;  // IV + DEK + GCM tag
 
 std::string aad_for_epoch(uint32_t epoch_id) {
     return "epoch:" + std::to_string(epoch_id);
@@ -104,11 +104,7 @@ void KeyRing::save() {
         buf.insert(buf.end(), wrapped.begin(), wrapped.end());
     }
 
-    // Atomic write-temp-then-rename-then-fsync -- a deliberate small
-    // improvement over keyring.py's direct in-place overwrite (same
-    // durability reasoning as manifest.cpp's write_manifest_file, and
-    // cheap here since a keyring is tiny). Immutability is cleared
-    // before writing and reapplied after, same as Python.
+    // Temp file + rename + fsync, clearing +i before and restoring it after.
     bool was_immutable = file_exists(path_);
     if (was_immutable) set_immutable(path_, false);
 

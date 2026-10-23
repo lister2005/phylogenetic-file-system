@@ -1,19 +1,6 @@
 """
-Phenotype detection: identifies a file's true format from its own
-content -- magic bytes / file signature -- instead of trusting a
-filename extension. Per the design doc: "a user can name a file
-absolutely anything, or give it no name at all, and the kernel will
-always know exactly what it is." This is the mapping from raw bytes to
-a Phenotype_Mask, used instead of '.pdf'/'.png'/etc: a Node's identity
-is defined by its Expressed Genes (magic numbers / structural headers),
-not a three-letter tag someone could rename away.
-
-Deliberately a small, explicit signature table rather than pulling in a
-general "file type sniffing" library (like python-magic/libmagic) --
-keeping this dependency-free and matching the small set of concrete
-magic-byte examples the design doc itself calls out (PDF's %PDF, PNG's
-8-byte signature, and so on), rather than a large opaque database this
-project doesn't need yet. Extending the table is a one-line add.
+Phenotype detection: a file's type from its magic bytes, never its name.
+A small explicit signature table; extending it is a one-line add.
 """
 
 from typing import NamedTuple
@@ -46,11 +33,9 @@ _SIGNATURES = [
 
 
 def detect(data: bytes) -> Phenotype:
-    """`data` should be the first ~64 bytes of the file -- every
-    signature above fits well within that. Falls back to a simple
-    printable-text heuristic, then to UNKNOWN. Never raises -- an
-    unrecognized or empty sample is a legitimate, expected outcome
-    (UNKNOWN), not an error."""
+    """`data`: the first ~64 bytes. Falls back to a printable-text heuristic,
+    then UNKNOWN. Never raises.
+    """
     for magic, offset, mask, name in _SIGNATURES:
         end = offset + len(magic)
         if len(data) >= end and data[offset:end] == magic:
@@ -67,8 +52,7 @@ def _looks_like_text(sample: bytes) -> bool:
         sample.decode("utf-8")
     except UnicodeDecodeError:
         return False
-    # Reject control-byte-heavy samples a real text file wouldn't have
-    # (allow common whitespace: tab, newline, carriage return).
+    # Mostly control bytes (other than tab/newline/CR) means not text.
     printable = sum(1 for b in sample if b >= 0x20 or b in (0x09, 0x0A, 0x0D))
     return printable / len(sample) > 0.95
 

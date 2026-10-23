@@ -1,28 +1,17 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * pfsfs -- a mountable, in-memory filesystem applying PFS's storage model
- * inside the kernel (manual.txt PART 8 item #8).
+ * pfsfs: PFS's storage model as a mountable in-memory filesystem
+ * (mount -t pfsfs none /mnt/pfs).
  *
- *   mount -t pfsfs none /mnt/pfs
+ * The working copy is in the page cache, as in ramfs. Closing a written file
+ * records a new generation unless the content is unchanged: content-defined
+ * chunks (the userspace Gear table and parameters), SHA-256 hashed and
+ * stored once per mount. .pfs_lineage lists generations and dedup totals;
+ * writing "<name> <generation>" to .pfs_checkout and reading it back
+ * rebuilds that generation from its chunks.
  *
- * A file's working copy lives in the page cache, as in ramfs. When a
- * file that was written is closed, pfsfs "speciates" it: the content is
- * cut into content-defined chunks (Gear hash, same table and parameters
- * as the userspace engines), each chunk is SHA-256 hashed and stored
- * once per mount however many files or generations share it, and the
- * file gains a new generation -- unless it's byte-identical to its
- * current one. Two read-only/control files at the root expose this:
- *
- *   .pfs_lineage   every file's generations, plus dedup totals
- *   .pfs_checkout  write "<name> <generation>", then read that past
- *                  generation back, rebuilt from its chunks (each chunk's
- *                  hash re-checked)
- *
- * Not here (userspace only): encryption, persistence (everything is lost
- * on unmount), clade clustering, merge/fork. The namespace is flat, like
- * PFS labels: no subdirectories.
- *
- * Written against kernel 7.0 headers and compiled; never loaded or run.
+ * No encryption, persistence or clustering; flat namespace. Compiled
+ * against kernel 7.0 headers, never loaded or run.
  */
 #include <linux/fs.h>
 #include <linux/fs_context.h>
@@ -43,7 +32,7 @@
 
 #define PFSFS_MAGIC 0x50465331 /* "PFS1" */
 
-/* Storage chunking profile, matching gearhash/pipeline.py and pipeline.cpp. */
+/* Storage chunking profile, as gearhash/pipeline.py and pipeline.cpp. */
 #define PFS_CHUNK_MASK 0x1FFFULL
 #define PFS_CHUNK_MIN 4096
 #define PFS_CHUNK_MAX 16384

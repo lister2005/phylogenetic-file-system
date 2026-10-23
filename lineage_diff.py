@@ -1,27 +1,9 @@
 """
-Real lineage diff: computes what actually mutated between two
-GENERATIONS of the SAME label's real edit history (lineage.py /
-cpp_engine's LineageStore) -- e.g. a node and its parent, or any two
-generations a Tree-view user picks.
+Lineage diff: what changed between two generations of the same label,
+by chunk position (each manifest is an ordered list of chunk hashes).
 
-This is deliberately NOT the same thing as pfs_gui.py's existing
-_show_diff_between, which compares two DIFFERENT LABELS' clade
-similarity fingerprints (a Jaccard-style % + shared/unique trait counts
-via PhylogeneticAnalyzer) -- that's clade-clustering machinery
-(unrelated-file similarity, see PORTFOLIO.md SS2.3), not lineage. This
-project has a hard-won rule against conflating the two (PORTFOLIO.md
-SS3.1): a clade comparison and a lineage diff must stay separate code
-paths. This module is the lineage one.
-
-Core primitive: a chunk-POSITION diff between two generations' ordered
-chunk-hash lists. Every manifest is already a flat array of block
-hashes (both engines' pfs_engine_adapter.get_chunk_hashes exposes it
-identically) -- no separate delta storage is needed to compute this.
-Same technique merge_branches() uses for its 3-way diff against a
-common ancestor (cpp_engine/src/merge.cpp, vault_session.py's
-merge_branches), just a simpler 2-way version: no common ancestor, no
-conflict detection, no merge -- just "what differs between exactly
-these two generations."
+Not the clade comparison in pfs_gui.py's _show_diff_between, which
+compares different labels' similarity; the two stay separate.
 """
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -35,7 +17,7 @@ DELETED = "deleted"      # position existed in the older generation only (file s
 @dataclass
 class ChunkDiffPosition:
     index: int
-    status: str  # one of UNCHANGED / NEW / CHANGED / DELETED
+    status: str  # UNCHANGED / NEW / CHANGED / DELETED
     old_hash: Optional[bytes]
     new_hash: Optional[bytes]
 
@@ -74,18 +56,11 @@ class LineageDiffResult:
 
 
 def diff_generations(adapter, label: str, generation_old: int, generation_new: int) -> LineageDiffResult:
-    """Real chunk-position diff between two generations of `label`'s own
-    lineage. `generation_old` is conventionally the earlier/ancestor
-    generation (e.g. a node's parent) and `generation_new` the later
-    one -- the math itself is symmetric, but the NEW/DELETED labeling
-    ("grew past old's length" / "old had a chunk old doesn't reach")
-    assumes this direction, so callers picking two arbitrary tree nodes
-    should order them by generation_index before calling this (which
-    is what pfs_gui.py's caller does).
+    """Chunk-position diff between two generations of `label`. Pass the older
+    generation first: NEW means past its end, DELETED means only it had that
+    position.
 
-    `adapter` is a PythonEngineAdapter or CppEngineAdapter (or anything
-    exposing the same .get_chunk_hashes(label, generation_index)
-    method) -- this function is engine-agnostic by construction.
+    `adapter`: anything with get_chunk_hashes(label, generation_index).
     """
     chunks_old = adapter.get_chunk_hashes(label, generation_old)
     chunks_new = adapter.get_chunk_hashes(label, generation_new)
@@ -97,9 +72,9 @@ def diff_generations(adapter, label: str, generation_old: int, generation_new: i
         new = chunks_new[i] if i < len(chunks_new) else None
         if old is not None and new is not None:
             status = UNCHANGED if old == new else CHANGED
-        elif new is not None:  # old is None -- position only reached by the newer generation
+        elif new is not None:  # only the newer generation reaches this position
             status = NEW
-        else:  # new is None, old is not -- position only reached by the older generation
+        else:  # only the older generation reaches this position
             status = DELETED
         positions.append(ChunkDiffPosition(i, status, old, new))
 

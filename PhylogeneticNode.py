@@ -3,16 +3,11 @@ import uuid
 import struct
 from typing import List, Optional, Set
 
-# Fixed-size header layout, matching the C struct's fixed fields:
+# Serialized form: the C struct's fixed fields
 #   node_uuid[16] + parent_uuid[16] + generation_index(u64) +
 #   branch_signature(u32) + birth_timestamp(u64) + delta_size(u64)
-# The struct's two pointer fields (trait_matrix_ptr, mutation_delta) can't
-# serialize literally -- pointers aren't meaningful outside one process's
-# memory. The standard way to serialize "a struct with pointers" is what's
-# used here: a fixed header (with size fields) followed by the variable-
-# length payload sections it points to, in order. delta_size (already in
-# the header) tells a reader how many mutation_delta bytes follow; the
-# trait matrix entry count is written just before its own section.
+# followed by the variable-length sections its pointers referred to:
+# the trait count and hashes, then delta_size bytes of mutation_delta.
 _HEADER_FORMAT = "16s16sQIQQ"
 _HEADER_SIZE = struct.calcsize(_HEADER_FORMAT)
 _TRAIT_HASH_SIZE = 32  # SHA-256 digest
@@ -23,42 +18,26 @@ class PhylogeneticNode:
         self.node_uuid: bytes = uuid.uuid4().bytes  # 16 raw bytes, matches uint8_t[16]
         self.parent_uuid: Optional[bytes] = parent_uuid
         self.generation_index = 0
-        self.branch_signature = 0  # bitmask -- see note in TreeConstructor
+        self.branch_signature = 0  # bitmask, see TreeConstructor
         self.birth_timestamp = int(time.time())
 
-        # The Genetic Material: chunk content hashes (32-byte SHA-256
-        # digests from PhylogeneticAnalyzer), NOT ints -- this was
-        # mistyped before.
+        # Chunk content hashes (32-byte SHA-256 digests).
         self.trait_matrix: Set[bytes] = set()
 
-        # delta_size / mutation_delta are for the LINEAGE DAG only (real
-        # per-edit deltas between actual file versions -- see
-        # TreeConstructor.py's module docstring for the distinction).
-        # They stay at these defaults on clade-clustering-tree nodes,
-        # since internal cluster nodes have no real byte content to
-        # take a delta of.
+        # Lineage-only; left at the defaults on clustering nodes, which have no content.
         self.delta_size = 0
         self.mutation_delta: bytes = b""
 
-        # Clustering-tree-only diagnostic: count of traits that differ
-        # between this node's two children at a merge. This is a
-        # similarity STATISTIC for clustering visualization, NOT a real
-        # storage delta -- do not confuse with delta_size above.
+        # Clustering diagnostic: traits that differ between the two children. Not a storage delta.
         self.trait_divergence_count = 0
 
-        # Needed for real UPGMA (the arithmetic-mean update formula is
-        # weighted by cluster size) and useful for NJ/visualization too.
+        # Cluster size, for UPGMA's weighted average.
         self.leaf_count = 1
-        # UPGMA-specific: ultrametric height above this node's descendant
-        # leaves (cumulative). Meaningless for NJ, which isn't ultrametric
-        # -- NJ nodes leave this at 0 and use branch_length instead.
+        # UPGMA only: ultrametric height above the leaves (0 for NJ).
         self.height = 0.0
-        # Universal: edge length from this node up to its own parent.
-        # Set by whichever algorithm builds the tree. This is the field
-        # to use for rendering/measuring branches regardless of which
-        # algorithm produced the tree.
+        # Edge length to the parent, for either algorithm.
         self.branch_length = 0.0
-        # Set by TreeConstructor for leaves; convenient for visualization.
+        # Set for leaves.
         self.metadata_name: Optional[str] = None
 
     def uuid_hex(self) -> str:
@@ -83,9 +62,7 @@ class PhylogeneticNode:
         }
 
     def to_bytes(self) -> bytes:
-        """Binary layout matching the C struct's fixed fields, followed
-        by the trait matrix (count + sorted 32-byte hashes) and the
-        mutation_delta payload."""
+        """The fixed header, then the trait count and sorted hashes, then mutation_delta."""
         parent = self.parent_uuid or b"\x00" * 16
         header = struct.pack(
             _HEADER_FORMAT,

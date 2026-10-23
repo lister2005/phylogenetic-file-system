@@ -1,32 +1,10 @@
-// C++ port of pfs_fuse.py -- Component 3 of the port. Uses libfuse3's
-// high-level path-based API (struct fuse_operations + fuse_main()),
-// the closest match to fusepy's own high-level Operations class that
-// pfs_fuse.py is built on, for a natural, direct port.
+// FUSE mount of a C++-engine vault (libfuse3 high-level API), the
+// counterpart of pfs_fuse.py: same clade layout (unclustered files at the
+// root, clades as directories named after their smallest member, kept by
+// a background CladeWorker), same streaming I/O.
 //
-// Two-level clade presentation (see pfs_fuse.py's own _resolve()/
-// _get_clades()/PORTFOLIO.md Sec 2.4): files with no near neighbor sit
-// at the mount root; files that cluster (2+ members, Jaccard distance
-// <= phylo.hpp's kDefaultCladeThreshold) appear grouped into a computed
-// subdirectory named after the clade's lexicographically-smallest
-// member. The partition (compute_clades()'s, over every label's stored
-// SIMILARITY_PROFILE fingerprint) is maintained incrementally by a
-// background CladeWorker (clade_worker.hpp), never on the path of a
-// filesystem call: lookups use its latest partition filtered against the
-// live catalog, so a just-written file shows at the root until clustered.
-//
-// Still out of scope for this pass: the daemonization lifecycle (fork/
-// setsid/PID file/status/stop) pfs_fuse.py's CLI wraps around this --
-// this binary runs in the foreground only, matching how Python's OWN
-// Phase 2 milestone was first verified before daemonization was added.
-//
-// Passphrase-based vault unlocking: NOT done natively in C++ (scrypt
-// KEK derivation isn't ported here -- see cpp_port_plan.txt's binding
-// section for why that's deliberate). This binary still takes the KEK
-// directly via the PFS_KEK_HEX environment variable; mount_pfs_cpp.py
-// at the repo root is the real entry point for interactive use -- it
-// prompts for the passphrase, derives the KEK via the EXISTING, already-
-// tested gearhash.master_key_store.create_new_vault_key()/
-// load_vault_key(), and execs this binary with PFS_KEK_HEX set.
+// Foreground only. Takes the KEK in PFS_KEK_HEX; mount_pfs_cpp.py prompts
+// for the passphrase and execs this.
 #define FUSE_USE_VERSION 31
 #include <fuse3/fuse.h>
 
@@ -60,13 +38,9 @@ using namespace pfs_engine;
 
 namespace {
 
-// Streaming, memory bounded regardless of file size -- same model as
-// pfs_fuse.py's READ/WRITE MODEL. A handle reads through a
-// ManifestReader (only the chunks each read() touches are decrypted)
-// until its first write/truncate, which copies that version into a
-// scratch file on DISK; from then on reads and writes go to that file,
-// and release() commits it through VaultSession::commit_write().
-// Exactly one of reader / spill_fd is set at a time.
+// A handle reads through a ManifestReader until its first write or
+// truncate, which copies the version to a scratch file on disk; release()
+// commits it. Exactly one of reader / spill_fd is set.
 struct FileHandle {
     std::string label;
     std::unique_ptr<ManifestReader> reader;
@@ -75,8 +49,7 @@ struct FileHandle {
     bool dirty = false;
 };
 
-// How much of a version one ManifestReader::read() pulls at a time when
-// copying it into a scratch file (copy-on-first-write).
+// Bytes per ManifestReader read when copying a version into a scratch file.
 constexpr size_t kSpillCopyBytes = 1 << 20;
 
 struct PfsFuseState {
@@ -86,20 +59,16 @@ struct PfsFuseState {
     std::map<uint64_t, FileHandle> handles;
     uint64_t next_fh = 1;
 
-    // Background clade clustering (clade_worker.hpp), started in
-    // pfs_init(). Declared after `session` so it's destroyed (and its
-    // thread joined) first.
+    // Clade worker, started in pfs_init(). Declared after `session`, so it's destroyed first.
     std::unique_ptr<CladeWorker> clades;
-    // Filtered view of the worker's latest partition -- 2+ live members
-    // only -- rebuilt when the partition or the catalog changes. Guarded
-    // by `mutex`, same as catalog/handles -- every *_locked() helper
-    // below assumes the caller already holds it (std::mutex isn't
-    // reentrant, unlike Python's RLock, so callers must never lock twice).
+    // Filtered view of the worker's partition (2+ live members), rebuilt when
+    // it or the catalog changes. Guarded by `mutex`, which every *_locked()
+    // helper expects the caller to hold (it isn't reentrant).
     uint64_t catalog_epoch = 0;
     uint64_t view_version = UINT64_MAX;
     uint64_t view_epoch = UINT64_MAX;
-    std::map<std::string, std::vector<std::string>> clade_to_labels;  // 2+ members only
-    std::map<std::string, std::string> label_to_clade;                // member label -> clade name
+    std::map<std::string, std::vector<std::string>> clade_to_labels;
+    std::map<std::string, std::string> label_to_clade;
 };
 
 PfsFuseState* state() {
@@ -118,13 +87,8 @@ void label_removed_locked(PfsFuseState* st, const std::string& label) {
     if (st->clades) st->clades->removed(label);
 }
 
-// Brings clade_to_labels/label_to_clade up to date with the worker's
-// latest partition, never waiting for a recompute in progress. Filtered
-// against the live catalog, so a label deleted or renamed since the
-// partition was computed never appears; a new label sits at the root
-// until the worker has clustered it. Only clades with 2+ members are
-// directories -- a "clade" of one is just a file at the root, matching
-// pfs_fuse.py.
+// Refreshes clade_to_labels/label_to_clade from the worker's latest
+// partition, filtered by the catalog, without waiting.
 void ensure_clades_locked(PfsFuseState* st) {
     if (!st->clades) return;
     auto partition = st->clades->snapshot();
@@ -144,16 +108,12 @@ struct Resolved {
     std::string name;  // clade name (kCladeDir) or label (kFile); empty for kRoot
 };
 
-// Path convention, matching pfs_fuse.py's _resolve() exactly:
-//   "/"                  -> root
-//   "/<name>"             -> a clade subdirectory, if <name> names a
-//                            clade with 2+ members; otherwise a root-
-//                            level file, if <name> is a label that's
-//                            NOT currently in any clade (and either sits
-//                            in the catalog or has an open handle)
-//   "/<clade>/<label>"    -> a file, if <clade> is a real clade and
-//                            <label> is one of ITS members
-//   anything else (3+ components, or neither case above) -> unresolved
+// Paths, as in pfs_fuse.py's _resolve():
+//   "/"                -> root
+//   "/<name>"          -> a clade directory (2+ members), else a root-level
+//                         file not in any clade (in the catalog or open)
+//   "/<clade>/<label>" -> a member of that clade
+//   anything else      -> unresolved
 bool resolve_locked(PfsFuseState* st, const std::string& path, Resolved* out) {
     ensure_clades_locked(st);
 
@@ -226,9 +186,7 @@ void copy_into(ManifestReader& reader, int fd) {
     }
 }
 
-// Copy-on-first-write: moves a handle from streaming reads to its own
-// scratch file, copying the version it opened chunk by chunk (never the
-// whole file in memory). A no-op once done. Caller holds st->mutex.
+// Moves a handle to its own scratch file (once), copying chunk by chunk. Caller holds st->mutex.
 void materialize_locked(PfsFuseState* st, FileHandle& handle) {
     if (handle.spill_fd >= 0) return;
     auto [fd, path] = new_spill(st);
@@ -252,15 +210,12 @@ off_t handle_size(const FileHandle& handle) {
     return static_cast<off_t>(handle.reader->size());
 }
 
-// The Speciation-on-Write event: hands a complete scratch file to
-// commit_write(), the same path the CLI's 'write' uses. Takes ownership
-// of scratch_path and removes it either way.
+// Commits a complete scratch file via commit_write(); removes it either way.
 void commit(PfsFuseState* st, const std::string& label, const std::string& scratch_path) {
     try {
         std::lock_guard<std::mutex> lock(st->mutex);
         st->session->commit_write(label, scratch_path);
-        // The fingerprint is attached synchronously by commit_write, so
-        // the worker can cluster the new content right away.
+        // commit_write attached the fingerprint, so the worker can cluster now.
         label_changed_locked(st, label);
     } catch (...) {
         remove(scratch_path.c_str());
@@ -285,11 +240,7 @@ int pfs_getattr(const char* path, struct stat* stbuf, struct fuse_file_info*) {
         stbuf->st_nlink = 2;
         stbuf->st_uid = getuid();
         stbuf->st_gid = getgid();
-        // A directory entry left at the memset(0) default reads as the Unix
-        // epoch (Jan 1 1970) to `ls -la` and every other stat consumer --
-        // cosmetic but confusing (found during the new-user acceptance
-        // pass). Root/clade dirs are synthesized (no backing manifest file
-        // to take a real mtime from), so "now" is the honest answer.
+        // Synthesized directories have no manifest to take a time from: use now, not 1970.
         time_t now = time(nullptr);
         stbuf->st_mtime = now;
         stbuf->st_ctime = now;
@@ -352,10 +303,7 @@ int pfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, stru
 
     if (r.kind != ResolveKind::kRoot) return -ENOTDIR;
 
-    // Matches pfs_fuse.py's readdir exactly: clade subdirectory names
-    // (sorted) first, then root-level files (sorted) -- two separate
-    // sorted groups, not one merged sort, so clade directories always
-    // list before loose files.
+    // Clade directories first, then files, each sorted.
     std::vector<std::string> clade_names;
     for (const auto& kv : st->clade_to_labels) clade_names.push_back(kv.first);
     std::sort(clade_names.begin(), clade_names.end());
@@ -408,13 +356,7 @@ int pfs_open(const char* path, struct fuse_file_info* fi) {
 
 int pfs_create(const char* path, mode_t, struct fuse_file_info* fi) {
     std::string label;
-    // Clade directories are computed, not a place to manually drop new
-    // files into -- new files can only be created at the root; they'll
-    // be filed into a clade automatically once commit_write() attaches
-    // a fingerprint and it turns out something matches. resolve_locked()
-    // itself would refuse this path anyway (the label doesn't exist yet
-    // to resolve), so this checks the same single-component-only rule
-    // directly instead. Matches pfs_fuse.py's create() exactly.
+    // New files only at the root; they're clustered once fingerprinted.
     std::string p(path);
     if (p.empty() || p[0] != '/') return -EACCES;
     std::string rest = p.substr(1);
@@ -462,8 +404,7 @@ int pfs_write(const char*, const char* buf, size_t size, off_t offset, struct fu
     } catch (const std::exception&) {
         return -EIO;
     }
-    // Writing past the end leaves a hole the OS reads back as zeros --
-    // the same zero-filled sparse-write gap as before.
+    // Writing past the end leaves a zero-filled hole.
     ssize_t n = pwrite(handle.spill_fd, buf, size, offset);
     if (n < 0) return -errno;
     handle.dirty = true;
@@ -498,11 +439,8 @@ int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
         }
         label = r.name;
 
-        // A path truncate while the file is open applies to every open
-        // handle on it; each commits the truncated content on release()
-        // -- committing a separate truncated version here instead would
-        // be silently overwritten by those handles' pre-truncate copies.
-        // Same rule as pfs_fuse.py's truncate().
+        // A path truncate applies to every open handle of the file (they commit
+        // on release); a separate commit here would be overwritten by them.
         bool any_open = false;
         for (auto& kv : st->handles) {
             if (kv.second.label != label) continue;
@@ -521,8 +459,7 @@ int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
         if (!manifest_filename) return -ENOENT;
         manifest_path = st->session->pipeline.storage_root() + "/" + *manifest_filename;
     }
-    // No open handle covers this path (truncate called standalone) --
-    // copy into a scratch file, resize it, and commit now.
+    // No open handle: copy, resize and commit now.
     try {
         std::unique_ptr<ManifestReader> reader;
         {
@@ -582,10 +519,7 @@ int pfs_unlink(const char* path) {
     Resolved r;
     if (!resolve_locked(st, p, &r) || r.kind != ResolveKind::kFile) return -ENOENT;
     if (!st->session->catalog.get(r.name)) return -ENOENT;
-    // delete_label(), not a raw pipeline.delete_file() call: a manifest
-    // can be shared by more than one label (byte-identical content
-    // dedups to the same manifest) or by this label's own older
-    // generations -- only actually free it once nothing else needs it.
+    // delete_label frees a manifest only once nothing else references it.
     st->session->delete_label(r.name);
     label_removed_locked(st, r.name);
     return 0;
@@ -599,10 +533,7 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
     if (!resolve_locked(st, old_p, &r) || r.kind != ResolveKind::kFile) return -ENOENT;
     std::string old_label = r.name;
 
-    // A clade-dir prefix on the destination, if any, is ignored --
-    // membership is computed, not chosen by which path you typed; only
-    // the destination's basename (the new label) is meaningful. Matches
-    // pfs_fuse.py's rename() exactly.
+    // Only the destination's basename (the new label) matters.
     std::string new_p(new_path);
     if (new_p.empty() || new_p[0] != '/') return -EINVAL;
     std::string rest = new_p.substr(1);
@@ -613,9 +544,7 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
 
     if (!st->session->catalog.get(old_label)) return -ENOENT;
     if (st->session->catalog.get(new_label) && new_label != old_label) {
-        // POSIX rename silently replaces an existing destination -- go
-        // through delete_label so a manifest shared with something else
-        // doesn't get destroyed out from under it.
+        // Replacing an existing destination goes through delete_label too.
         st->session->delete_label(new_label);
     }
     auto manifest_filename = st->session->catalog.get(old_label);
@@ -628,18 +557,9 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
 }
 
 void* pfs_init(struct fuse_conn_info*, struct fuse_config* cfg) {
-    cfg->kernel_cache = 0;  // content can change from underneath (writes commit new generations); don't cache
-    // A path's TYPE can change from underneath too, now that clade
-    // presentation is real: "/clade_a.bin" is a plain file right up
-    // until a second, similar-enough file lands, at which point the
-    // SAME PATH becomes a directory (the clade subdirectory, named
-    // after its lexicographically-smallest member). Without this, the
-    // kernel's default 1-second entry/attribute cache can hand back a
-    // stale REGULAR-FILE dentry for a path our driver has already
-    // reclassified as a DIRECTORY -- the VFS then refuses the type
-    // mismatch with EIO, which is exactly what a real mount test (two
-    // similar files written back-to-back, then `ls`) hit before this
-    // was added. Disabling all three caches forces every lookup fresh.
+    cfg->kernel_cache = 0;  // content changes under us; don't cache
+    // A path can turn from file into clade directory, and a cached dentry of
+    // the old type makes the VFS return EIO, so disable all three caches.
     cfg->entry_timeout = 0;
     cfg->attr_timeout = 0;
     cfg->negative_timeout = 0;
@@ -647,8 +567,7 @@ void* pfs_init(struct fuse_conn_info*, struct fuse_config* cfg) {
     auto* st = static_cast<PfsFuseState*>(fuse_get_context()->private_data);
     std::string root = st->session->pipeline.storage_root();
     Bytes32 kek = st->session->pipeline.kek();
-    // Runs on the worker thread: reads and decrypts one manifest file,
-    // named by the event, and nothing else (VaultSession isn't thread-safe).
+    // Worker thread: reads one manifest file named by the event (VaultSession isn't thread-safe).
     auto loader = [root, kek](const std::string&, const std::string& manifest_filename) -> std::optional<SortedTraits> {
         Manifest m = read_manifest_file(root + "/" + manifest_filename, manifest_filename, kek);
         if (!m.metadata().similarity_fingerprint) return std::nullopt;
@@ -712,12 +631,7 @@ int main(int argc, char** argv) {
     try {
         st->session = std::make_unique<VaultSession>(storage_root, kek);
     } catch (const std::exception& e) {
-        // Covers both a genuinely wrong/corrupt key AND the vault
-        // already being open elsewhere (VaultSession's first member is
-        // a VaultLock -- see vault_lock.hpp -- which throws a clear
-        // message if a DIFFERENT process already holds this vault's
-        // lock). Print it plainly rather than letting it propagate to
-        // an uncaught-exception abort/backtrace.
+        // Wrong key, or the vault is open in another process (VaultLock).
         fprintf(stderr, "Couldn't open vault '%s': %s\n", storage_root.c_str(), e.what());
         return 1;
     }
@@ -727,17 +641,10 @@ int main(int argc, char** argv) {
     std::vector<char*> fuse_argv;
     fuse_argv.push_back(argv[0]);
     fuse_argv.push_back(const_cast<char*>(mountpoint.c_str()));
-    fuse_argv.push_back(const_cast<char*>("-f"));  // foreground -- this pass doesn't do Python's daemonization
-    // Single-threaded, matching pfs_fuse.py's own explicit nothreads=True.
-    // Several handlers (open/truncate, and now resolve_locked's clade
-    // cache) release st->mutex between an initial catalog snapshot and a
-    // later slow I/O step, then re-lock to act on it -- safe only if no
-    // OTHER callback can run in between. libfuse3's default is a
-    // multi-threaded dispatch pool; without -s, a concurrent callback
-    // CAN interleave there (observed directly: a real mount test hit a
-    // transient getattr EIO under concurrent cp invocations before this
-    // flag was added). -s removes that whole race class instead of
-    // trying to make every multi-step handler concurrency-safe piecemeal.
+    fuse_argv.push_back(const_cast<char*>("-f"));  // foreground
+    // Single-threaded (-s), like pfs_fuse.py: several handlers drop the mutex
+    // between a catalog snapshot and slow I/O, which is safe only if no other
+    // callback runs in between.
     fuse_argv.push_back(const_cast<char*>("-s"));
     for (int i = 3; i < argc; i++) fuse_argv.push_back(argv[i]);
 

@@ -1,45 +1,16 @@
 #!/usr/bin/env python3
 """
-One-time migration tool: converts an existing Python-engine vault's
-pickled manifest (`.manifest.fks`), keyring (`keyring.enc`), lineage
-store (`lineage.enc`), and catalog (`catalog.enc`) files to the C++
-engine's new portable formats (`.manifest.pfsm`, `keyring.pfsk`,
-`lineage.pfsl`, `catalog.pfsc`) -- see MANIFEST_FORMAT.md,
-KEYRING_FORMAT.md, and LINEAGE_FORMAT.md for the on-disk layouts this
-produces (catalog.pfsc's layout is simple enough to be documented
-inline in catalog.hpp instead of its own file: magic "PFSC" + version
-u16 + count u32 + that many (label, manifest_filename) u16-len-prefixed
-UTF-8 string pairs).
+One-time, non-destructive migration of a Python-engine vault to the C++
+engine's formats: .manifest.fks -> .manifest.pfsm, keyring.enc ->
+keyring.pfsk, lineage.enc -> lineage.pfsl, catalog.enc -> catalog.pfsc
+(see the *_FORMAT.md files; catalog.pfsc is documented in catalog.hpp).
+New files are written alongside the originals, which are never touched.
 
-Lineage migration reuses lineage.py's OWN LineageStore class to load
-the old file, rather than re-parsing its framing/pickle format here --
-that class already correctly handles both the current framed-pickle
-format AND the even-older pre-framing format (auto-migrating between
-them internally), so reusing it is both less code and guaranteed
-correct against whatever the real system actually does, instead of a
-second, potentially-drifting reimplementation of the same parsing
-logic.
-
-This is a PYTHON script, not a C++ tool, deliberately: the OLD formats
-are pickle, which only Python can read without reimplementing pickle's
-protocol (the exact reason the new formats exist in the first place --
-see cpp_port_plan.txt). Python already knows how to read its own old
-format; this script just makes it also emit the new one.
-
-Non-destructive by default: writes the NEW files alongside the old
-ones, never deletes or modifies the originals. The vault keeps working
-with the Python engine exactly as before regardless of whether this
-has been run; the new files are purely additive, for when/if the C++
-engine takes over reading this vault.
-
-Keyring migration needs no decryption at all: `_wrap()`'s wrapped-DEK
-bytes (12-byte IV + 32-byte ciphertext + 16-byte GCM tag = exactly 60
-bytes) are copied as-is into the new format's fixed-size entry layout
--- the wrap SCHEME is unchanged between the two engines (verified
-byte-for-byte compatible in keyring_wrap_check.cpp), only the FILE
-format around it changed. Manifest migration does need decryption
-(under the vault's KEK) since the new plaintext layout genuinely
-differs from the old FKS structure.
+Python, because the old formats are pickle. Lineage is loaded with
+lineage.py's own LineageStore (which handles every older format).
+Wrapped DEKs (IV + ciphertext + tag, 60 bytes) are copied as-is -- the
+wrapping scheme is the same in both engines; manifests are decrypted and
+re-encoded.
 """
 import os
 import sys
@@ -108,9 +79,7 @@ def migrate_manifest(old_path: str, crypto: CryptoEngine) -> str:
 
     fingerprint = stored_fingerprint.unpack(meta.get("similarity_fingerprint"))
     if fingerprint:
-        # Sorted ascending, matching pfs_engine::Manifest's own
-        # normalization -- a `set`'s iteration order isn't otherwise
-        # deterministic, and this format defines one.
+        # Sorted, as pfs_engine::Manifest normalizes them.
         sorted_fp = sorted(fingerprint)
         buf += struct.pack("<B", 1)
         buf += struct.pack("<I", len(sorted_fp))
@@ -153,11 +122,9 @@ def migrate_keyring(old_path: str) -> str:
 
 
 def _encode_lineage_node(node) -> bytes:
-    """Matches lineage_store.cpp's write_node() field-for-field exactly
-    -- little-endian throughout (unlike the OUTER lineage framing,
-    which stays big-endian to match Python's own struct.pack('>I', ...)
-    length prefixes; the two are independent design choices at
-    different layers, not an inconsistency)."""
+    """Same fields as lineage_store.cpp's write_node(), little-endian (the
+    outer record framing stays big-endian, as in Python).
+    """
     buf = bytearray()
     buf += bytes.fromhex(node.node_uuid)
     if node.parent_uuid is not None:
@@ -199,27 +166,17 @@ def _encode_lineage_node(node) -> bytes:
 
 
 def migrate_lineage(storage_root: str, crypto: CryptoEngine) -> str:
-    """Loads the OLD lineage.enc via lineage.py's own LineageStore
-    (correctly handling both the current framed-pickle format and the
-    even-older pre-framing format -- see this module's own docstring
-    for why reusing that class beats re-parsing it here), then emits a
-    single fresh snapshot record in the new format. All node data is
-    preserved -- generation_index, branching (parent_uuid), lateral
-    parents, epigenetic tags, pruned state -- nothing is summarized or
-    dropped."""
-    store = LineageStore(storage_root, crypto)  # loads (and self-migrates the OLD pre-framing format if needed)
+    """Loads lineage.enc with lineage.py's LineageStore and writes one snapshot
+    record in the new format, keeping every node field.
+    """
+    store = LineageStore(storage_root, crypto)  # also migrates the oldest format
 
     all_nodes = []
     for label in store.all_labels():
         all_nodes.extend(store.get_history(label))
 
-    # Little-endian here -- this is the SNAPSHOT BODY's own node-count
-    # prefix (matching LineageStore::save()'s BinaryWriter, which is
-    # little-endian throughout), NOT the outer frame length below
-    # (which stays big-endian to match Python's existing
-    # struct.pack('>I', ...) OUTER framing convention). Two independent
-    # conventions at two different layers -- mixing them up here was a
-    # real bug caught by lineage_migration_verify.cpp before this fix.
+    # Little-endian node count (the snapshot body), unlike the big-endian
+    # outer frame length below.
     body = bytearray()
     body += struct.pack("<I", len(all_nodes))
     for node in all_nodes:
@@ -239,9 +196,7 @@ def migrate_lineage(storage_root: str, crypto: CryptoEngine) -> str:
 
 
 def migrate_catalog(storage_root: str, crypto: CryptoEngine) -> str:
-    """catalog.enc is a pickled `Dict[str, str]` (label -> current
-    manifest_filename). Smallest of the four formats -- no nested
-    structures, no framing -- so this is the simplest converter."""
+    """catalog.enc is a pickled {label: manifest_filename}."""
     old_path = os.path.join(storage_root, "catalog.enc")
     with open(old_path, "rb") as f:
         encrypted = f.read()

@@ -1,104 +1,29 @@
 #!/usr/bin/env python3
 """
-FUSE mount for the Phylogenetic File System vault -- Phase 2 of the
-design doc's roadmap, built in Python rather than C++ (see the project's
-Phase 2 decision: gearhash/ is already built, tested, and correct, so
-this maps POSIX filesystem calls onto it directly instead of duplicating
-that logic in a new language and toolchain from scratch).
+FUSE mount of a Python-engine vault.
 
-PRESENTATION MODEL: two levels, computed from the same clade
-partitioning TreeConstructor.compute_clades() does for the CLI's 'tree'
-command. Files with no near neighbor (Jaccard distance > threshold, or
-no fingerprint yet) sit directly at the mount root. Files that DO share
-enough content with at least one other file are grouped into a
-subdirectory named after their clade's alphabetically-first member --
-e.g. a photo edited three times and saved under three labels shows up
-as a 'photo_v1/' directory containing all three, automatically, with no
-folder ever explicitly created. This answers the design doc's own
-question ("will you build a translation layer that presents the
-lineages looking like a traditional folder structure?") with its
-simplest useful form. Clade membership is COMPUTED, not stored or
-manually assignable -- new files can ONLY be created at the root
-(clade directories are read-only containers you browse, not a place to
-drop new files into); a file may appear at the root today and inside a
-clade directory tomorrow once something similar enough to it gets
-written, or vice versa if its clade-mates are deleted. That's
-intentional -- it mirrors the design doc's own "automatic evolutionary
-self-organization" -- not a bug, but worth knowing about if a path that
-worked a moment ago suddenly doesn't.
+Layout: files with no close relative sit at the root; files in a clade
+(Jaccard distance <= threshold to another file) appear together in a
+directory named after the clade's smallest member. Membership is computed
+by a background worker (clade_worker.py), so it changes as files change;
+new files can only be created at the root. Lookups use the worker's
+latest partition filtered against the catalog, so a file deleted or
+renamed never lingers, and a new or just-edited file sits at the root
+until it's fingerprinted and clustered. The kernel can briefly report
+EIO for a path whose type just changed between file and directory.
 
-The partition is maintained by a background worker (clade_worker.py),
-incrementally, never on the path of a filesystem call: lookups use its
-latest partition, filtered against the live catalog, so a deleted or
-renamed file never lingers in a clade directory, and a just-written file
-shows at the root until the worker has clustered it.
+I/O streams: reads decrypt only the chunks a range touches
+(reconstruct.ManifestReader). The first write or truncate copies the file
+to a scratch file on disk; release() commits it through
+VaultSession.commit_write() (re-chunking the whole file; unchanged chunks
+dedup). A write needs temporary disk space equal to the file's size.
 
-Two concrete, OBSERVED consequences of that dynamism, confirmed against
-a real mount (2026-07-23), not just theorized:
-1. Editing a file that currently lives inside a clade directory clears
-   its old fingerprint immediately (the edit changed its content, so
-   the old one is simply wrong now) and the new one attaches on its own
-   background thread, same as every other write. For that ~1-2 second
-   gap, the file has NO fingerprint at all, so it's excluded from
-   clustering entirely and briefly appears back at the ROOT instead of
-   inside the clade directory you just wrote through -- then reappears
-   inside it once refingerprinting lands. A process with the file still
-   open by its file handle is unaffected either way; only a fresh path
-   lookup during that window sees it move.
-2. The kernel's own dentry cache can briefly surface EIO (not ENOENT)
-   for a path that transitions from file to directory (or back) between
-   its own cached lookup and a following stat -- this is standard FUSE
-   behavior when a name's type changes underneath an already-cached
-   entry, not a bug in this code (nothing here raises or catches
-   anything in that window). Both of these settle on their own within
-   about a second; neither has been observed to leave anything
-   inconsistent once it settles.
+Single-threaded (nothreads=True): the engine isn't built for concurrent
+callbacks. The passphrase is asked once at mount time; anyone with access
+to the mountpoint can use it until unmount.
 
-READ/WRITE MODEL: streaming, with memory bounded regardless of file
-size. open() does NOT reconstruct the file: it opens a
-reconstruct.ManifestReader, which resolves the version's chunk table
-once and then serves each read() by decrypting only the chunks that
-byte range overlaps (same per-chunk integrity checks and mirror
-self-healing as reconstruct()). The first write() or truncate() on a
-handle copies that version into a scratch file on DISK (never RAM) and
-from then on reads and writes go to that file; open(O_TRUNC)/create()
-start with an empty scratch file. release() (the file actually being
-closed) is the real commit point -- this IS the design doc's
-"Speciation on Write": nothing lands in the vault until the file handle
-closes, and the scratch file is handed to VaultSession.commit_write(),
-the same tested path the CLI's 'write' uses. A commit re-chunks the
-whole file (unchanged chunks still dedup, so storage only grows by what
-actually changed); a write needs temporary disk space equal to the
-file's size.
-
-CONCURRENCY: mounted with nothreads=True on purpose. The storage engine
-underneath (SQLite connections, the crypto engine, the catalog dict)
-was built and tested for one call at a time, not concurrent FUSE
-callback threads -- serializing filesystem calls is the safe choice for
-a first working version. This is a real scalability limit (one
-operation at a time) worth knowing about, not a hidden one.
-
-LOCKING/AUTH: unlike the CLI, this does NOT reauth per operation --
-there's no prompt mechanism inside a read()/write() syscall. The
-passphrase is asked once at mount time; from then until unmount, this
-behaves like any other mounted encrypted volume (LUKS, VeraCrypt, ...)
--- anyone with OS-level access to the mountpoint can read/write through
-it. That's not a new weakness this introduces, just worth being
-explicit about: unmount is what re-locks it, not idle time.
-
-DAEMON MODEL: 'mount' unlocks the vault interactively (passphrase
-prompt needs a real TTY) and THEN detaches -- a single explicit
-os.fork()+setsid(), done ourselves rather than delegated to libfuse's
-own internal daemonize, specifically so the parent knows the real
-child PID and can record it. The parent writes that PID (plus the
-mountpoint) to a small file inside storage_root and exits; the child
-closes stdin/stdout/stderr, redirects them to a log file under
-storage_root, and runs the FUSE event loop from there. No threads
-exist yet at fork time (background fingerprint threads only start
-later, from inside FUSE callbacks), so there's nothing fork-across-
-thread-unsafe about this. 'status'/'stop' read that PID file; neither
-needs the vault passphrase since they only touch the PID file and the
-OS mount table, not vault content.
+'mount' unlocks interactively, then forks and setsid()s itself (so the
+real PID can be recorded in storage_root) and logs to a file there.
 
 Run with:
   python3 pfs_fuse.py mount <storage_root> <mountpoint> [--foreground]
@@ -127,8 +52,7 @@ from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from clade_worker import CladeWorker, filtered_view, python_session_loader
 
 SCRATCH_DIRNAME = ".fuse_scratch"
-# How much of a file version one read() pulls through ManifestReader at a
-# time when copying it into a scratch file (copy-on-first-write).
+# Bytes per ManifestReader read when copying a version into a scratch file.
 SPILL_COPY_BYTES = 1 << 20
 PID_FILENAME = ".fuse_daemon.pid"
 LOG_FILENAME = ".fuse_daemon.log"
@@ -143,25 +67,16 @@ class PFSFuse(Operations):
         os.makedirs(self.scratch_dir, exist_ok=True)
 
         self._next_fh = 1
-        # fh -> {"label": str, "reader": ManifestReader or None,
-        #        "spill_fd": int or None, "spill_path": str or None, "dirty": bool}
-        # Exactly one of reader/spill_fd is set: reader until the first
-        # write/truncate, scratch file after (see READ/WRITE MODEL).
+        # fh -> {"label", "reader": ManifestReader or None, "spill_fd", "spill_path", "dirty"}.
+        # reader until the first write or truncate, the scratch file after.
         self._handles = {}
-        # Guards catalog mutation and the handle/job tables. FUSE itself
-        # is mounted single-threaded (nothreads=True) so callbacks never
-        # overlap each other, but background fingerprint threads (see
-        # _start_background_fingerprint) run concurrently with whatever
-        # FUSE call happens next, so shared state they touch still needs
-        # this.
+        # Guards the catalog and the handle/job tables against the background
+        # fingerprint threads (FUSE callbacks themselves never overlap).
         self._lock = threading.RLock()
         self._fingerprint_jobs = []  # (label, Thread) currently running
-        # Background clade clustering (clade_worker.py). Started in
-        # init(), not here: in daemon mode do_mount() forks AFTER this
-        # constructor, and a thread doesn't survive fork().
+        # Clade worker, started in init(): daemon mode forks after this constructor, and threads don't survive fork().
         self._clades = None
-        # Filtered view of the worker's latest snapshot, cached until the
-        # snapshot or the catalog changes -- see _get_clades().
+        # Filtered view of the worker's snapshot, cached until it or the catalog changes.
         self._catalog_epoch = 0
         self._clade_view = None
         self._clade_view_key = None
@@ -189,11 +104,10 @@ class PFSFuse(Operations):
             sys.exit(1)
         print(f"Vault unlocked ({len(self.session.catalog)} file(s) currently stored). Mounting...")
 
-    # ---------- clade computation (cached) ----------
+    # ---------- clade presentation ----------
 
     def init(self, path):
-        """Called by FUSE once mounted, in the process that serves the
-        mount (after any daemon fork)."""
+        """Called once mounted, in the serving process (after any fork)."""
         with self._lock:
             labels = list(self.session.catalog.keys())
         self._clades = CladeWorker(python_session_loader(self.session), name="fuse-clade-worker").start(labels)
@@ -203,16 +117,9 @@ class PFSFuse(Operations):
             self._catalog_epoch += 1
 
     def _get_clades(self):
-        """Returns (clade_to_labels, label_to_clade) from the clade
-        worker's latest snapshot, never waiting for a recompute in
-        progress. Only clades with 2+ current members are directories --
-        a "clade" of one is just a file at the root, not a directory
-        (avoids a mount where every single file is its own one-entry
-        folder, which would be technically accurate to the design doc
-        but genuinely annoying to browse). Filtered against the live
-        catalog, so a label deleted or renamed since the snapshot was
-        computed never appears; a new label sits at the root until the
-        worker has clustered it."""
+        """(clade_to_labels, label_to_clade) from the worker's latest snapshot,
+        never waiting. Only clades with 2+ live members are directories.
+        """
         if self._clades is None:
             return {}, {}
         snapshot = self._clades.snapshot()
@@ -226,14 +133,9 @@ class PFSFuse(Operations):
     # ---------- path resolution ----------
 
     def _resolve(self, path):
-        """Resolves a FUSE path against the current (cached) clade
-        partition. Returns one of:
-            ("root",)                   -- path == "/"
-            ("clade_dir", clade_name)   -- a clade subdirectory
-            ("file", label)             -- an actual file, wherever it
-                                            currently sits
-        or None if the path doesn't resolve to anything that exists
-        right now."""
+        """Resolves a path against the current clade partition: ("root",),
+        ("clade_dir", clade_name), ("file", label), or None.
+        """
         parts = [p for p in path.split("/") if p]
         clade_to_labels, label_to_clade = self._get_clades()
 
@@ -274,9 +176,7 @@ class PFSFuse(Operations):
 
         label = resolved[1]
         with self._lock:
-            # An open-but-not-yet-committed handle for this label should
-            # report ITS size -- otherwise 'ls -l' mid-edit looks wrong
-            # (still showing the last-committed size).
+            # An open handle reports its own (possibly uncommitted) size.
             for handle in self._handles.values():
                 if handle["label"] == label:
                     return dict(st_mode=(stat.S_IFREG | 0o644), st_nlink=1,
@@ -332,9 +232,7 @@ class PFSFuse(Operations):
             position += len(piece)
 
     def _materialize(self, handle: dict) -> None:
-        """Copy-on-first-write: moves a handle from streaming reads to its
-        own scratch file, copying the version it opened chunk by chunk
-        (never the whole file in memory). A no-op once it's been done."""
+        """Moves a handle from streaming reads to its own scratch file (once), copying chunk by chunk."""
         if handle["spill_fd"] is not None:
             return
         fd, path = self._new_spill()
@@ -366,10 +264,7 @@ class PFSFuse(Operations):
         return self._new_handle(label, reader=self._open_reader(manifest_path))
 
     def create(self, path, mode, fi=None):
-        # Clade directories are computed, not a place to manually drop
-        # new files into -- new files can only be created at the root;
-        # they'll be filed into a clade automatically once their
-        # fingerprint is ready and it turns out something matches.
+        # New files only at the root; they're clustered once fingerprinted.
         parts = [p for p in path.split("/") if p]
         if len(parts) != 1:
             raise FuseOSError(errno.EACCES)
@@ -404,8 +299,7 @@ class PFSFuse(Operations):
             if handle is None:
                 raise FuseOSError(errno.EBADF)
             self._materialize(handle)
-            # Writing past the end leaves a hole the OS reads back as
-            # zeros -- the same zero-filled sparse-write gap as before.
+            # Writing past the end leaves a zero-filled hole.
             os.pwrite(handle["spill_fd"], data, offset)
             handle["dirty"] = True
         return len(data)
@@ -424,16 +318,13 @@ class PFSFuse(Operations):
         resolved = self._resolve(path)
         if resolved is None or resolved[0] != "file":
             if length == 0:
-                return  # truncating a not-yet-existent file to 0 is a no-op
+                return
             raise FuseOSError(errno.ENOENT)
         label = resolved[1]
 
-        # A path truncate while the file is open applies to every open
-        # handle on it; each commits the truncated content on release().
-        # This is also how fusepy (libfuse2) delivers open(O_TRUNC): a
-        # plain open() and then truncate(path, 0) with no fh. Committing
-        # a separate truncated version here instead would be silently
-        # overwritten by those handles' pre-truncate copies on release.
+        # A path truncate applies to every open handle of the file, which commit
+        # on release -- fusepy delivers open(O_TRUNC) this way too. Committing a
+        # separate version here would be overwritten by their stale copies.
         with self._lock:
             open_handles = [h for h in self._handles.values() if h["label"] == label]
             for handle in open_handles:
@@ -441,9 +332,7 @@ class PFSFuse(Operations):
         if open_handles:
             return
 
-        # No open handle covers this path (truncate called standalone,
-        # e.g. the `truncate` command) -- there's no release() to defer
-        # to, so copy into a scratch file, resize it, and commit now.
+        # No open handle: copy, resize and commit now.
         manifest_path = self.session.manifest_path_for(label)
         reader = self._open_reader(manifest_path)
         fd, tmp_path = self._new_spill()
@@ -474,13 +363,10 @@ class PFSFuse(Operations):
         return 0
 
     def _commit(self, label: str, tmp_path: str) -> None:
-        """The actual Speciation-on-Write event: hands a complete scratch
-        file to VaultSession.commit_write() -- the exact same path
-        pfs_cli.py's 'write' command uses, so this gets the same
-        lineage-generation tracking and catalog handling for free, with
-        no separate, unreviewed ingestion path for FUSE writes. Takes
-        ownership of tmp_path: the background fingerprint job deletes it
-        once it's done reading it (or this does, on failure)."""
+        """Commits a complete scratch file through VaultSession.commit_write().
+        Takes ownership of tmp_path: the fingerprint job (or this, on failure)
+        deletes it.
+        """
         try:
             with self._lock:
                 manifest_path = self.session.commit_write(label, tmp_path)
@@ -489,20 +375,15 @@ class PFSFuse(Operations):
                 os.remove(tmp_path)
             raise FuseOSError(errno.EIO)
 
-        # The new content's fingerprint isn't attached yet (background
-        # job below), so this drops the label from clustering until it is.
+        # No fingerprint yet: this drops the label from clustering until one is attached.
         self._catalog_changed()
         self._clades.changed(label)
         self._start_background_fingerprint(label, tmp_path, manifest_path)
 
     def _start_background_fingerprint(self, label: str, tmp_path: str, manifest_path: str) -> None:
-        """Same decoupling as pfs_cli.py's write path: the SIMILARITY_
-        PROFILE fingerprint (used only by the clade tree, not by data
-        integrity) runs on a background thread so closing a file in your
-        editor doesn't hang waiting for it. Unlike the CLI, tmp_path here
-        is OUR OWN scratch file, not the user's -- so this thread, not
-        the caller, is responsible for deleting it once it's done reading
-        from it."""
+        """Fingerprints the committed scratch file on a background thread, then
+        deletes it.
+        """
         def _job():
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(tmp_path)
@@ -532,20 +413,13 @@ class PFSFuse(Operations):
             raise FuseOSError(errno.ENOENT)
         label = resolved[1]
         with self._lock:
-            # delete_label(), not a raw pipeline.delete_file() call: a
-            # manifest can be shared by more than one label (byte-
-            # identical content dedups to the same manifest file) or by
-            # this label's own older generations -- only actually free
-            # it once nothing else still needs it. See VaultSession.
-            # delete_label's docstring for the bug this fixes.
+            # delete_label frees a manifest only once nothing else references it.
             self.session.delete_label(label)
         self._catalog_changed()
         self._clades.removed(label)
 
     def rename(self, old, new):
-        # A clade-dir prefix on the destination, if any, is ignored --
-        # membership is computed, not chosen by which path you typed;
-        # only the destination's basename (the new label) is meaningful.
+        # Only the destination's basename (the new label) matters.
         old_resolved = self._resolve(old)
         if old_resolved is None or old_resolved[0] != "file":
             raise FuseOSError(errno.ENOENT)
@@ -557,9 +431,7 @@ class PFSFuse(Operations):
 
         with self._lock:
             if new_label in self.session.catalog and new_label != old_label:
-                # POSIX rename silently replaces an existing destination
-                # -- go through delete_label so a manifest shared with
-                # something else doesn't get destroyed out from under it.
+                # Replacing an existing destination goes through delete_label too.
                 self.session.delete_label(new_label)
             self.session.catalog[new_label] = self.session.catalog.pop(old_label)
             self.session.lineage.rename_label(old_label, new_label)
@@ -570,8 +442,7 @@ class PFSFuse(Operations):
     # ---------- clean shutdown ----------
 
     def destroy(self, path):
-        """Called on unmount. Waits for any in-flight background
-        fingerprint jobs so unmounting doesn't silently drop one."""
+        """On unmount: waits for running fingerprint jobs."""
         with self._lock:
             pending = list(self._fingerprint_jobs)
         for _label, thread in pending:
@@ -581,22 +452,15 @@ class PFSFuse(Operations):
         try:
             os.rmdir(self.scratch_dir)
         except OSError:
-            pass  # non-empty (a job raced us) or already gone -- harmless either way
-        # Belt-and-suspenders: if this was a daemonized mount, the PID
-        # file should already be gone by the time do_mount's finally
-        # block runs, but a manual `fusermount3 -u` (bypassing 'stop')
-        # still ends up here via the same destroy() callback, so this
-        # is the one place guaranteed to run on every clean unmount.
+            pass  # non-empty or already gone
+        # Remove the PID file here too: a manual fusermount3 -u skips 'stop'.
         pid_file = os.path.join(self.session.storage_root, PID_FILENAME)
         if os.path.exists(pid_file):
             try:
                 os.remove(pid_file)
             except OSError:
                 pass
-        # Release the vault lock (vault_lock.py) explicitly on this
-        # normal-unmount path rather than relying on process exit --
-        # this process may not exit immediately after destroy() returns
-        # in every FUSE binding/version, so don't assume it does.
+        # Release the vault lock now; the process may not exit right away.
         self.session.close()
 
 
@@ -620,12 +484,12 @@ def _read_pid_file(storage_root: str):
 
 def _pid_is_alive(pid: int) -> bool:
     try:
-        os.kill(pid, 0)  # signal 0: existence/permission check only, doesn't actually signal
+        os.kill(pid, 0)  # signal 0: existence check only
         return True
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True  # exists, just owned by someone else
+        return True  # exists, owned by someone else
 
 
 def do_mount(storage_root: str, mountpoint: str, foreground: bool) -> None:
@@ -635,15 +499,9 @@ def do_mount(storage_root: str, mountpoint: str, foreground: bool) -> None:
               f"Stop it first with: python3 pfs_fuse.py stop {storage_root}")
         sys.exit(1)
 
-    # Passphrase prompt needs a real TTY -- must happen here, in the
-    # original foreground process, before any detaching below.
+    # The passphrase prompt needs the original foreground TTY.
     fs = PFSFuse(storage_root)
-    # print() doesn't flush when stdout isn't a TTY. Without this, output
-    # already written by PFSFuse.__init__ (e.g. "Vault unlocked...") sits
-    # in an unflushed buffer, gets duplicated into the child by fork(),
-    # and only actually reaches a file once the CHILD's stdio eventually
-    # flushes -- by which point dup2() below has repointed fd 1 at the
-    # log file, so it silently ends up there instead of the terminal.
+    # Flush before fork(), or buffered output is duplicated into the child and lands in its log.
     sys.stdout.flush()
     sys.stderr.flush()
 
@@ -657,29 +515,20 @@ def do_mount(storage_root: str, mountpoint: str, foreground: bool) -> None:
 
     child_pid = os.fork()
     if child_pid > 0:
-        # Parent: record the child's PID + mountpoint, confirm, and get
-        # out of the way -- the child carries on in the background.
+        # Parent: record the child's PID and mountpoint, then exit.
         with open(pid_file, "w") as f:
             f.write(f"{child_pid}\n{mountpoint}\n")
         print(f"Mounted at {mountpoint} as a background daemon (pid {child_pid}).")
         print(f"Log:    {log_path}")
         print(f"Status: python3 pfs_fuse.py status {storage_root}")
         print(f"Stop:   python3 pfs_fuse.py stop {storage_root}")
-        # os._exit (not sys.exit) on purpose -- skips atexit/interpreter
-        # teardown so the parent doesn't touch anything the child also
-        # holds a copy of (SQLite connections, open fds) post-fork. That
-        # means it ALSO skips stdio flushing, so do it explicitly first
-        # or these prints never reach the terminal at all.
+        # os._exit skips teardown of state the child shares, and skips flushing -- so flush first.
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(0)
 
-    # Child: detach for real (new session, no controlling terminal), then
-    # redirect stdio to a log file since nothing will ever read a
-    # terminal here again. foreground=True in the FUSE() call below is
-    # deliberate -- we've already done our own daemonization; letting
-    # libfuse ALSO fork here would spawn a second, untracked process and
-    # the PID recorded above would stop meaning anything.
+    # Child: new session, stdio to the log file. foreground=True below
+    # because this process already daemonized itself.
     os.setsid()
     log_fd = os.open(log_path, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
     devnull_fd = os.open(os.devnull, os.O_RDONLY)

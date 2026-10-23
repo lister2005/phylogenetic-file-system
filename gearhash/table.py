@@ -1,8 +1,5 @@
-"""Gear hash table.
-
-An array of 256 random 64-bit integers that map the values of the byte
-contents in the sliding window. These values can be anything, but should be
-sufficiently random to ensure a uniform hash distribution.
+"""
+Gear hash table: 256 random 64-bit values, one per byte value.
 
 Ported from ``table.rs``.
 """

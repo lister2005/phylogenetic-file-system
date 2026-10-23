@@ -8,23 +8,21 @@ from gearhash.dedup_index import GlobalBlockIndex
 from gearhash.keyring import KeyRing
 from gearhash.pipeline import MIRROR_CONTAINER_FILENAME
 
-# Bytes encrypt_block() adds to every chunk: a 12-byte IV prefix and a
-# 16-byte GCM tag (gearhash/crypto.py). A chunk's plaintext length is its
-# stored length minus this, which is what lets ManifestReader map byte
-# offsets to chunks without any per-chunk length in the manifest itself.
+# AES-GCM bytes added per chunk: 12-byte IV + 16-byte tag. A chunk's
+# plaintext length is its stored length minus this, which is how
+# ManifestReader maps offsets to chunks.
 AEAD_OVERHEAD = 28
 
 
 class ReconstructionError(Exception):
-    """Raised when reconstruction can't be verified as complete and correct."""
+    """Reconstruction can't be verified as complete and correct."""
 
 
 def _open_manifest(manifest_path: str, crypto: CryptoEngine) -> FKSLookupEngine:
     manifest_filename = os.path.basename(manifest_path)
     with open(manifest_path, "rb") as f:
         encrypted_manifest = f.read()
-    # Must match the AAD used when the manifest was written. Wrong key or
-    # a swapped-in manifest file both fail loudly here.
+    # AAD is the filename: a wrong key or a swapped manifest fails here.
     raw_manifest = crypto.decrypt_block(encrypted_manifest, associated_data=manifest_filename.encode())
     engine = FKSLookupEngine(raw_bytes=raw_manifest)
     if engine.metadata.get("total_blocks") is None:
@@ -59,10 +57,9 @@ def _missing_from_index(idx: int, content_hash: bytes) -> ReconstructionError:
 
 
 class _BlockFetcher:
-    """Returns one chunk's verified plaintext: primary copy first, then
-    its Ancestral Hardening mirror. The one implementation behind both
-    reconstruct() (whole file) and ManifestReader (byte ranges), so the
-    two can't drift apart on integrity checks or self-healing."""
+    """One chunk's verified plaintext: primary copy, then its Ancestral
+    Hardening mirror. Shared by reconstruct() and ManifestReader.
+    """
 
     def __init__(self, storage_root: str, container_path: str, crypto: CryptoEngine,
                  keyring: KeyRing, global_index: GlobalBlockIndex):
@@ -77,10 +74,7 @@ class _BlockFetcher:
         offset, length, _ref_count, epoch_id = location
         dek = self._keyring.get_dek(epoch_id)
 
-        # Try the primary copy first. Must match the AAD used at
-        # encryption time -- if this physical block was substituted
-        # or corrupted, decryption raises or the hash won't match,
-        # instead of silently returning the wrong plaintext.
+        # Primary copy: AAD and SHA-256 must both match.
         plaintext = None
         primary_error = None
         try:
@@ -95,11 +89,7 @@ class _BlockFetcher:
             primary_error = f"{type(e).__name__}: {e}"
 
         if plaintext is None:
-            # Ancestral Hardening fallback: this chunk may have a
-            # redundant copy (see StoragePipeline.MIRROR_REF_THRESHOLD)
-            # if it was shared widely enough to warrant one. Try it
-            # before giving up -- but always SURFACE that the primary
-            # was bad, never silently paper over real corruption.
+            # Mirror fallback, always reported -- never hide a damaged primary.
             mirror_location = self._global_index.get_mirror(content_hash)
             if mirror_location is not None and os.path.exists(self._mirror_container_path):
                 if self._mirror_container is None:
@@ -116,7 +106,7 @@ class _BlockFetcher:
                               f"Ancestral Hardening mirror instead. The primary copy is damaged; "
                               f"run 'verify' to repair it.")
                 except Exception:
-                    pass  # mirror also failed -- plaintext stays None, handled below
+                    pass  # mirror failed too
 
         if plaintext is None:
             raise ReconstructionError(
@@ -139,7 +129,7 @@ def reconstruct(manifest_path: str, container_path: str, output_path: str, maste
 
     storage_root = os.path.dirname(container_path)
     crypto = CryptoEngine(master_key)
-    keyring = KeyRing(storage_root, crypto.key)  # crypto.key is the KEK here
+    keyring = KeyRing(storage_root, crypto.key)  # the KEK
 
     engine = _open_manifest(manifest_path, crypto)
     global_index = GlobalBlockIndex(storage_root, crypto)
@@ -190,26 +180,17 @@ def reconstruct(manifest_path: str, container_path: str, output_path: str, maste
 
 
 class ManifestReader:
-    """Random-access, read-only view of one stored file version: serves
-    any byte range by decrypting only the chunks that range overlaps,
-    instead of reconstructing the whole file first. This is what lets
-    pfs_fuse.py stream reads of large files with bounded memory.
+    """Read-only, random-access view of one stored version: a read decrypts
+    only the chunks it overlaps.
 
-    open (this constructor) decrypts the manifest and resolves every
-    chunk's container location in one batched index query; the chunk
-    table it builds is a snapshot of this version, so a later commit to
-    the same label doesn't change what an already-open reader returns.
+    The constructor resolves the whole chunk table in one batched query, so
+    the reader keeps returning this version after later commits. Each chunk
+    is authenticated as in reconstruct(), mirror fallback included; a partial
+    read can't check the whole-file hash, so the total size is checked up
+    front instead.
+    """
 
-    Integrity: every chunk returned is individually authenticated --
-    AES-GCM with the chunk's own hash as AAD, then its SHA-256 checked
-    against the (itself authenticated) manifest's hash for that
-    position -- with the same mirror self-healing as reconstruct(). A
-    chunk swapped, reordered or corrupted is still caught. What a
-    partial read can NOT check is the whole-file content_sha256, since
-    that needs every byte; the total size is checked against the
-    manifest up front instead."""
-
-    CACHE_CHUNKS = 8  # recently-decrypted chunks kept, for small sequential reads
+    CACHE_CHUNKS = 8  # recent chunks, for small sequential reads
 
     def __init__(self, manifest_path: str, container_path: str, master_key: bytes):
         if not os.path.exists(manifest_path) or not os.path.exists(container_path):
@@ -223,8 +204,8 @@ class ManifestReader:
         self._global_index = GlobalBlockIndex(storage_root, crypto)
         try:
             found = self._global_index.lookup_many(hashes)
-            self._blocks = []   # (content_hash, location) per block index
-            self._starts = []   # plaintext byte offset where each block begins
+            self._blocks = []
+            self._starts = []
             position = 0
             for idx, content_hash in enumerate(hashes):
                 location = found.get(content_hash)

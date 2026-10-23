@@ -1,23 +1,8 @@
 """
-Engine-abstraction layer for pfs_gui.py -- lets the GUI run against
-either the Python engine (vault_session.VaultSession) or the compiled
-C++ engine (pfs_engine_binding.CppVaultSession) without knowing which
-one it's actually talking to. This exists because the two engines'
-Python-facing shapes differ in real ways (VaultSession exposes
-.catalog/.lineage/.pipeline/.crypto as separate objects with their own
-methods; CppVaultSession is a single flat ctypes wrapper) -- pfs_gui.py
-is written once against the interface below, and each adapter class
-translates it into whichever engine's real calls.
-
-Only wraps what pfs_gui.py actually uses (surveyed directly against the
-GUI's own `self.session.*`/`window.session.*` call sites, not guessed):
-catalog/label listing, manifest metadata, lineage history/heads/
-generations/tags, and the mutating operations (write, fork, graft,
-duplicate, merge, prune, delete, rename, tag/untag). Read-only file
-content access always goes through checkout()/reconstruct_current(),
-never raw manifest paths -- the one place the two engines' on-disk
-layouts (pickle vs. the new binary formats) would otherwise leak
-through this abstraction.
+One interface over both engines for pfs_gui.py: PythonEngineAdapter wraps
+VaultSession, CppEngineAdapter wraps CppVaultSession. Covers what the GUI
+uses: labels, metadata, lineage, the mutating operations, and file content
+only through checkout()/reconstruct_current().
 """
 import os
 import re
@@ -33,12 +18,9 @@ _CONFLICT_POSITIONS_RE = re.compile(r"since their common ancestor:\s*([\d,\s]+)"
 
 
 def _parse_conflict_positions(message: str) -> list:
-    """Recovers the conflicting chunk positions from the C++ engine's
-    MutationConflictError-equivalent message text (its own build_message
-    in merge.hpp uses the same wording and the same first-10 truncation
-    Python's own MutationConflictError does) -- lets the C++ path raise
-    the SAME exception type pfs_gui.py already knows how to catch,
-    rather than needing a second catch clause throughout the GUI."""
+    """Conflicting chunk positions from the C++ engine's conflict message (same
+    wording as Python's), so both engines raise MutationConflictError.
+    """
     m = _CONFLICT_POSITIONS_RE.search(message)
     if not m:
         return []
@@ -46,12 +28,7 @@ def _parse_conflict_positions(message: str) -> list:
 
 
 class NodeInfo:
-    """Uniform lineage-node view, regardless of backend. node_uuid/
-    parent_uuid are hex strings in both engines already (Python's
-    LineageNode uses uuid.uuid4().hex natively; the C++ binding returns
-    node_uuid_hex/parent_uuid_hex) -- no conversion needed, which is
-    what makes them usable as dict keys identically either way (the GUI
-    keys its node-item map by node_uuid)."""
+    """A lineage node in either engine; uuids are hex strings in both."""
     __slots__ = ("node_uuid", "parent_uuid", "generation_index", "new_chunks", "total_chunks",
                  "pruned", "birth_timestamp", "manifest_filename", "label", "lateral_parent_uuids")
 
@@ -70,10 +47,9 @@ class NodeInfo:
 
 
 class _CladeTracking:
-    """Keeps a background clade worker (clade_worker.py) in step with
-    every change made through the adapter, so the GUI's clade outlines
-    come from a maintained partition instead of decrypting every manifest
-    and comparing every pair on each redraw."""
+    """Keeps a background clade worker (clade_worker.py) in step with changes
+    made through the adapter, for the GUI's clade outlines.
+    """
 
     _clade_worker = None
     _clade_stopped = False
@@ -86,7 +62,7 @@ class _CladeTracking:
             self._clade_worker = CladeWorker(self._clade_loader(), name="gui-clade-worker").start(self.labels())
 
     def stop_clade_worker(self) -> None:
-        """Stops it for good -- nothing restarts it afterwards."""
+        """Stops it for good."""
         self._clade_stopped = True
         if self._clade_worker is not None:
             self._clade_worker.stop(timeout=10)
@@ -97,9 +73,9 @@ class _CladeTracking:
         return self._clade_worker.snapshot().version if self._clade_worker else 0
 
     def clades(self, wait: float = 0.0):
-        """(clade_to_labels, label_to_clade, version): clades with 2+
-        current members, from the worker's latest partition, after
-        waiting up to `wait` seconds for a pending recompute."""
+        """(clade_to_labels, label_to_clade, version) for clades with 2+ current
+        members, after waiting up to `wait` seconds for pending work.
+        """
         self.start_clade_worker()
         if self._clade_worker is None:
             return {}, {}, 0
@@ -110,7 +86,7 @@ class _CladeTracking:
         return clade_to_labels, label_to_clade, snapshot.version
 
     def _clade_event(self, kind: str, *labels) -> None:
-        # Before the worker starts there's nothing to update: start() loads every label.
+        # start() loads every label, so nothing to report before it.
         if self._clade_worker is not None:
             getattr(self._clade_worker, kind)(*labels)
 
@@ -173,11 +149,7 @@ class PythonEngineAdapter(_CladeTracking):
         return self._node_info(node) if node else None
 
     def get_chunk_hashes(self, label: str, generation_index: int) -> list:
-        """This generation's ordered chunk-hash list (bytes, one per
-        block position) -- the primitive a real lineage diff (§2.2:
-        comparing two generations of the SAME label's real edit
-        history, NOT the clade-clustering similarity comparison
-        _show_diff_between does) is built on."""
+        """This generation's ordered chunk hashes (for lineage diffs)."""
         return self._session.get_generation_chunk_hashes(label, generation_index)
 
     def find_node_by_uuid(self, uuid_hex: str):
@@ -198,16 +170,7 @@ class PythonEngineAdapter(_CladeTracking):
         self._session.lineage.remove_tag(label, key)
 
     def commit_write(self, label: str, path: str, fork_from_generation=None) -> None:
-        # Computed synchronously here, matching the C++ engine's own
-        # write path exactly (see pipeline.cpp) -- pfs_cli.py instead
-        # backgrounds this on a thread for its own reason (a shell
-        # prompt shouldn't stall on a large file), but pfs_gui.py has
-        # never had ANY mechanism to attach one at all: before this
-        # fix, a file written through the GUI itself (not previously
-        # written via the CLI) would silently never appear in Clade
-        # Tree mode, with no error -- just an empty tree. Caught by
-        # testing the two engines side by side through this exact
-        # adapter, not assumed.
+        # Fingerprinted synchronously, like the C++ engine's write path.
         fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(path)
         manifest_path = self._session.commit_write(
             label, path, fork_from_generation=fork_from_generation, similarity_fingerprint=fingerprint)
@@ -257,9 +220,7 @@ class PythonEngineAdapter(_CladeTracking):
         self._clade_event("changed", new_label)
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> None:
-        # lateral_gene_transfer already computes+attaches its own
-        # fingerprint internally (see vault_session.py) -- no fix
-        # needed here, unlike duplicate_label/commit_write above.
+        # lateral_gene_transfer attaches its own fingerprint.
         self._session.lateral_gene_transfer(label_a, label_b, new_label)
         self._clade_event("changed", new_label)
 
@@ -325,10 +286,7 @@ class CppEngineAdapter(_CladeTracking):
         return None
 
     def get_chunk_hashes(self, label: str, generation_index: int) -> list:
-        """This generation's ordered chunk-hash list (bytes, one per
-        block position) -- see PythonEngineAdapter.get_chunk_hashes for
-        why this exists as a separate primitive from the clade/
-        similarity comparison _show_diff_between does."""
+        """This generation's ordered chunk hashes (for lineage diffs)."""
         return self._session.get_generation_chunk_hashes(label, generation_index)
 
     def find_node_by_uuid(self, uuid_hex: str):

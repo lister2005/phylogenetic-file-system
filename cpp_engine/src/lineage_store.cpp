@@ -26,7 +26,7 @@ bool file_exists(const std::string& path) {
     return f.good();
 }
 
-// -------- single-node plaintext encoding (what gets encrypted inside each frame) --------
+// -------- one node's plaintext encoding (encrypted inside each frame) --------
 
 void write_node(BinaryWriter& w, const LineageNode& node) {
     w.fixed_bytes(node.node_uuid);
@@ -174,8 +174,7 @@ void LineageStore::rebuild_by_uuid() {
 }
 
 void LineageStore::save() {
-    // Full snapshot -- O(total history size). Only called by the rare
-    // mutating ops (delete/prune/rename/tag), never by record_version.
+    // Full snapshot, O(N): only the rare mutating operations use this.
     BinaryWriter body;
     uint32_t total = 0;
     for (auto& [label, nodes] : history_) total += static_cast<uint32_t>(nodes.size());
@@ -212,8 +211,7 @@ void LineageStore::save() {
 }
 
 void LineageStore::append_node(const LineageNode& node) {
-    // The hot path: O(1), appends ONE small framed record. Never
-    // rewrites the file. This is the entire reason this format exists.
+    // Appends one framed record, O(1): the per-write path.
     BinaryWriter body;
     write_node(body, node);
     std::string aad = "lineage_node";
@@ -277,7 +275,7 @@ LineageNode LineageStore::record_version(const std::string& label, const std::op
 std::vector<LineageNode> LineageStore::get_heads(const std::string& label) const {
     auto it = history_.find(label);
     if (it == history_.end()) return {};
-    std::set<NodeUuid> claimed;  // O(log n) membership, matching Python's set-based claimed_as_primary_parent
+    std::set<NodeUuid> claimed;  // nodes that are someone's primary parent
     for (const auto& n : it->second) {
         if (n.has_parent) claimed.insert(n.parent_uuid);
     }

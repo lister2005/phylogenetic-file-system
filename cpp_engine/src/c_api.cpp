@@ -288,7 +288,7 @@ int pfs_merge_branches(pfs_session_t* session_h, const char* label, uint64_t gen
         copy_out(result.manifest_path.substr(result.manifest_path.find_last_of('/') + 1), out_manifest_filename, out_buf_len);
         return 0;
     } catch (const std::exception& e) {
-        set_error(e);  // MutationConflictError's what() already lists every conflicting position
+        set_error(e);  // what() lists the conflicting positions
         return -1;
     }
 }

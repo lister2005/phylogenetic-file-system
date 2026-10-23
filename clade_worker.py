@@ -1,39 +1,17 @@
 """
-Background clade clustering -- manual.txt PART 8 item #6.
+Background, incremental clade clustering (TreeConstructor.compute_clades's
+partition) for the FUSE mount, the CLI and the GUI.
 
-Clades (connected components of "Jaccard distance <= threshold" between
-files' similarity fingerprints -- exactly TreeConstructor.compute_clades)
-used to be recomputed from scratch, on demand, after any change: every
-manifest decrypted, every pair compared, O(n^2), on the path of whatever
-asked (a FUSE path lookup, the GUI's next refresh). A CladeWorker keeps
-the partition up to date on a background thread instead:
+Front ends report changed(label), removed(label) and renamed(old, new),
+never waiting. The worker keeps each label's related labels, so a change
+compares only the changed labels against the rest (O(n), not O(n^2)).
+snapshot() returns the last complete partition at once; filtered_view()
+hides labels that no longer exist; wait_idle() waits for a fresh one.
 
-  - The front end reports changes -- changed(label) once a label's
-    fingerprint exists or changes, removed(label), renamed(old, new) --
-    and never waits for the work.
-  - Recomputing is incremental: the worker keeps each label's set of
-    related labels (distance <= threshold), so a change only compares
-    the CHANGED labels against everyone else (O(n) for one change, not
-    O(n^2)), then re-runs the cheap union-find over those edges.
-  - Readers call snapshot(): the last complete partition, immediately.
-    It can briefly lag the vault; filtered_view() drops labels that no
-    longer exist, so a deleted or renamed label never surfaces from a
-    stale snapshot. A label not yet in any snapshot simply isn't in a
-    clade yet. Readers that want a fresh answer call wait_idle() first.
-
-It runs inside the process that holds the vault, as a thread, not as a
-separate daemon process: the vault lock (vault_lock.py) admits one
-process per vault, so a separate process would lock out the CLI, GUI
-and mount it's meant to serve.
-
-Fingerprints come from a loader the front end supplies, called ONLY on
-the worker thread; it must be safe to call from there (see each front
-end). They're cached in memory packed (gearhash/fingerprint.py), 32
-bytes per trait -- roughly a tenth of the vault's unique stored data --
-and unpacked one comparison block at a time, so memory stays bounded.
-
-The C++ FUSE driver has its own port of this (cpp_engine/src/
-pfs_fuse_cpp.cpp, CladeWorker); same algorithm, same semantics.
+A thread in the process holding the vault, not a separate process: the
+vault lock admits one process per vault. Fingerprints come from a loader
+called only on the worker thread, and are cached packed (32 bytes per
+trait). The C++ FUSE driver uses the port in clade_worker.hpp.
 """
 import sys
 import threading
@@ -45,23 +23,16 @@ from TreeConstructor import TreeConstructor
 
 DEFAULT_CLADE_THRESHOLD = TreeConstructor.DEFAULT_CLADE_THRESHOLD
 
-# How many changed labels' trait sets are held unpacked at once while
-# they're compared against everyone else. Bounds memory during a big
-# batch (e.g. the initial build) at the cost of one extra pass over the
-# cached fingerprints per block.
+# Changed labels held unpacked at once; bounds memory in big batches.
 COMPARE_BLOCK = 64
 
 
 class CladeSnapshot:
-    """One complete, immutable partition. clade_to_labels maps each
-    clade's representative (its lexicographically-smallest member) to its
-    sorted members -- singletons included, exactly like compute_clades();
-    label_to_clade maps every member to its representative. Only labels
-    that had a fingerprint when it was computed appear at all.
-
-    version counts published snapshots (0 = nothing computed yet);
-    pending is True if changes were queued or in progress when it was
-    taken, i.e. the vault may already differ from it."""
+    """An immutable partition. clade_to_labels: representative (smallest
+    member) -> sorted members, singletons included; label_to_clade: member ->
+    representative. version counts snapshots (0 = none yet); pending means
+    changes were queued when it was taken.
+    """
 
     __slots__ = ("clade_to_labels", "label_to_clade", "version", "pending")
 
@@ -73,26 +44,23 @@ class CladeSnapshot:
 
 
 def filtered_view(snapshot: CladeSnapshot, live_labels, min_members: int = 1):
-    """(clade_to_labels, label_to_clade) restricted to labels that still
-    exist, re-keyed by each clade's smallest SURVIVING member, keeping
-    only clades with at least min_members survivors. This is what lets a
-    reader use a slightly stale snapshot safely: a label deleted or
-    renamed since it was computed never shows up."""
+    """(clade_to_labels, label_to_clade) for labels still in live_labels,
+    re-keyed by the smallest survivor, keeping clades with min_members+.
+    """
     live = live_labels if isinstance(live_labels, (set, frozenset, dict)) else set(live_labels)
     clade_to_labels = {}
     for members in snapshot.clade_to_labels.values():
         surviving = [m for m in members if m in live]
         if len(surviving) >= min_members:
-            clade_to_labels[surviving[0]] = surviving  # members are sorted, so [0] is the smallest
+            clade_to_labels[surviving[0]] = surviving  # members are sorted
     label_to_clade = {m: name for name, members in clade_to_labels.items() for m in members}
     return clade_to_labels, label_to_clade
 
 
 def python_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
-    """Fingerprint loader for a vault_session.VaultSession. Safe on the
-    worker thread: it only reads and decrypts one manifest file -- no
-    SQLite, nothing the front end mutates in place (a dict lookup on the
-    catalog is atomic). A label deleted meanwhile loads as None."""
+    """Loader for a VaultSession: reads and decrypts one manifest file (no
+    SQLite), so it's safe on the worker thread. Deleted labels load as None.
+    """
     import os
 
     def load(label: str):
@@ -108,15 +76,12 @@ def python_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
 
 
 def cpp_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
-    """Fingerprint loader for a pfs_engine_binding.CppVaultSession. Safe
-    on the worker thread because the binding serializes every call into
-    one session (pfs_engine_binding._serialize_calls). A label that no
-    longer exists loads as None; one with an EMPTY stored fingerprint
-    (an empty file) loads as an empty set, so it still counts as a
-    clade of one, exactly as compute_clades() treats it."""
+    """Loader for a CppVaultSession (calls are serialized by the binding).
+    Missing labels load as None; an empty fingerprint loads as an empty set,
+    a clade of one, as in compute_clades().
+    """
     def load(label: str):
-        # Held across both calls, and the same lock close() takes: a session
-        # closed meanwhile is seen here, never called with a dead handle.
+        # Hold the session lock across both calls; close() takes it too.
         with session._call_lock:
             if session._handle is None:
                 return None
@@ -141,21 +106,20 @@ class CladeWorker:
 
         self._cond = threading.Condition()
         self._events: List[tuple] = []   # guarded by _cond
-        self._busy = False               # guarded by _cond: a batch is being processed
+        self._busy = False  # guarded by _cond
         self._stopping = False           # guarded by _cond
         self._snapshot = CladeSnapshot({}, {}, 0, False)
         self._thread: Optional[threading.Thread] = None
         self.last_error: Optional[str] = None
 
-        # Worker-thread-only state.
+        # Worker-thread state.
         self._traits: Dict[str, bytes] = {}       # label -> packed fingerprint
         self._neighbors: Dict[str, Set[str]] = {}  # label -> labels within threshold
 
     # ---------- front-end API (any thread) ----------
 
     def start(self, labels: Iterable[str] = ()) -> "CladeWorker":
-        """Queues every existing label and starts the thread. The first
-        snapshot lands once the initial build finishes."""
+        """Queues every label and starts the thread."""
         with self._cond:
             self._events.extend(("changed", label) for label in labels)
         self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
@@ -180,8 +144,7 @@ class CladeWorker:
         return CladeSnapshot(snap.clade_to_labels, snap.label_to_clade, snap.version, pending)
 
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
-        """Blocks until every change reported so far is reflected in
-        snapshot(). False if the timeout ran out first."""
+        """Waits until every change posted so far is in snapshot(). False on timeout."""
         with self._cond:
             return self._cond.wait_for(lambda: not self._events and not self._busy, timeout)
 
@@ -209,12 +172,12 @@ class CladeWorker:
                 self._busy = True
             try:
                 self._process(events)
-            except Exception as e:  # never let the thread die; report and keep serving
+            except Exception as e:  # keep serving
                 self.last_error = f"{type(e).__name__}: {e}"
                 sys.stderr.write(f"[{self._name}] clustering pass failed: {self.last_error}\n")
             finally:
                 with self._cond:
-                    self._busy = bool(self._events)  # more may have arrived meanwhile
+                    self._busy = bool(self._events)  # more may have arrived
                     self._cond.notify_all()
 
     def _drop(self, label: str) -> None:
@@ -248,7 +211,6 @@ class CladeWorker:
                     dirty.discard(old)
                     dirty.add(new)
 
-        # Reload each dirty label's fingerprint and drop its old edges.
         loaded: Dict[str, bytes] = {}
         for label in sorted(dirty):
             self._drop(label)
@@ -260,10 +222,8 @@ class CladeWorker:
             if traits is not None:
                 loaded[label] = stored_fingerprint.pack(traits)
 
-        # Compare the newly loaded labels, a block at a time, against (1)
-        # every label already known, (2) new labels in LATER blocks, and
-        # (3) each other within the block -- every unordered pair exactly
-        # once, with at most one block plus one other label unpacked.
+        # Compare new labels, a block at a time, with (1) known labels, (2) new
+        # labels in later blocks, (3) each other -- every pair once.
         new_labels = sorted(loaded)
         for start in range(0, len(new_labels), COMPARE_BLOCK):
             names = new_labels[start:start + COMPARE_BLOCK]

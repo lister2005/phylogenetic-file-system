@@ -1,12 +1,8 @@
 """
-Interactive command-line shell for the Phylogenetic File System storage
-engine. Lets you exercise every piece built so far -- write, read,
-delete, vacuum, key rotation -- and includes a built-in 'attack' command
-that runs a suite of adversarial tests against a throwaway file to
-verify the vault's actual defenses, not just trust that they work.
+Interactive shell for a PFS vault, for either engine.
 
-Run with:  python3 pfs_cli.py [storage_root]
-(storage_root defaults to ./pfs_storage_vault)
+Run with:  python3 pfs_cli.py [--engine cpp] [storage_root]
+(storage_root defaults to ./pfs_storage_vault, or ./pfs_storage_vault_cpp)
 """
 
 import cmd
@@ -37,9 +33,7 @@ from TreeConstructor import TreeConstructor
 from vault_session import VaultSession, VaultUnlockError, MutationConflictError, CATALOG_FILENAME, HISTORY_FILENAME
 from lineage import LINEAGE_FILENAME
 
-# The C++ engine binding is optional -- pfs_cli.py's default (Python)
-# shell must keep working even on a checkout where cpp_engine/ hasn't
-# been built yet. Only --engine cpp actually needs this to succeed.
+# Optional: only --engine cpp needs the compiled engine.
 try:
     from pfs_engine_binding import CppVaultSession, PfsEngineError
     _CPP_ENGINE_IMPORT_ERROR = None
@@ -48,13 +42,9 @@ except OSError as e:
     PfsEngineError = Exception
     _CPP_ENGINE_IMPORT_ERROR = e
 
-# The C++ engine's on-disk formats are deliberately incompatible with
-# Python's (see cpp_engine/include/manifest.hpp's module docstring),
-# but data_container.bin and global_index.db use the SAME filenames in
-# both engines -- so a directory can never safely serve as both kinds
-# of vault. These markers let us detect which one (if either) already
-# owns a given directory BEFORE either engine's constructor ever
-# touches the container/index files.
+# Marker files that tell the engines' vaults apart. Both use
+# data_container.bin and global_index.db with incompatible formats, so a
+# directory must never be opened by the wrong engine.
 CPP_CATALOG_FILENAME = "catalog.pfsc"
 CPP_KEYRING_FILENAME = "keyring.pfsk"
 
@@ -62,8 +52,7 @@ MAX_HISTORY = 500
 
 
 def _existing_vault_engine(storage_root: str):
-    """Returns 'python', 'cpp', or None (nothing here yet), based on
-    each engine's own marker files."""
+    """'python', 'cpp', or None, from each engine's marker files."""
     is_python = os.path.exists(os.path.join(storage_root, CATALOG_FILENAME)) or \
         os.path.exists(os.path.join(storage_root, KEYRING_FILENAME))
     is_cpp = os.path.exists(os.path.join(storage_root, CPP_CATALOG_FILENAME)) or \
@@ -76,14 +65,9 @@ def _existing_vault_engine(storage_root: str):
 
 
 def _reliability_warning(unreliable: dict) -> str:
-    """Formats the "too little data to fingerprint reliably" warning
-    'tree'/'similar'/'clade' print whenever a file involved in the
-    result fingerprinted to fewer than MIN_RELIABLE_TRAIT_COUNT chunks.
-    `unreliable` is {label: chunk_count}. Shared by BOTH engine shells
-    (PFSShell and CppPFSShell below) so switching --engine never changes
-    the wording a user sees -- see PhylogeneticAnalyzer.MIN_RELIABLE_
-    TRAIT_COUNT / phylo.hpp's kMinReliableTraitCount for why this
-    specific threshold."""
+    """The "too little data to fingerprint reliably" warning, shared by both
+    shells. `unreliable` is {label: chunk_count}.
+    """
     parts = ", ".join(
         f"'{label}' ({count} chunk{'s' if count != 1 else ''})"
         for label, count in sorted(unreliable.items())
@@ -99,8 +83,7 @@ def _reliability_warning(unreliable: dict) -> str:
 
 
 def _index_probe(storage_root, crypto) -> bool:
-    """do_test's dedup-index sanity check: a lookup for a hash that was
-    never registered should just return None, not raise."""
+    """A lookup of a never-registered hash returns None rather than raising."""
     gi = GlobalBlockIndex(storage_root, crypto)
     gi.lookup(secrets.token_bytes(32))
     gi.close()
@@ -108,12 +91,9 @@ def _index_probe(storage_root, crypto) -> bool:
 
 
 def _split_args(arg: str):
-    """Splits a command's arguments the way a Unix shell would, so a
-    label or file path containing spaces can be given in quotes:
-        write "/home/lister/Q3 report.pdf" "q3 report"
-    Both shells parse through this, so quoting works the same on both
-    engines. Returns None (after saying why) on unbalanced quotes --
-    e.g. an unquoted apostrophe; wrap that word in double quotes."""
+    """Splits arguments like a Unix shell, so quoted labels and paths may
+    contain spaces. Returns None (after saying why) on unbalanced quotes.
+    """
     try:
         return shlex.split(arg)
     except ValueError as e:
@@ -122,26 +102,19 @@ def _split_args(arg: str):
 
 
 def _join_args(arg: str):
-    """For commands that take exactly one label or path: accepts it
-    quoted ('info "q3 report"') or unquoted ('info q3 report'), same
-    result either way. None on unbalanced quotes, like _split_args."""
+    """A single label or path, quoted or not. None on unbalanced quotes."""
     parts = _split_args(arg)
     return None if parts is None else " ".join(parts)
 
 
-# How long one successful passphrase re-entry covers later reauth-gated
-# commands in the same shell. Measured from the re-entry itself, not
-# extended by commands run inside the window.
+# How long a passphrase re-entry covers later gated commands (not extended by use).
 REAUTH_GRACE_SECONDS = 300
 
 
 def _reauth_grace_seconds() -> float:
-    """REAUTH_GRACE_SECONDS, optionally SHORTENED by the
-    PFS_REAUTH_GRACE_SECONDS environment variable (0 = ask every time,
-    the shells' pre-grace-period behavior; scripted test drivers use
-    that to keep one passphrase line per gated command). The variable
-    can never lengthen the window past the default -- it's clamped --
-    and an unparseable value is ignored."""
+    """REAUTH_GRACE_SECONDS, optionally shortened (never lengthened) by
+    PFS_REAUTH_GRACE_SECONDS; 0 asks every time. Invalid values are ignored.
+    """
     raw = os.environ.get("PFS_REAUTH_GRACE_SECONDS")
     if raw is None:
         return REAUTH_GRACE_SECONDS
@@ -152,18 +125,14 @@ def _reauth_grace_seconds() -> float:
     return min(max(value, 0.0), REAUTH_GRACE_SECONDS)
 
 
-# How long 'clade' waits for the background clade worker to catch up
-# before answering from its last partition instead.
+# How long 'clade' waits for the clade worker before using its last partition.
 CLADE_WAIT_SECONDS = 60
 
 
 def _clade_members(worker: CladeWorker, label: str, live_labels):
-    """`label`'s clade (sorted members) from the shell's background clade
-    worker, or None if `label` has no fingerprint in it. Waits for any
-    pending recompute first -- 'clade' is an explicit command, so it
-    answers from an up-to-date partition (incremental, so normally
-    instant), not merely the last one; if the worker is still busy after
-    CLADE_WAIT_SECONDS it says so and uses the last partition."""
+    """`label`'s sorted clade members from the worker, or None if it has no
+    fingerprint. Waits for pending work first (up to CLADE_WAIT_SECONDS).
+    """
     if not worker.wait_idle(CLADE_WAIT_SECONDS):
         print(f"Note: clade clustering is still catching up after {CLADE_WAIT_SECONDS}s -- "
               f"showing the most recent complete result.")
@@ -173,29 +142,22 @@ def _clade_members(worker: CladeWorker, label: str, live_labels):
 
 
 class _ReauthMixin:
-    """The one re-auth policy both shells (PFSShell, CppPFSShell) share,
-    so the two engines can't drift apart on it. Being unlocked once at
-    shell startup isn't enough -- an attacker who finds an already-open,
-    unattended terminal shouldn't be able to just type a command and see
-    or change vault contents. The first gated command asks for the
-    passphrase again; after a correct answer, further gated commands
-    run without asking until the grace window (REAUTH_GRACE_SECONDS)
-    expires. A wrong answer closes the window immediately. Commands
-    passed always_ask=True (delete, panic) ask every time regardless.
+    """Re-auth policy shared by both shells. The first gated command after
+    unlocking asks for the passphrase again; a correct answer covers later
+    gated commands for the grace period, a wrong one ends it. always_ask
+    commands (delete, panic) always ask.
 
-    Subclasses provide storage_root and _current_kek()."""
+    Subclasses provide storage_root and _current_kek().
+    """
 
-    # time.monotonic() of the last correct passphrase re-entry, or None.
-    # monotonic, not wall-clock: a system clock change can't extend the window.
+    # time.monotonic() of the last correct re-entry, or None.
     _reauth_ok_at = None
 
     def _current_kek(self) -> bytes:
         raise NotImplementedError
 
     def _require_reauth(self, action_description: str = "do this", always_ask: bool = False) -> bool:
-        """Returns True if the command may proceed: either inside the
-        grace window (and not always_ask), or on an exact match of the
-        re-entered passphrase's KEK against the currently-loaded one."""
+        """True if inside the grace window (and not always_ask), or the re-entered passphrase unwraps the same KEK."""
         if not always_ask and self._reauth_ok_at is not None:
             if time.monotonic() - self._reauth_ok_at < _reauth_grace_seconds():
                 return True
@@ -207,8 +169,7 @@ class _ReauthMixin:
             print("Wrong passphrase. Cancelled.")
             return False
         if kek != self._current_kek():
-            # Shouldn't happen since the file didn't change underneath
-            # us, but never accept a near-match -- require exact equality.
+            # Exact match only.
             self._reauth_ok_at = None
             print("Wrong passphrase. Cancelled.")
             return False
@@ -233,36 +194,25 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
         super().__init__()
         self.storage_root = storage_root
         self._session = VaultSession(storage_root)
-        # (label, Thread) for every in-flight background similarity
-        # fingerprinting job -- see _start_background_fingerprint().
+        # (label, Thread) for each running fingerprint job.
         self._fingerprint_jobs = []
         self._fingerprint_jobs_lock = threading.Lock()
-        # Set by 'navigate'; None means relative paths in write/read resolve
-        # against wherever this process happens to be running from, same as
-        # before this feature existed.
+        # Set by 'navigate': base directory for relative write/read paths.
         self._nav_dir = None
         self._command_history = []
         self._readline = None
-        # Set by 'clade' -- the Lineage Shell's "current focus" label
-        # (Project_idea.txt's clade/checkout @tip/ancestor vocabulary).
-        # None means 'checkout @tip'/'ancestor' have nothing to work
-        # from yet and must be told to run 'clade <label>' first.
+        # Set by 'clade': the label 'checkout @tip' and 'ancestor' default to.
         self._focus_label = None
         self._unlock_or_create()
-        # Background clade clustering (clade_worker.py) for 'clade'. Fed by
-        # diffing the catalog after every command (onecmd) plus each
-        # background fingerprint job's completion.
+        # Clade worker for 'clade', fed by a catalog diff after each command.
         self._catalog_seen = dict(self.catalog)
         self._clades = CladeWorker(python_session_loader(self._session),
                                    name="cli-clade-worker").start(self._catalog_seen)
 
     def _report_catalog_changes(self) -> None:
-        """Tells the clade worker about every label whose tip changed,
-        appeared or vanished since the last command -- catches every
-        command that touches the catalog (write, fork, graft, merge,
-        delete, rename, ...) without each having to report itself. A
-        rename shows up as a removal plus a new label, which the worker
-        handles correctly (it just reloads that one fingerprint)."""
+        """Reports every label added, changed or removed since the last command
+        to the clade worker. A rename shows up as a removal plus an addition.
+        """
         current = self.catalog
         for label in self._catalog_seen.keys() - current.keys():
             self._clades.removed(label)
@@ -271,11 +221,7 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
                 self._clades.changed(label)
         self._catalog_seen = dict(current)
 
-    # crypto/pipeline/catalog live on the shared VaultSession now (so
-    # pfs_fuse.py can use the exact same unlock/catalog logic without
-    # duplicating it) -- exposed here as properties so the rest of this
-    # class's methods can keep referring to self.crypto/self.pipeline/
-    # self.catalog unchanged.
+    # Exposed for the methods below; owned by the VaultSession.
     @property
     def crypto(self):
         return self._session.crypto
@@ -288,7 +234,6 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
     def catalog(self):
         return self._session.catalog
 
-    # ---------- setup ----------
 
     def _unlock_or_create(self):
         if _existing_vault_engine(self.storage_root) == "cpp":
@@ -326,21 +271,10 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
         self._load_history()
 
     def _load_history(self):
-        """Loads this vault's encrypted command history and seeds
-        readline's in-memory buffer with it, so up-arrow recall works
-        across restarts, not just within one running session (within a
-        session, up-arrow already works for free once 'readline' is
-        imported -- that part needs no code here). Kept encrypted on
-        disk like everything else in this vault: a plaintext history
-        file would leak every label and file path you've ever typed,
-        which is exactly the kind of metadata leak the manifest-filename
-        design elsewhere in this codebase already goes out of its way to
-        avoid.
-
-        Unlike the catalog (whose failure to load is fatal -- it's the
-        only map from your labels to your data), history is pure
-        convenience: if it can't be read, this starts empty rather than
-        crashing the shell."""
+        """Loads the encrypted command history into readline, so up-arrow recall
+        survives restarts. History is kept encrypted (labels and paths are
+        metadata); if it can't be read, it starts empty.
+        """
         self._command_history = []
         path = os.path.join(self.storage_root, HISTORY_FILENAME)
         if os.path.exists(path):
@@ -360,7 +294,7 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
             readline.set_history_length(MAX_HISTORY)
             self._readline = readline
         except ImportError:
-            self._readline = None  # e.g. Windows without pyreadline -- up-arrow just won't recall
+            self._readline = None  # no readline (e.g. Windows): no recall
 
     def _save_history(self):
         path = os.path.join(self.storage_root, HISTORY_FILENAME)
@@ -374,20 +308,14 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
         os.replace(tmp, path)
 
     def _record_history(self, line: str) -> None:
-        """Called only for lines that ran without raising -- 'history of
-        successful commands', per how this shell can actually tell the
-        difference (a command that prints e.g. 'No such label' isn't an
-        exception, so it still counts here, same as bash recording a
-        failed command's exit code without excluding it from history).
-        Not re-added to readline's own buffer here -- readline already
-        recorded it automatically the moment it was typed via input()."""
+        """Records a line that ran without raising."""
         self._command_history.append(line)
         if len(self._command_history) > MAX_HISTORY:
             self._command_history = self._command_history[-MAX_HISTORY:]
         try:
             self._save_history()
         except Exception:
-            pass  # history is a convenience; never worth crashing the shell over
+            pass  # history is only a convenience
 
     def _read_manifest_metadata(self, manifest_path: str) -> dict:
         return self._session.read_manifest_metadata(manifest_path)
@@ -398,7 +326,6 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
     def _current_kek(self) -> bytes:
         return self.crypto.key
 
-    # ---------- core commands ----------
 
     def do_write(self, arg):
         """write <file_path> [label]  -- ingest a file into the vault
@@ -416,8 +343,7 @@ a relative file_path resolves against 'navigate's directory, if set)"""
             print("Usage: write <file_path> [label]")
             return
         if len(parts) > 2:
-            # Refuse rather than silently dropping the extra words (an
-            # unquoted label with spaces used to be cut to its first word).
+            # Refuse extra words rather than silently dropping them.
             print('Usage: write <file_path> [label]  (put a path or label containing spaces '
                   'in quotes: write "my file.txt" "my label")')
             return
@@ -460,12 +386,9 @@ a relative file_path resolves against 'navigate's directory, if set)"""
 
 Example:
   fork my_report 2 /home/lister/Documents/alternate_draft.pdf
-(writes file_path's content as a NEW, divergent version descending from
-generation N of <label> -- NOT from the current tip. If generation N
-already has later descendants (i.e. it's not the tip), this creates a
-second, genuinely divergent branch -- see 'lineage <label>' afterward
-to see both heads. Use 'merge' later to reconcile two branches back
-together, or just keep both indefinitely; nothing forces a merge.)"""
+(stores file_path as a new version descending from generation N of
+<label>, not the tip -- a second branch. 'lineage' shows both heads;
+'merge' reconciles them.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -505,20 +428,15 @@ together, or just keep both indefinitely; nothing forces a merge.)"""
         self._start_background_fingerprint(label, file_path, manifest_path)
 
     def _start_background_fingerprint(self, label: str, file_path: str, manifest_path: str) -> None:
-        """Computes the SIMILARITY_PROFILE fingerprint (used only by the
-        'tree' command) on a background thread and attaches it to the
-        manifest afterward. This is fully decoupled from the write path
-        above on purpose: it re-opens and re-streams the file
-        independently, at its own pace, so it never holds up the shell
-        prompt or delays the durable, security-critical part of the
-        write. If it fails for any reason, the write itself already
-        succeeded and is unaffected -- only the clade tree won't include
-        this file until a retry."""
+        """Fingerprints the file on a background thread and attaches it to the
+        manifest, so writes don't wait for it. A failure only leaves the file out
+        of clustering.
+        """
         def _job():
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(file_path)
                 self.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
-                self._clades.changed(label)  # before the message, so 'clade' after it sees this
+                self._clades.changed(label)  # before the message, so a 'clade' after it sees this
                 print(f"\n[background] fingerprint ready for '{label}' -- 'tree' can now include it.\n{self.prompt}", end="", flush=True)
             except Exception as e:
                 print(f"\n[background] fingerprinting '{label}' failed: {type(e).__name__}: {e} "
@@ -572,13 +490,8 @@ Example:
   list image
   list size
   list image size
-(with no type argument, shows everything; with one, shows only files
-whose CONTENT-DETECTED type matches -- e.g. 'list image' finds PNG/JPEG/
-GIF/BMP files no matter what they're named or whether they have an
-extension at all. This is phenotypic search: the design doc's "query the
-ledger for a specific phenotypic mask" -- no filename string matching.
-Add 'size' (in either position) to sort largest-first instead of the
-default catalog order -- the design doc's "High-to-Low Volumetric Grid.")"""
+(a type matches the CONTENT-detected type, whatever the file is named;
+'size' sorts largest first)"""
         if not self._require_reauth("view the vault contents"):
             return
         if not self.catalog:
@@ -606,9 +519,7 @@ default catalog order -- the design doc's "High-to-Low Volumetric Grid.")"""
         if sort_by_size:
             rows.sort(key=lambda row: row[2]["original_size"], reverse=True)
 
-        # Columns grow to fit the longest label/type (never narrower than
-        # the original fixed widths), so long values can't run into the
-        # next column.
+        # Columns grow to fit the longest label and type.
         label_w = max([25] + [len(label) + 2 for label in [r[0] for r in rows] + missing])
         type_w = max([24] + [len(r[1]) + 2 for r in rows])
         print(f"{'Label':<{label_w}}{'Type':<{type_w}}{'Size':>12}  {'Chunks':>8}  {'Dedup':>7}")
@@ -629,18 +540,9 @@ Example:
   delete my_report
   delete my_report old_draft unused_photo
   delete my_report force
-(each label must already appear in 'list'; this removes every recorded
-generation of that label, not just the current version -- 'delete'
-really means delete. A manifest is only actually freed on disk once
-nothing else in the vault still needs it -- e.g. another label with
-byte-identical content, or a graft that used this label as a lateral
-parent -- so 'vacuum' afterward may reclaim less than the full size if
-some of it is still shared with something else you haven't deleted.
-Pass more than one label to delete them all in one go, one reauth
-covering the whole batch -- each is deleted independently, so one
-missing or refused label doesn't stop the rest. 'force' (if present,
-anywhere in the argument list) applies to every label in the batch;
-add it to override the 'protected' tag.)"""
+(removes every generation of each label. Storage still shared with
+other labels stays until nothing uses it. Labels are deleted
+independently; 'force' overrides the 'protected' tag for all of them.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -720,14 +622,8 @@ Example:
 
 Example:
   fsck
-(takes no arguments; checks every chunk that's still referenced by
-something -- not the whole disk, just this vault's own data. A chunk
-that fails its integrity check but has an Ancestral Hardening mirror
-(see 'info' -- chunks shared by 3+ manifests get one automatically) is
-repaired in place from that mirror. A chunk that fails with no working
-mirror is reported, not silently ignored -- that content is genuinely
-gone, and you should know which of your files it affects; 'verify' on
-individual labels will confirm exactly that.)"""
+(a damaged chunk with an Ancestral Hardening mirror is repaired from it;
+one without is reported -- use 'verify' to see which files it affects)"""
         if not self._require_reauth("scan the vault for corruption"):
             return
         print("Scanning every live chunk (this reads and verifies your entire vault -- may take a while)...")
@@ -798,7 +694,6 @@ Example:
         print(f"Files tracked:         {len(self.catalog)}")
         print(f"Key epochs so far:     {self.pipeline.keyring.current_epoch + 1}")
 
-    # ---------- security self-test ----------
 
     def do_attack(self, arg):
         """attack  -- run a suite of adversarial tests against this vault's defenses
@@ -835,7 +730,7 @@ Example:
             manifest_path = self.pipeline.secure_and_persist_file(test_src)
             manifest_filename = os.path.basename(manifest_path)
 
-            # 1. Baseline: correct key reconstructs correctly
+            # 1. Correct key reconstructs correctly
             try:
                 reconstruct(manifest_path, self.pipeline.container_path, out_ok, self.crypto.key)
                 with open(out_ok, "rb") as f:
@@ -861,8 +756,7 @@ Example:
             except Exception:
                 results.append(("Manifest is unreadable without the key", True))
 
-            # 4. Confirmation-of-presence attack is blocked: a guessed
-            # content hash can't be used directly as a database lookup key
+            # 4. Confirmation-of-presence attack: a guessed content hash isn't a lookup key
             conn = sqlite3.connect(os.path.join(self.storage_root, DB_FILENAME))
             guessed_hash = hashlib.sha256(test_content[:4096]).digest()
             row = conn.execute("SELECT 1 FROM blocks WHERE lookup_key = ?", (guessed_hash,)).fetchone()
@@ -897,7 +791,7 @@ Example:
                     self.pipeline.delete_file(manifest_path)
                     self.pipeline.vacuum()
                 except Exception:
-                    pass  # best-effort cleanup; the corrupted chunk from test 5 gets dropped by vacuum either way
+                    pass  # best-effort; vacuum drops test 5's corrupted chunk anyway
 
         print(f"{'Check':<65}{'Result'}")
         for name, passed in results:
@@ -956,8 +850,7 @@ Example:
             except Exception:
                 results.append(("Manifest is unreadable without the key", True))
 
-            # 4. Confirmation-of-presence attack blocked, using THIS file's
-            # real first chunk hash rather than synthetic data
+            # 4. Confirmation-of-presence attack, with this file's real first chunk hash
             raw_manifest = self.crypto.decrypt_block(raw, associated_data=manifest_filename.encode())
             engine = FKSLookupEngine(raw_bytes=raw_manifest)
             first_hash = engine.lookup(0)
@@ -966,9 +859,7 @@ Example:
             conn.close()
             results.append(("Confirmation-of-presence blocked (this file's real chunk hash)", row is None))
 
-            # 5. Corrupted ciphertext detected -- SAFELY: back up the exact
-            # byte before touching anything, corrupt, test detection, then
-            # restore and verify the restoration itself worked.
+            # 5. Corrupted ciphertext is detected: back up the byte, corrupt it, test, restore, verify.
             gi = GlobalBlockIndex(self.storage_root, self.crypto)
             offset, length, ref_count, epoch_id = gi.lookup(first_hash)
             gi.close()
@@ -987,7 +878,7 @@ Example:
                 detected = True
             results.append(("Corrupted ciphertext is detected, not silently returned", detected))
 
-            # Restore -- this happens even if detection somehow failed above.
+            # Restore even if detection failed.
             with open(self.pipeline.container_path, "r+b") as cf:
                 cf.seek(offset)
                 cf.write(original_byte)
@@ -1014,31 +905,17 @@ Example:
         else:
             print("SOME CHECKS FAILED -- see above. If restoration failed, run 'verify' on this file now.")
 
-    # ---------- last-resort protection ----------
 
     def do_panic(self, arg):
         """panic  -- LAST RESORT: irreversibly destroys this vault's key material
 
 Example:
   panic
-(takes no arguments; asks for your passphrase, then a literal typed
-confirmation phrase -- there is no undo past that point)
+(asks for your passphrase, then a typed confirmation -- no undo after that)
 
-What this actually does: shreds master.key and keyring.enc. Without
-them, every chunk ever written to this vault becomes permanently
-undecryptable garbage -- even to you, even with the correct passphrase,
-regardless of how large the container is (destroying two small key
-files is instant; it never needs to touch however many GB of ciphertext
-sit in data_container.bin). Best-effort cleanup of the container/index/
-manifests/catalog follows, but even if that part is interrupted, the
-vault is already unrecoverable by the time it starts.
-
-Requires your passphrase first -- same reason every other sensitive
-command here does: an attacker at an unattended, already-unlocked
-terminal shouldn't be able to destroy your vault out of malice any more
-than they should be able to read it. This command exists for YOU to
-trigger deliberately (e.g. before your device leaves your control), not
-as something that fires on its own."""
+Shreds master.key and keyring.enc, which makes every chunk in the vault
+permanently undecryptable, even with the passphrase. The rest of the
+vault is then deleted best-effort; it is already unrecoverable by then."""
         print("\n*** PANIC WIPE -- LAST RESORT PROTECTION ***")
         print("This destroys this vault's key material immediately and irreversibly.")
         print("Every file ever stored here becomes permanently unrecoverable, including")
@@ -1078,7 +955,7 @@ as something that fires on its own."""
             try:
                 self._secure_erase_file(path)
             except Exception:
-                pass  # already unrecoverable regardless of whether this part succeeds
+                pass
 
         print("\nDone. Exiting -- the key is gone from disk; only whatever remains in this")
         print("process's own memory persists until it exits, which is now.")
@@ -1087,16 +964,10 @@ as something that fires on its own."""
         return True
 
     def _secure_erase_file(self, path: str) -> None:
-        """Best-effort overwrite-then-delete, used only by 'panic'.
-        Clears +i, overwrites the file's full length with random bytes
-        before unlinking it, rather than just deleting the directory
-        entry. This is NOT a guarantee against a well-equipped forensic
-        adversary -- SSD wear-leveling and copy-on-write filesystems can
-        leave the old physical blocks intact regardless of what gets
-        overwritten at the file-path level -- but it's strictly better
-        than a bare unlink, and costs nothing extra to do. The actual
-        unrecoverability panic() provides comes from the KEK/DEK
-        material being gone, not from this overwrite step."""
+        """Overwrites the file with random bytes, then unlinks it. Not proof
+        against forensics on SSDs or copy-on-write filesystems; panic's real
+        guarantee is that the key material is gone.
+        """
         if not os.path.exists(path):
             return
         set_immutable(path, False)
@@ -1108,17 +979,14 @@ as something that fires on its own."""
                 f.flush()
                 os.fsync(f.fileno())
         except Exception:
-            pass  # even if the overwrite fails, still attempt the unlink below
+            pass  # still unlink if the overwrite fails
         os.remove(path)
 
-    # ---------- clade clustering tree (the bridge) ----------
 
     def _gather_named_traits(self, description: str) -> dict:
-        """Collects {label: similarity_fingerprint} for every catalog
-        label that has one, printing an honest note about any excluded
-        (still fingerprinting in the background, or predates the
-        feature). Shared by 'tree' and 'similar' so both report gaps
-        the same way instead of each reimplementing it."""
+        """{label: fingerprint} for every label that has one, noting any left
+        out (still fingerprinting, or none stored).
+        """
         named_traits = {}
         missing = []
         for label, manifest_filename in self.catalog.items():
@@ -1153,8 +1021,7 @@ as something that fires on its own."""
 Example:
   tree
   tree nj
-(defaults to upgma if not given; uses fingerprints computed back at write
-time, so it never re-reads or re-decrypts your original files)"""
+(defaults to upgma; uses the fingerprints stored at write time)"""
         if not self._require_reauth("view the clade tree"):
             return
         algorithm = arg.strip().lower() or "upgma"
@@ -1188,10 +1055,7 @@ time, so it never re-reads or re-decrypts your original files)"""
 
 Example:
   similar my_report
-(uses the same Jaccard distance math 'tree'/the clade view already use
--- just reported as a ranked list against ONE chosen file instead of a
-whole tree. 0.0 = identical content, 1.0 = nothing in common; this is
-the design doc's "Proximity Matrix" sort)"""
+(Jaccard distance: 0.0 = identical content, 1.0 = nothing in common)"""
         label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
@@ -1234,13 +1098,8 @@ Example:
   clade my_report
   checkout @tip /tmp/restored.pdf     (label is optional once focused)
   ancestor 2                           (steps back from the focused label's tip)
-(a clade is a similarity GROUPING -- the same connected-components
-clustering 'tree'/'similar' already use, at the design doc's own
-D<=0.80 threshold -- NOT a lineage: it has no real parent/child
-structure of its own, just membership, so this never invents a fake
-"clade root". Sets this shell's 'current focus' to <label> itself, so
-'checkout @tip'/'ancestor N' can be used afterward without repeating
-the label.)"""
+(a clade groups files within Jaccard distance 0.80 of each other; it is
+not a lineage and has no root. Sets the shell's focus to <label>.)"""
         label = _join_args(arg)
         if not label:
             print("Usage: clade <label>")
@@ -1272,12 +1131,7 @@ the label.)"""
             print(f"  '{label}' -- no other file in the vault is within the clade threshold "
                   f"(a clade of one).")
         else:
-            # "Most ancestral" here means only "the member whose OWN generation-0 write
-            # happened earliest" -- an orientation note, not a real clade root: this
-            # project's own design deliberately keeps clade clustering (unrelated files
-            # grouped by content similarity) separate from the Lineage DAG (one file's
-            # real edit history) -- see TreeConstructor.py's module docstring. A clade has
-            # no parent/child structure of its own, so this is NOT claiming one exists.
+            # "Oldest" is just the earliest generation-0 write -- an orientation aid, not a root.
             def birth0(m):
                 node0 = self._session.lineage.get_generation(m, 0)
                 return node0.birth_timestamp if node0 else float("inf")
@@ -1341,9 +1195,7 @@ Example:
 
 Example:
   lineage my_report
-(each generation is a real, reconstructible past version of THIS label
--- distinct from 'tree', which groups DIFFERENT files by similarity,
-not one file's own history; use 'checkout' to pull an old generation)"""
+(each generation is a reconstructible past version; 'checkout' pulls one)"""
         label = _join_args(arg)
         if label not in self.catalog:
             print(f"No such label: '{label}'")
@@ -1393,11 +1245,7 @@ not one file's own history; use 'checkout' to pull an old generation)"""
 
     @staticmethod
     def _parse_tag_value(raw: str):
-        """'true'/'false'/'yes'/'no'/'1'/'0' (case-insensitive) become
-        real booleans, so the two enforced tags (protected,
-        no_graft_source) work correctly as flags -- everything else is
-        kept as the literal string, so arbitrary informational tags
-        ('project=alpha') aren't forced into a boolean shape."""
+        """true/false/yes/no/1/0 become booleans (so 'protected' works as a flag); anything else stays text."""
         lowered = raw.lower()
         if lowered in ("true", "yes", "1"):
             return True
@@ -1412,18 +1260,14 @@ Example:
   tag legal_contract protected true
   tag internal_draft no_graft_source true
   tag my_report project alpha
-(true/false/yes/no/1/0 become real booleans; anything else is kept as
-text. Applies to the CURRENT tip and is inherited automatically by
-every future generation of this label from now on -- an "expression
-mutation" the design doc describes: 'protected' blocks delete/prune
-unless forced, 'no_graft_source' blocks this label from being used in
-'graft'. Any other key is stored and inherited the same way but is
-purely informational.)"""
+(true/false/yes/no/1/0 become booleans. Future generations inherit the
+tag. 'protected' blocks delete/prune unless forced; 'no_graft_source'
+blocks use in 'graft'; other keys are informational.)"""
         parts = _split_args(arg)
         if parts is None:
             return
         if len(parts) > 3:
-            # An unquoted multi-word value still works, as before quoting existed.
+            # An unquoted multi-word value still works.
             parts = parts[:2] + [" ".join(parts[2:])]
         if len(parts) != 3:
             print("Usage: tag <label> <key> <value>")
@@ -1447,10 +1291,7 @@ purely informational.)"""
 
 Example:
   untag legal_contract protected
-(removes the tag from the CURRENT tip; future generations from now on
-won't inherit it either. Does NOT retroactively change any past
-generation's own tag record -- see 'prune's docstring for what that
-means for a specific already-tagged past generation.)"""
+(future generations won't inherit it; past generations keep theirs)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1479,16 +1320,9 @@ means for a specific already-tagged past generation.)"""
 Example:
   prune my_report 2
   prune my_report 2 force
-(keeps the label and ALL its OTHER generations intact -- only removes
-this one specific past version's content. The generation's record stays
-visible in 'lineage', marked pruned, so you can still see it existed.
-Cannot prune the current tip -- the live version -- use 'delete' to
-remove a label entirely instead. Refused if this exact generation is
-tagged 'protected' unless you add 'force'. If this generation's
-manifest is still shared with something else in the vault -- another
-label with identical content, or a graft that used it as a lateral
-parent -- nothing is actually freed yet; run 'vacuum' afterward
-regardless to reclaim whatever became reclaimable.)"""
+(frees one past version's content; it stays listed in 'lineage' as
+pruned. Not the current tip -- use 'delete'. 'force' overrides
+'protected'. Run 'vacuum' afterwards to reclaim the space.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1526,17 +1360,9 @@ regardless to reclaim whatever became reclaimable.)"""
 
 Example:
   graft source_code documentation combined_release
-(concatenates label_a's current content + label_b's current content
-into a new label, recorded as descending from BOTH lineages at once --
-run 'lineage <new_label>' afterward to see the dual parentage. This is
-a graph-level provenance operation, not format-aware content merging:
-no diffing, no conflict detection, just a real, reconstructible graft
-of two independent, already-stored files into one new node. Because
-both files' chunks are usually already in the vault from their own
-earlier writes, this typically introduces very few genuinely new
-chunks -- watch the 'new' count in the output, it's a direct
-demonstration of the shared chunk pool across what were, until now,
-two completely unrelated lineages.)"""
+(new_label = label_a's content followed by label_b's, descending from
+both. No merging logic. Since both are already stored, few chunks are
+new -- see the 'new' count.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1574,14 +1400,9 @@ two completely unrelated lineages.)"""
 
 Example:
   merge my_report 3 5
-(use 'lineage <label>' first to see which generations are currently
-branch heads -- 'fork' creates them. Does a real chunk-position 3-way
-diff against the branches' common ancestor: a chunk changed by only
-one branch (or changed identically by both) merges automatically; a
-chunk changed DIFFERENTLY by both branches is a genuine Mutation
-Conflict -- this refuses to guess a winner and commits nothing. The
-design doc's EvolutionaryDivergenceException, made real: no data is
-silently discarded either way.)"""
+(3-way diff of chunk positions against the common ancestor: a chunk
+changed by one branch, or the same way by both, merges; a chunk changed
+differently by both is a conflict and nothing is committed)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1628,11 +1449,8 @@ Example:
   checkout my_report @tip /tmp/my_report_latest.pdf
   clade my_report
   checkout @tip /tmp/my_report_latest.pdf     (label optional once focused via 'clade')
-(use 'lineage <label>' first to see which generations exist; generation
-0 is the original, higher numbers are later edits; '@tip' means "this
-label's current head generation" -- the same generation plain 'read'
-already gives you -- instead of a specific number; the output path
-resolves against 'navigate's directory, if set)"""
+(generation 0 is the original; '@tip' is the current version; a relative
+output path resolves against 'navigate's directory)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1695,15 +1513,9 @@ Example:
   clade my_report
   ancestor 3
   ancestor 3 /tmp/three_generations_back.pdf
-(requires a focus label -- run 'clade <label>' first. Always counts N
-PRIMARY-parent hops back from the focused label's CURRENT TIP -- not
-chained, so 'ancestor 1' then 'ancestor 2' each start counting from the
-tip again rather than compounding. Lateral parents (from 'graft'/
-'merge') never count as a hop, same "primary lineage" concept 'fork'
-branches off of. If you omit output_path, it's written as
-'<label>_ancestor_<N>_gen<G>.<ext-less>' next to 'navigate's directory
-(or this process's own working directory if unset), and the real path
-used is always printed.)"""
+(needs a focus label from 'clade'. Counts primary-parent steps from the
+current tip each time; lateral parents don't count. Without output_path,
+writes <label>_ancestor_<N>_gen<G> in the navigate or working directory.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1731,7 +1543,7 @@ used is always printed.)"""
             return
         by_uuid = {h.node_uuid: h for h in history}
 
-        node = history[-1]  # tip, same definition prune_generation() itself uses
+        node = history[-1]  # tip, as prune_generation() defines it
         for step in range(n):
             if node.parent_uuid is None:
                 print(f"'{label}' only has {step} primary-parent generation(s) available back from "
@@ -1799,8 +1611,7 @@ Example:
 
 Example:
   rename my_report q3_report
-(the label's full recorded history moves with it -- 'lineage q3_report'
-shows what used to be under 'lineage my_report')"""
+(the label's history moves with it)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -1826,10 +1637,8 @@ shows what used to be under 'lineage my_report')"""
 
 Example:
   test
-(runs real operations -- write, edit, fork, tag, delete, vacuum, fsck --
-against a throwaway label, not just checks that files exist. This is a
-functional check ('does everything work'), not an adversarial one; see
-'attack' for deliberate corruption/tampering tests.)"""
+(real write, edit, fork, tag, delete, vacuum and fsck on a throwaway
+label; see 'attack' for tampering tests)"""
         if not self._require_reauth("run a self test"):
             return
         print("=== PFS Power-On Self Test ===\n")
@@ -1879,13 +1688,8 @@ functional check ('does everything work'), not an adversarial one; see
         try:
             self._session.commit_write(label, work_v1)
             check("Write/read round trip is byte-identical", roundtrip_ok)
-            # Checked AFTER a real write, not before: a brand-new keyring's
-            # current_epoch starts at -1 and is only lazily set to 0 the
-            # first time a DEK is actually requested (get_current_dek()),
-            # which secure_and_persist_file just did as part of the write
-            # above -- checking this on a truly fresh vault BEFORE any
-            # write would give a false FAIL, not because the keyring is
-            # broken but because nothing had asked it for a key yet.
+            # Checked after a write: a new keyring's epoch starts at -1 and becomes 0
+            # only when a DEK is first requested.
             check("Keyring loads with an active epoch", lambda: self.pipeline.keyring.current_epoch >= 0)
             self._session.commit_write(label, work_v1)  # byte-identical resave
             check("No-op resave does not inflate lineage history",
@@ -1919,9 +1723,7 @@ functional check ('does everything work'), not an adversarial one; see
 Example:
   history
   history 20
-(persisted encrypted across sessions -- up arrow also recalls it live,
-same as any shell; only records commands that didn't crash the shell,
-same idea as your shell's own history)"""
+(stored encrypted across sessions; up arrow recalls it too)"""
         if not self._require_reauth("view command history"):
             return
         n = None
@@ -1951,10 +1753,8 @@ Example:
   navigate                             -- show the current setting
   navigate -                           -- clear it
 
-Only affects how relative paths you type into 'write' and 'read' get
-resolved -- absolute paths and '~' always pass through untouched. Never
-touches the vault's own storage_root. Per-session only, not saved
-between runs (unlike 'history', this is meant to be reset each time)."""
+Only affects relative paths given to 'write' and 'read'. Not saved
+between sessions."""
         target = _join_args(arg)
         if target is None:
             return
@@ -1981,9 +1781,7 @@ between runs (unlike 'history', this is meant to be reset each time)."""
         print("'write <file>' and the output path in 'read <label> <file>' now resolve relative paths here.")
 
     def _resolve_path(self, path: str) -> str:
-        """Applies the current navigate directory (if any) to a relative
-        path from 'write'/'read'. Absolute paths and '~' pass through
-        untouched regardless of whether navigate is set."""
+        """Resolves a relative write/read path against the navigate directory."""
         expanded = os.path.expanduser(path)
         if os.path.isabs(expanded) or self._nav_dir is None:
             return expanded
@@ -1997,7 +1795,6 @@ Example:
 (takes no arguments)"""
         os.system("cls" if os.name == "nt" else "clear")
 
-    # ---------- misc ----------
 
     def do_exit(self, arg):
         "exit  -- close the shell"
@@ -2009,10 +1806,7 @@ Example:
             for _label, thread in pending:
                 thread.join()
         self._clades.stop(timeout=10)
-        # Release the vault lock (vault_lock.py) explicitly here rather
-        # than leaving it to __del__/process exit -- this is the
-        # NORMAL clean-close path (as opposed to a crash), so it should
-        # release deterministically, not whenever GC happens to run.
+        # Release the vault lock now rather than at garbage collection.
         self._session.close()
         print("Goodbye.")
         return True
@@ -2024,7 +1818,7 @@ Example:
         return self.do_exit(arg)
 
     def emptyline(self):
-        pass  # don't repeat the last command on blank input
+        pass  # don't repeat the last command
 
     def onecmd(self, line):
         stripped = line.strip() if isinstance(line, str) else ""
@@ -2044,17 +1838,9 @@ Example:
 
 
 class CppPFSShell(_ReauthMixin, cmd.Cmd):
-    """Interactive shell for the compiled C++ storage engine
-    (cpp_engine/), reached via 'python3 pfs_cli.py --engine cpp'.
-
-    Deliberately a SEPARATE, smaller shell rather than a flag on
-    PFSShell: the C API (cpp_engine/include/c_api.h) only covers a
-    growing subset so far (write/read/delete/list/history/manifest-info,
-    fork/graft/merge/tags/prune/vacuum/fsck/key-rotation, the attack
-    suite, clade tree/'similar'/'clade' -- see cpp_port_plan.txt for
-    what's still Python-only). Bolting a partial command set onto
-    PFSShell would make it unclear, per command, which engine is
-    actually being exercised; this way the shell you're in tells you."""
+    """Shell for the compiled C++ engine (--engine cpp). Separate from
+    PFSShell so it's always clear which engine a command runs on.
+    """
 
     intro = (
         "\nPhylogenetic File System -- C++ ENGINE shell.\n"
@@ -2078,10 +1864,7 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
         super().__init__()
         self.storage_root = storage_root
         self._nav_dir = None
-        # Set by 'clade' -- the Lineage Shell's "current focus" label
-        # (Project_idea.txt's clade/checkout @tip/ancestor vocabulary).
-        # None means 'checkout @tip'/'ancestor' have nothing to work
-        # from yet and must be told to run 'clade <label>' first.
+        # Set by 'clade': the label 'checkout @tip' and 'ancestor' default to.
         self._focus_label = None
         os.makedirs(storage_root, exist_ok=True)
         existing = _existing_vault_engine(storage_root)
@@ -2096,13 +1879,10 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
         except PfsEngineError as e:
             print(f"Couldn't open the C++ vault: {e}")
             sys.exit(1)
-        # Kept for _require_reauth's exact-match check, the same role
-        # self.crypto.key plays in PFSShell.
+        # For _require_reauth's exact-match check.
         self._kek = kek
-        # Background clade clustering (clade_worker.py) for 'clade'. Each
-        # command that changes a label's tip reports it (write, fork,
-        # graft, merge, delete, rename); 'test'/'attack' only touch
-        # throwaway labels they delete again, so they don't.
+        # Clade worker for 'clade'. Commands that change a label's tip report it;
+        # 'test' and 'attack' only use throwaway labels.
         self._clades = CladeWorker(cpp_session_loader(self._session),
                                    name="cli-cpp-clade-worker").start(self._session.list_labels())
 
@@ -2136,7 +1916,6 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
             return expanded
         return os.path.join(self._nav_dir, expanded)
 
-    # ---------- commands (the C API's actual current coverage) ----------
 
     def do_write(self, arg):
         """write <file_path> [label]  -- ingest a file into the vault (C++ engine)
@@ -2154,8 +1933,7 @@ relative file_path resolves against 'navigate's directory, if set)"""
             print("Usage: write <file_path> [label]")
             return
         if len(parts) > 2:
-            # Refuse rather than silently dropping the extra words (an
-            # unquoted label with spaces used to be cut to its first word).
+            # Refuse extra words rather than silently dropping them.
             print('Usage: write <file_path> [label]  (put a path or label containing spaces '
                   'in quotes: write "my file.txt" "my label")')
             return
@@ -2211,11 +1989,8 @@ Example:
 Example:
   delete my_report
   delete my_report force
-(removes the label's full history, not just its current tip. A
-manifest is only actually freed once nothing else in the vault --
-another label sharing identical content, or a graft that used it as a
-lateral parent -- still references it. Refused if the current tip is
-tagged 'protected' unless you add 'force'.)"""
+(removes the label's full history; shared storage stays until unused.
+'force' overrides the 'protected' tag.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -2245,9 +2020,8 @@ tagged 'protected' unless you add 'force'.)"""
 
 Example:
   fork my_report 2 /home/lister/Documents/alternate_draft.pdf
-(writes file_path's content as a NEW, divergent version descending from
-generation N of <label> -- NOT from the current tip. Use 'lineage' to
-see the resulting branch heads, 'merge' to reconcile them later.)"""
+(a new version descending from generation N, not the tip. 'lineage'
+shows the branch heads; 'merge' reconciles them.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -2312,10 +2086,9 @@ either source is tagged 'no_graft_source'.)"""
 
 Example:
   merge my_report 3 5
-(a real chunk-position 3-way diff against the branches' common
-ancestor: a chunk changed by only one branch -- or identically by both
--- merges automatically; a chunk changed DIFFERENTLY by both is a
-genuine Mutation Conflict -- refuses to guess, commits nothing.)"""
+(3-way diff of chunk positions against the common ancestor; a chunk
+changed differently by both branches is a conflict and nothing is
+committed)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -2346,9 +2119,7 @@ Example:
   checkout my_report @tip /tmp/my_report_latest.pdf
   clade my_report
   checkout @tip /tmp/my_report_latest.pdf     (label optional once focused via 'clade')
-('@tip' means "this label's current head generation" -- the same
-generation plain 'read' already gives you -- instead of a specific
-number)"""
+('@tip' is the current version)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -2403,15 +2174,9 @@ Example:
   clade my_report
   ancestor 3
   ancestor 3 /tmp/three_generations_back.pdf
-(requires a focus label -- run 'clade <label>' first. Always counts N
-PRIMARY-parent hops back from the focused label's CURRENT TIP -- not
-chained, so 'ancestor 1' then 'ancestor 2' each start counting from the
-tip again rather than compounding. Lateral parents (from 'graft'/
-'merge') never count as a hop, same "primary lineage" concept 'fork'
-branches off of. If you omit output_path, it's written as
-'<label>_ancestor_<N>_gen<G>.bin' next to 'navigate's directory (or
-this process's own working directory if unset), and the real path used
-is always printed.)"""
+(needs a focus label from 'clade'. Counts primary-parent steps from the
+current tip each time; lateral parents don't count. Without output_path,
+writes <label>_ancestor_<N>_gen<G>.bin in the navigate or working directory.)"""
         parts = _split_args(arg)
         if parts is None:
             return
@@ -2520,7 +2285,7 @@ this label from being used in 'graft'.)"""
         if parts is None:
             return
         if len(parts) > 3:
-            # An unquoted multi-word value still works, as before quoting existed.
+            # An unquoted multi-word value still works.
             parts = parts[:2] + [" ".join(parts[2:])]
         if len(parts) != 3:
             print("Usage: tag <label> <key> <value>")
@@ -2658,9 +2423,8 @@ Example:
 
 Example:
   fsck
-(a chunk that fails its integrity check but has an Ancestral Hardening
-mirror -- shared by 3+ manifests -- is repaired in place. A chunk that
-fails with no working mirror is reported, not silently ignored.)"""
+(a damaged chunk with an Ancestral Hardening mirror is repaired from it;
+one without is reported)"""
         if not self._require_reauth("scan the vault for corruption"):
             return
         print("Scanning every live chunk (this reads and verifies your entire vault -- may take a while)...")
@@ -2709,12 +2473,7 @@ Example:
 (you'll be asked to choose:
   virtual attack -- safe, uses a disposable throwaway test file
   real attack    -- tests one of your actual stored files; any temporary
-                     corruption is backed up and verified-restored afterward
-Same battery as the Python engine's 'attack', adapted for this engine's own
-manifest/keyring formats -- 'wrong key is rejected' is actually STRONGER
-here: a second session opened under the wrong key fails immediately, since
-the keyring itself can't be decrypted, rather than only failing later on a
-specific read.)"""
+                     corruption is backed up and verified-restored afterward)"""
         if not self._require_reauth("run an attack test"):
             return
         choice = input("Run 'virtual attack' or 'real attack'? ").strip().lower()
@@ -2776,7 +2535,7 @@ specific read.)"""
         results = []
         out_bad = os.path.join(self.storage_root, "__attack_test_out_bad__.bin")
 
-        # 1. Baseline: correct key reconstructs correctly
+        # 1. Correct key reconstructs correctly
         try:
             self._session.reconstruct_label(label, out_ok)
             with open(out_ok, "rb") as f:
@@ -2785,9 +2544,7 @@ specific read.)"""
             ok = False
         results.append(("Baseline: correct key reconstructs correctly", ok))
 
-        # 2. Wrong key is rejected -- opening a SECOND session under a
-        # wrong KEK fails immediately (the keyring itself can't be
-        # decrypted), stronger than only failing on a later read.
+        # 2. A session under a wrong KEK fails to open (the keyring can't be decrypted).
         wrong_kek = secrets.token_bytes(32)
         try:
             bad_session = CppVaultSession(self.storage_root, wrong_kek)
@@ -2796,17 +2553,14 @@ specific read.)"""
         except PfsEngineError:
             results.append(("Wrong key is rejected", True))
 
-        # 3. Confirmation-of-presence attack is blocked: a guessed
-        # content hash can't be used directly as a database lookup key
-        # (the real lookup_key is HMAC-blinded, never the raw hash).
+        # 3. Confirmation-of-presence attack: lookup keys are HMACs, not raw hashes.
         guessed_hash = hashlib.sha256(expected_content[:4096]).digest()
         conn = sqlite3.connect(os.path.join(self.storage_root, DB_FILENAME))
         row = conn.execute("SELECT 1 FROM blocks WHERE lookup_key = ?", (guessed_hash,)).fetchone()
         conn.close()
         results.append(("Confirmation-of-presence attack blocked", row is None))
 
-        # 4. Corrupted ciphertext is detected, not silently returned --
-        # SAFELY: back up the exact bytes before touching anything.
+        # 4. Corrupted ciphertext is detected; the original bytes are backed up first.
         try:
             first_hash = self._session.debug_get_block_hash(label, 0)
             loc = self._session.debug_lookup_chunk(first_hash)
@@ -2857,11 +2611,8 @@ specific read.)"""
 
 Example:
   test
-(runs real operations -- write, edit, fork, tag, key rotation, delete,
-vacuum, fsck -- against a throwaway label, not just checks that files
-exist. Functional check, not adversarial; see 'attack' for deliberate
-corruption tests. Same check names as the Python engine's 'test' where
-the operation is genuinely equivalent.)"""
+(real write, edit, fork, tag, key rotation, delete, vacuum and fsck on a
+throwaway label; see 'attack' for tampering tests)"""
         if not self._require_reauth("run a self test"):
             return
         print("=== PFS Power-On Self Test (C++ engine) ===\n")
@@ -3050,8 +2801,7 @@ Example:
 Example:
   tree
   tree nj
-(defaults to upgma if not given; uses fingerprints attached at write
-time, so it never re-reads or re-decrypts your original files)"""
+(defaults to upgma; uses the fingerprints stored at write time)"""
         algorithm = arg.strip().lower() or "upgma"
         if algorithm not in ("upgma", "nj"):
             print("Usage: tree [upgma|nj]")
@@ -3064,10 +2814,7 @@ time, so it never re-reads or re-decrypts your original files)"""
             print(f"Failed: {e}")
             return
 
-        # build_tree already covers every fingerprinted label, so no
-        # filtering needed here (unlike similar/clade below, which only
-        # touch a subset) -- best-effort: a failure here shouldn't hide
-        # the tree that already rendered fine.
+        # build_tree covers every fingerprinted label. A warning failure mustn't hide the tree.
         try:
             unreliable = self._session.unreliable_fingerprint_labels()
         except PfsEngineError:
@@ -3119,13 +2866,8 @@ Example:
   clade my_report
   checkout @tip /tmp/restored.pdf     (label is optional once focused)
   ancestor 2                           (steps back from the focused label's tip)
-(a clade is a similarity GROUPING -- the same connected-components
-clustering 'tree'/'similar' already use, at the design doc's own
-D<=0.80 threshold -- NOT a lineage: it has no real parent/child
-structure of its own, just membership, so this never invents a fake
-"clade root". Sets this shell's 'current focus' to <label> itself, so
-'checkout @tip'/'ancestor N' can be used afterward without repeating
-the label.)"""
+(a clade groups files within Jaccard distance 0.80 of each other; it is
+not a lineage and has no root. Sets the shell's focus to <label>.)"""
         label = _join_args(arg)
         if not label:
             print("Usage: clade <label>")
@@ -3155,12 +2897,7 @@ the label.)"""
             print(f"  '{label}' -- no other file in the vault is within the clade threshold "
                   f"(a clade of one).")
         else:
-            # "Most ancestral" here means only "the member whose OWN generation-0 write
-            # happened earliest" -- an orientation note, not a real clade root: this
-            # project's own design deliberately keeps clade clustering (unrelated files
-            # grouped by content similarity) separate from the Lineage DAG (one file's
-            # real edit history). A clade has no parent/child structure of its own, so
-            # this is NOT claiming one exists.
+            # "Oldest" is just the earliest generation-0 write -- an orientation aid, not a root.
             def birth0(m):
                 try:
                     hist = self._session.get_history(m)

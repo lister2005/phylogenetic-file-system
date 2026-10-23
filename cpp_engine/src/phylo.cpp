@@ -81,9 +81,7 @@ bool trait_set_is_reliable(const TraitSet& traits) {
 double jaccard_distance(const TraitSet& a, const TraitSet& b) {
     if (a.empty() && b.empty()) return 1.0;
     size_t intersection = 0;
-    // Both are sorted (std::set) -- a linear merge-count is O(|a|+|b|),
-    // same asymptotic cost as Python's set intersection/union but no
-    // extra allocation for the intersection/union sets themselves.
+    // Linear merge-count over two sorted sets.
     auto ia = a.begin(), ib = b.begin();
     while (ia != a.end() && ib != b.end()) {
         if (*ia == *ib) { intersection++; ++ia; ++ib; }
@@ -132,9 +130,7 @@ std::vector<PhyloNode> make_leaves(const std::map<std::string, TraitSet>& named_
     return leaves;
 }
 
-// Dense initial pairwise distance matrix over LEAF indices only (0..n-1
-// in `leaves`'s own order) -- mirrors _initial_distances, just indexed
-// by position instead of Python object identity.
+// Pairwise distances between leaves, by position.
 std::vector<std::vector<double>> initial_distances(const std::vector<PhyloNode>& leaves) {
     size_t n = leaves.size();
     std::vector<std::vector<double>> d(n, std::vector<double>(n, 0.0));
@@ -153,9 +149,8 @@ PhyloTree build_tree_upgma_from_traits(const std::map<std::string, TraitSet>& na
     std::vector<PhyloNode> leaves = make_leaves(named_traits);
     if (leaves.size() <= 1) return leaves;
 
-    PhyloTree all_nodes(leaves.begin(), leaves.end());  // index i -> all_nodes[i], stable (push_back-only from here)
-    // "active" holds INDICES into all_nodes. distances is keyed the
-    // same way, indexed by those same stable indices.
+    PhyloTree all_nodes(leaves.begin(), leaves.end());  // index -> all_nodes[index], stable
+    // active and distances use indices into all_nodes.
     std::vector<size_t> active;
     for (size_t i = 0; i < leaves.size(); i++) active.push_back(i);
 
@@ -165,7 +160,7 @@ PhyloTree build_tree_upgma_from_traits(const std::map<std::string, TraitSet>& na
         for (size_t j = 0; j < leaves.size(); j++)
             if (i != j) distances[i][j] = dense[i][j];
 
-    std::map<size_t, uint64_t> leaf_count_of;  // tracks CURRENT leaf_count per active index (all_nodes[idx] also has it, kept in sync)
+    std::map<size_t, uint64_t> leaf_count_of;  // current leaf_count per active index
     for (size_t i = 0; i < leaves.size(); i++) leaf_count_of[i] = 1;
 
     while (active.size() > 1) {

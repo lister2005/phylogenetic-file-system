@@ -1,9 +1,6 @@
 #pragma once
-// C++ port of gearhash/phenotype.py -- identifies a file's true format
-// from its own content (magic bytes), not a filename extension. Same
-// signature table, same order (first match wins), same text-heuristic
-// fallback. See phenotype.py's own docstring for the design rationale;
-// this is a byte-for-byte behavioral port, not a redesign.
+// Port of gearhash/phenotype.py: same signature table and order, same
+// text fallback.
 #include <cstdint>
 #include <string>
 
@@ -14,8 +11,7 @@ struct Phenotype {
     std::string name;
 };
 
-// data should be the first ~64 bytes of the file. Never throws -- an
-// unrecognized or empty sample is UNKNOWN, a legitimate outcome.
+// data: the first ~64 bytes. Never throws; unknown or empty -> UNKNOWN.
 Phenotype detect_phenotype(const uint8_t* data, size_t size);
 
 }  // namespace pfs_engine

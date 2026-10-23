@@ -1,43 +1,14 @@
 """
-Builds a phylogenetic tree from a set of files, using either UPGMA or
-Neighbor-Joining. Both start from the same pairwise Jaccard distance
-matrix (via the analyzer's SIMILARITY_PROFILE) but merge nodes with
-different criteria and produce different branch-length semantics --
-see each method's docstring.
+Clade clustering: UPGMA and Neighbor-Joining trees, and the clade
+partition (compute_clades), from pairwise Jaccard distances between
+SIMILARITY_PROFILE fingerprints.
 
-Two ways to get leaves in:
-- build_tree_upgma(file_paths) / build_tree_nj(file_paths): reads and
-  fingerprints files directly. Useful for ad-hoc comparisons of files
-  not yet in the vault.
-- build_tree_upgma_from_traits(named_traits) / build_tree_nj_from_traits
-  (named_traits): starts from ALREADY-COMPUTED trait sets (e.g. read
-  back from encrypted manifest metadata via the storage pipeline). This
-  is what the CLI's `tree` command uses -- it never needs to re-read or
-  re-decrypt original file content just to see the tree.
+Leaves come from files (build_tree_*(file_paths)) or from stored
+fingerprints (build_tree_*_from_traits), which is what the CLI uses.
 
-IMPORTANT DISTINCTION (per text.txt): this builds the CLADE CLUSTERING
-TREE, not the LINEAGE DAG. These are two different structures text.txt
-describes, and they must not be conflated:
-
-- The Lineage DAG (text.txt's "Speciation on Write"): tracks ONE file's
-  real edit history over time (V1 -> V2 -> V3...). Every node is a real,
-  reconstructible file state. Parent->child here has a REAL
-  mutation_delta -- the actual new chunk bytes introduced by a real
-  edit, computed by comparing the new version's STORAGE_PROFILE chunk
-  hashes against the parent's. This already exists: it's exactly what
-  StoragePipeline's dedup mechanism does on every write
-  (new_chunks_written vs duplicate_chunks_found in the manifest). This
-  file does not build that structure.
-
-- The Clade Clustering Tree (this file, UPGMA/NJ): groups UNRELATED,
-  previously-unlinked files by content similarity for discovery and
-  organization -- text.txt's "background clustering daemon... to build
-  the file matrix". Internal nodes here are SYNTHETIC clusters with no
-  real byte content (they're the union of their children's trait sets),
-  so they cannot have a real mutation_delta. leaf_count/branch_signature
-  are meaningful here; mutation_delta/delta_size are left at their
-  defaults (0 / empty) on internal nodes, since populating them with
-  anything would misleadingly imply real storage bytes that don't exist.
+This groups different files by similarity. It is not the lineage DAG
+(lineage.py), which records one file's real edit history: internal nodes
+here are synthetic, so they carry no mutation delta.
 """
 
 from typing import List, Dict, Optional
@@ -60,9 +31,7 @@ class TreeConstructor:
         return self._assign_branch_signatures(leaves)
 
     def _make_leaves_from_traits(self, named_traits: Dict[str, set]) -> List[PhylogeneticNode]:
-        """named_traits: {label: set_of_trait_hashes}, e.g. read back from
-        each file's already-computed, already-stored fingerprint. No file
-        I/O, no re-chunking -- just builds leaf nodes directly."""
+        """named_traits: {label: set_of_trait_hashes}. No file I/O."""
         leaves = []
         for label, traits in named_traits.items():
             node = PhylogeneticNode()
@@ -72,14 +41,8 @@ class TreeConstructor:
         return self._assign_branch_signatures(leaves)
 
     def _assign_branch_signatures(self, leaves: List[PhylogeneticNode]) -> List[PhylogeneticNode]:
-        # branch_signature is a uint32_t bitmask in the C struct -- one
-        # bit per ORIGINAL leaf, OR'd together as clusters merge, so any
-        # node's signature tells you which original files are its
-        # descendants via simple bit tests. This caps out at 32 leaves;
-        # beyond that, signature is left at 0 for the overflow leaves --
-        # documented limitation, not a silent wraparound bug. A real fix
-        # for large N would need a wider or probabilistic (Bloom-filter
-        # style) signature scheme instead of a fixed 32-bit mask.
+        # branch_signature: one bit per original leaf, OR'd on merge. 32 bits, so
+        # leaves past the 32nd get 0.
         for i, leaf in enumerate(leaves):
             leaf.branch_signature = (1 << i) if i < 32 else 0
         return leaves
@@ -101,7 +64,7 @@ class TreeConstructor:
         return self._upgma_merge(self._make_leaves_from_files(file_paths))
 
     def build_tree_upgma_from_traits(self, named_traits: Dict[str, set]) -> List[PhylogeneticNode]:
-        """UPGMA from already-computed trait sets -- no file I/O."""
+        """UPGMA from stored trait sets."""
         return self._upgma_merge(self._make_leaves_from_traits(named_traits))
 
     def build_tree_nj(self, file_paths: List[str]) -> List[PhylogeneticNode]:
@@ -109,24 +72,15 @@ class TreeConstructor:
         return self._nj_merge(self._make_leaves_from_files(file_paths))
 
     def build_tree_nj_from_traits(self, named_traits: Dict[str, set]) -> List[PhylogeneticNode]:
-        """Neighbor-Joining from already-computed trait sets -- no file I/O."""
+        """Neighbor-Joining from stored trait sets."""
         return self._nj_merge(self._make_leaves_from_traits(named_traits))
 
     # ---------- UPGMA core ----------
 
     def _upgma_merge(self, leaves: List[PhylogeneticNode]) -> List[PhylogeneticNode]:
-        """Unweighted Pair Group Method with Arithmetic mean. Assumes a
-        constant mutation rate across all lineages (produces an
-        ULTRAMETRIC tree -- every leaf is the same total height from the
-        root). At each step, merges the two clusters with the smallest
-        distance, then updates the new cluster's distance to everyone
-        else via the size-weighted average of the two merged clusters'
-        distances -- this is the "arithmetic mean" the name refers to,
-        and it's what makes this UPGMA rather than just greedy nearest-
-        neighbor clustering.
-
-        Returns ALL nodes created (leaves + internal), not just the
-        root, so the full tree is available for visualization/export.
+        """UPGMA: repeatedly merges the closest pair, updating distances by the
+        size-weighted average. Assumes a constant rate (ultrametric tree).
+        Returns every node, leaves and internal.
         """
         if len(leaves) <= 1:
             return leaves
@@ -153,10 +107,7 @@ class TreeConstructor:
             parent.leaf_count = a.leaf_count + b.leaf_count
             parent.branch_signature = a.branch_signature | b.branch_signature
             parent.height = min_dist / 2.0  # ultrametric midpoint
-            # Trait-count proxy for divergence at this split -- traits
-            # that distinguish the two children from each other. NOT the
-            # actual byte-level mutation delta (that's a separate delta-
-            # synthesis phase against real file content, not built yet).
+            # Traits distinguishing the two children: a divergence proxy, not a byte delta.
             parent.trait_divergence_count = len(a.trait_matrix.symmetric_difference(b.trait_matrix))
 
             a.parent_uuid = parent.node_uuid
@@ -164,8 +115,7 @@ class TreeConstructor:
             a.branch_length = max(0.0, parent.height - a.height)
             b.branch_length = max(0.0, parent.height - b.height)
 
-            # UPGMA's actual update rule: size-weighted average of the
-            # two merged clusters' distances to everyone else.
+            # Size-weighted average distance to every other cluster.
             new_row = {}
             for other in active:
                 if other is a or other is b:
@@ -189,21 +139,9 @@ class TreeConstructor:
     # ---------- Neighbor-Joining core ----------
 
     def _nj_merge(self, leaves: List[PhylogeneticNode]) -> List[PhylogeneticNode]:
-        """Neighbor-Joining. Does NOT assume a constant mutation rate --
-        useful here because different files/file types plausibly get
-        edited at very different rates, which would distort an UPGMA
-        tree's ultrametric assumption. Produces asymmetric branch
-        lengths per child instead of a single midpoint height.
-
-        Classic NJ produces an unrooted tree (the last three active
-        nodes form a trifurcation with no natural root). For a
-        browsable lineage tree we still want a root, so this roots at
-        the final join of the last two active nodes -- a standard,
-        simple choice, not the only valid one (midpoint or outgroup
-        rooting are alternatives if you need something more principled
-        later).
-
-        Returns ALL nodes created (leaves + internal).
+        """Neighbor-Joining: no constant-rate assumption, so branch lengths differ
+        per child. Rooted at the final join of the last two nodes. Returns every
+        node, leaves and internal.
         """
         if len(leaves) <= 1:
             return leaves
@@ -233,9 +171,7 @@ class TreeConstructor:
             d_ab = distances[a][b]
             branch_a = 0.5 * d_ab + (total[a] - total[b]) / (2 * (n - 2))
             branch_b = d_ab - branch_a
-            # Floating point can push these fractionally negative for
-            # near-zero distances -- clamp rather than let a cosmetic
-            # rounding error look like a real negative branch length.
+            # Clamp rounding noise below zero.
             branch_a = max(0.0, branch_a)
             branch_b = max(0.0, branch_b)
 
@@ -268,7 +204,7 @@ class TreeConstructor:
             active.append(parent)
             all_nodes.append(parent)
 
-        # Final step: exactly two active nodes left -- join directly.
+        # Two nodes left: join them.
         a, b = active[0], active[1]
         d_ab = distances[a][b]
         root = PhylogeneticNode()
@@ -287,29 +223,16 @@ class TreeConstructor:
 
     # ---------- clade partitioning (connected components, not the tree) ----------
 
-    # Design doc's own recommendation ("The absolute optimal threshold
-    # for your system is D<=0.80"): files sharing at least 20% of their
-    # content-defined chunks are considered the same clade.
+    # Distance <= 0.80 (at least 20% shared chunks) means the same clade.
     DEFAULT_CLADE_THRESHOLD = 0.80
 
     def compute_clades(self, named_traits: Dict[str, set], threshold: float = DEFAULT_CLADE_THRESHOLD) -> Dict[str, List[str]]:
-        """Partitions files into clades: connected components of the
-        graph where an edge connects any two labels whose Jaccard
-        distance is <= threshold. Deliberately NOT the UPGMA/NJ tree
-        above (which always produces a single tree spanning everyone,
-        with no notion of "these are unrelated") -- a clade here is
-        "the group of files close enough to call related", matching the
-        design doc's own definition verbatim: "If D(A,B) < Threshold,
-        they are assigned to the same Clade."
+        """Clades: connected components of "Jaccard distance <= threshold",
+        unlike the trees, which always span everything.
 
-        Returns {representative_label: [member_labels, ...]}, keyed by
-        each clade's lexicographically-smallest member so a caller using
-        this for directory names gets a name that's stable across
-        recomputation as long as membership doesn't change. Singleton
-        clades (no neighbor within threshold) are included too, as a
-        clade of one -- callers that only want multi-member clades
-        (e.g. "only show a subdirectory when there's actually a group")
-        should filter those out themselves."""
+        Returns {representative: [members]} keyed by each clade's smallest
+        member; singletons are included.
+        """
         labels = list(named_traits.keys())
         parent = {label: label for label in labels}
 
@@ -345,8 +268,7 @@ class TreeConstructor:
     # ---------- visualization ----------
 
     def visualize_tree(self, all_nodes: List[PhylogeneticNode]) -> None:
-        """ASCII tree, working recursively via a parent->children map
-        built from the full node list."""
+        """ASCII rendering of the tree."""
         by_uuid = {n.node_uuid: n for n in all_nodes}
         children: Dict[bytes, List[PhylogeneticNode]] = {n.node_uuid: [] for n in all_nodes}
         roots = []

@@ -31,8 +31,7 @@ VaultLock::VaultLock(const std::string& storage_root) {
     std::filesystem::create_directories(storage_root);
     std::filesystem::path lock_path = std::filesystem::path(storage_root) / kLockFilename;
 
-    // Open (creating if needed) before canonicalizing -- canonical()
-    // requires the path to already exist.
+    // Create it first: canonical() needs an existing path.
     int fd = ::open(lock_path.c_str(), O_CREAT | O_RDWR, 0600);
     if (fd < 0) {
         throw std::runtime_error("Couldn't create lock file at '" + lock_path.string() +
@@ -46,10 +45,7 @@ VaultLock::VaultLock(const std::string& storage_root) {
     std::lock_guard<std::mutex> guard(g_registry_mutex);
     auto it = g_registry.find(canonical_path_);
     if (it != g_registry.end() && it->second.refcount > 0) {
-        // Already held by THIS process (another VaultSession against
-        // the same vault) -- join it, no new OS-level flock call
-        // needed. Don't leak the fd we just opened; the registry's
-        // original fd is what's actually holding the OS lock.
+        // Already held by this process: join it and close the extra fd.
         ::close(fd);
         it->second.refcount += 1;
         active_ = true;

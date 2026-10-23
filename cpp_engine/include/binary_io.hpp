@@ -1,10 +1,6 @@
 #pragma once
-// Small, explicit little-endian binary serialization helpers shared by
-// every on-disk format in this engine (manifest, keyring, lineage).
-// Explicit field-by-field writes/reads, not struct packing -- avoids
-// compiler-padding/alignment differences ever becoming a silent format
-// break across compilers or platforms. Factored out once the same
-// put_u16/u32/string pattern was about to be written a third time.
+// Explicit little-endian field-by-field serialization for every on-disk
+// format here (no struct packing, so no padding surprises).
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -22,16 +18,13 @@ public:
     void u64(uint64_t v) { for (int i = 0; i < 8; i++) buf_.push_back(static_cast<uint8_t>((v >> (8 * i)) & 0xFF)); }
     void f64(double v) {
         uint64_t bits;
-        memcpy(&bits, &v, 8);  // IEEE754 double, byte layout reinterpreted as u64 -- x86_64/ARM64 are both little-endian
+        memcpy(&bits, &v, 8);  // IEEE 754 double as u64
         u64(bits);
     }
     void raw_bytes(const uint8_t* data, size_t len) { buf_.insert(buf_.end(), data, data + len); }
     template <size_t N>
     void fixed_bytes(const std::array<uint8_t, N>& arr) { raw_bytes(arr.data(), N); }
-    // u16-length-prefixed UTF-8 string -- every string field in every
-    // format here is short (filenames, tag keys/values, phenotype
-    // names), so a u16 prefix (up to 64KB) is deliberately generous
-    // without wasting space on a u32/u64 prefix nothing needs.
+    // u16-length-prefixed UTF-8 string (every string field here is short).
     void string16(const std::string& s) {
         if (s.size() > 0xFFFF) throw std::runtime_error("string field too long for a u16 length prefix");
         u16(static_cast<uint16_t>(s.size()));

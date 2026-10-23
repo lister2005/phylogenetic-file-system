@@ -6,11 +6,9 @@ namespace pfs_engine {
 
 namespace {
 
-constexpr const char* kMirrorAadSuffix = "|mirror";  // matches _MIRROR_AAD_SUFFIX exactly
+constexpr const char* kMirrorAadSuffix = "|mirror";  // _MIRROR_AAD_SUFFIX
 
-// Matches _VALUE_FORMAT = "32sQQII" (content_hash, offset, length,
-// ref_count, epoch_id), little-endian, no padding -- verified via
-// struct.calcsize()/struct.pack() against the Python reference.
+// _VALUE_FORMAT "32sQQII": content_hash, offset, length, ref_count, epoch_id; little-endian, unpadded.
 constexpr size_t kValueSize = 32 + 8 + 8 + 4 + 4;
 
 std::vector<uint8_t> pack_value(const Bytes32& content_hash, uint64_t offset, uint64_t length,
@@ -154,9 +152,7 @@ std::map<Bytes32, BlockEntry> DedupIndex::lookup_many(const std::vector<Bytes32>
     std::map<Bytes32, BlockEntry> result;
     if (content_hashes.empty()) return result;
 
-    // lookup_key -> content_hash, so a matched row can be reported back
-    // under the caller's own hash (lookup_key is a one-way HMAC, not
-    // reversible from the row itself).
+    // lookup_key -> content_hash, to report rows under the caller's hash.
     std::map<Bytes32, Bytes32> key_to_hash;
     std::vector<Bytes32> keys;
     keys.reserve(content_hashes.size());
@@ -187,7 +183,7 @@ std::map<Bytes32, BlockEntry> DedupIndex::lookup_many(const std::vector<Bytes32>
         Bytes32 key{};
         memcpy(key.data(), key_blob, key_len < 32 ? key_len : 32);
         auto it = key_to_hash.find(key);
-        if (it == key_to_hash.end()) continue;  // shouldn't happen; defensive
+        if (it == key_to_hash.end()) continue;  // defensive
 
         std::vector<uint8_t> raw = aead_decrypt(value_key_, static_cast<const uint8_t*>(val_blob), val_len,
                                                  static_cast<const uint8_t*>(key_blob), key_len);
@@ -211,8 +207,7 @@ void DedupIndex::upsert_many(const std::vector<std::tuple<Bytes32, uint64_t, uin
     if (sqlite3_prepare_v2(db_, sql.c_str(), -1, &stmt, nullptr) != SQLITE_OK) {
         throw std::runtime_error("failed to prepare batched upsert");
     }
-    // SQLITE_STATIC bindings don't copy the bytes -- keep every row's
-    // key/value buffers alive until sqlite3_step() actually runs below.
+    // SQLITE_STATIC doesn't copy: keep the buffers alive until sqlite3_step().
     std::vector<Bytes32> keys_buf;
     std::vector<std::vector<uint8_t>> vals_buf;
     keys_buf.reserve(entries.size());
@@ -330,10 +325,7 @@ bool DedupIndex::remove(const Bytes32& content_hash) {
         throw std::runtime_error("failed to delete mirror row");
     }
     sqlite3_finalize(del_mirror);
-    // sqlite3_changes() reflects the row count of the last completed
-    // INSERT/UPDATE/DELETE on this connection -- the mirror DELETE just
-    // above, at this point -- so this tells the caller whether this
-    // specific dead chunk was ever actually mirrored.
+    // sqlite3_changes() here counts the mirror DELETE above: did this chunk have a mirror?
     return sqlite3_changes(db_) > 0;
 }
 
@@ -360,12 +352,7 @@ std::vector<FullBlockEntry> DedupIndex::iter_all() {
 std::vector<FullMirrorEntry> DedupIndex::iter_all_mirrors() {
     std::vector<FullMirrorEntry> out;
     sqlite3_stmt* stmt = nullptr;
-    // Joined against blocks on the shared lookup_key -- both tables key
-    // off HMAC(hmac_key, content_hash) for the SAME content_hash (see
-    // set_mirror/upsert), and blocks' own payload carries content_hash in
-    // plaintext (unpack_full), which the mirrors table's payload does
-    // not. This recovers content_hash for every mirror row without any
-    // on-disk format change to the mirrors table itself.
+    // Mirror payloads lack the content hash; join with blocks on the shared lookup_key to get it.
     sqlite3_prepare_v2(db_,
         "SELECT m.lookup_key, m.encrypted_value, b.encrypted_value "
         "FROM mirrors m JOIN blocks b ON m.lookup_key = b.lookup_key",

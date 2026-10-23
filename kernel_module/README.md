@@ -38,10 +38,6 @@ generation), the code has an explicit comment saying so, backed by a small
 in-kernel memory buffer standing in for real storage just so a `read()`
 after a `write()` has something real to hand back.
 
-See `pfs_lkm.c` itself for a heavily-commented (deliberately more so than
-this codebase's normal style, since this file is meant to be read aloud and
-explained line-by-line to someone who's never seen kernel C before) walk
-through of every function.
 
 ## Build status: compiles cleanly to a real `.ko`
 

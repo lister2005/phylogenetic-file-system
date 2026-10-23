@@ -22,10 +22,7 @@ Manifest::Manifest(ManifestMetadata metadata, std::vector<Bytes32> block_hashes)
     if (block_hashes_.size() != metadata_.total_blocks) {
         throw std::runtime_error("block_hashes.size() must equal metadata.total_blocks");
     }
-    // Sorted so two manifests built from the same logical fingerprint
-    // set always serialize identically -- a `std::set`-like normal
-    // form, matching Python's `set` having no meaningful iteration
-    // order guarantee of its own, so this format defines one instead.
+    // Sorted, so the same fingerprint always serializes identically.
     if (metadata_.similarity_fingerprint) {
         std::sort(metadata_.similarity_fingerprint->begin(), metadata_.similarity_fingerprint->end());
     }
@@ -62,7 +59,7 @@ Manifest Manifest::deserialize(const std::vector<uint8_t>& raw) {
     BinaryReader r(raw.data(), raw.size());
     r.need(4);
     if (memcmp(raw.data(), kMagic, 4) != 0) throw std::runtime_error("bad manifest magic");
-    r.fixed_bytes<4>();  // consume the magic we just checked
+    r.fixed_bytes<4>();  // the magic
     uint16_t version = r.u16();
     if (version != kVersion) throw std::runtime_error("unsupported manifest version");
 
@@ -119,10 +116,7 @@ void write_manifest_file(const std::string& path, const std::string& manifest_fi
         kek, raw.data(), raw.size(),
         reinterpret_cast<const uint8_t*>(manifest_filename.data()), manifest_filename.size());
 
-    // Write-temp-then-rename-then-fsync -- matches pipeline.py's
-    // _atomic_write exactly: the target path either has its old
-    // complete contents or the new complete contents, never a partial
-    // write, even across a crash.
+    // Temp file + rename + fsync: never a partial manifest.
     std::string tmp_path = path + ".tmp";
     {
         std::ofstream out(tmp_path, std::ios::binary | std::ios::trunc);

@@ -1,17 +1,11 @@
 #pragma once
-// Background, incremental clade clustering -- the C++ counterpart of
-// clade_worker.py (see its docstring for the full rationale). Keeps the
-// compute_clades() partition (connected components of "Jaccard distance
-// <= threshold", keyed by smallest member, singletons included) up to
-// date on its own thread: a change compares only the changed labels
-// against everyone else (O(n), not O(n^2)), then re-runs union-find over
-// the kept related-pairs edges and publishes a new immutable partition.
-// Readers take snapshot() and never wait.
+// Background, incremental clade clustering: the C++ counterpart of
+// clade_worker.py. A change compares only the changed labels against the
+// rest; readers take snapshot() and never wait.
 //
-// The loader runs ONLY on the worker thread. Each changed() carries a
-// caller-chosen `source` string (pfs_fuse_cpp passes the label's manifest
-// filename, captured on its own thread) so the loader never has to touch
-// state the caller mutates -- VaultSession isn't thread-safe.
+// The loader runs only on the worker thread. Each changed() carries a
+// caller-chosen `source` (pfs_fuse_cpp: the manifest filename), so the
+// loader needs no state the caller mutates.
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -31,7 +25,7 @@
 namespace pfs_engine {
 
 struct CladePartition {
-    // representative (smallest member) -> sorted members; every clade, singletons included
+    // representative (smallest member) -> sorted members; singletons included
     std::map<std::string, std::vector<std::string>> clade_to_labels;
     uint64_t version = 0;  // 0 = nothing computed yet
 };
@@ -42,10 +36,8 @@ using SortedTraits = std::vector<Bytes32>;
 // Same Jaccard distance as jaccard_distance(), over sorted vectors.
 double sorted_jaccard_distance(const SortedTraits& a, const SortedTraits& b);
 
-// `partition` restricted to labels for which is_live() is true, re-keyed
-// by each clade's smallest surviving member, keeping clades with at least
-// min_members survivors. Lets a reader use a slightly stale partition: a
-// label deleted or renamed since it was computed never shows up.
+// `partition` restricted to live labels, re-keyed by the smallest
+// survivor, keeping clades with at least min_members.
 std::pair<std::map<std::string, std::vector<std::string>>, std::map<std::string, std::string>>
 filtered_clades(const CladePartition& partition, const std::function<bool(const std::string&)>& is_live,
                 size_t min_members);
@@ -91,13 +83,14 @@ private:
 
     mutable std::mutex mutex_;
     std::condition_variable cond_;
-    std::vector<Event> events_;  // guarded by mutex_
-    bool busy_ = false;          // guarded by mutex_
-    bool stopping_ = false;      // guarded by mutex_
-    std::shared_ptr<const CladePartition> snapshot_;  // guarded by mutex_
+    // Guarded by mutex_:
+    std::vector<Event> events_;
+    bool busy_ = false;
+    bool stopping_ = false;
+    std::shared_ptr<const CladePartition> snapshot_;
     std::thread thread_;
 
-    // Worker-thread-only state.
+    // Worker-thread state.
     std::map<std::string, SortedTraits> traits_;
     std::map<std::string, std::set<std::string>> neighbors_;
     uint64_t distance_calls_ = 0;

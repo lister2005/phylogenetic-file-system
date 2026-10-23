@@ -1,18 +1,8 @@
 #pragma once
-// C++ port of VaultSession's catalog (label -> current manifest_filename
-// pointer). Same story as manifest/keyring/lineage: Python pickles a
-// `Dict[str, str]` (catalog.enc); this is a new small portable format
-// (catalog.pfsc) instead. Small enough that, like the keyring, there's
-// nothing deeper to port than the container shape itself -- no
-// algorithmic complexity here, just "don't use pickle."
-//
-// Why this can't just be derived from LineageStore alone: a label with
-// multiple open branch heads (after a fork) has more than one valid
-// "current" generation, and LineageStore has no notion of which one is
-// THE one a plain, generation-unaware read/write should use -- that's
-// exactly what the catalog records (vault_session.py: "the catalog
-// pointer... always moves to whichever branch was written to most
-// recently, fork or not"). It's genuinely separate state, not a cache.
+// The catalog: label -> current manifest filename, in a portable file
+// (catalog.pfsc) instead of pickle. Separate state, not derivable from
+// lineage: with several branch heads, it records which one plain
+// reads/writes use (the most recently written).
 #include <map>
 #include <optional>
 #include <string>

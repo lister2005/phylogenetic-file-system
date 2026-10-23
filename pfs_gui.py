@@ -1,54 +1,15 @@
 """
-PFS Cosmic Web View -- GUI phase (v4, 2026-07-24).
+PFS Cosmic Web View: desktop GUI over a vault (either engine, through
+pfs_engine_adapter), in the same process -- no IPC, no FUSE.
 
-Architecture: embeds VaultSession directly, same process, like pfs_cli.py
--- no IPC, no dependency on the FUSE daemon. See manual.txt PART 10/PART 0
-for the full reasoning (including why there's no path/directory concept
-anywhere in this file).
+Views: Cosmic Web (one node per label, laid out by similarity), Lineage
+Tree (every generation; branches colored and curved; merge from the
+context menu) and Clade Tree (UPGMA or Neighbor-Joining dendrogram).
+A force simulation runs continuously; dragging pins a node.
 
-THREE VIEW MODES (toggle, top-left):
-  - Cosmic Web: one node per label (current tip), force-directed by
-    SIMILARITY_PROFILE closeness.
-  - Lineage Tree: the FULL DAG -- every recorded generation of every
-    label, laid out by depth from its root. Divergent branches (forks)
-    get distinct per-branch edge colors; a branch head's right-click menu
-    has a real "Merge branches..." action.
-  - Clade Tree: a REAL UPGMA or Neighbor-Joining dendrogram
-    (TreeConstructor.build_tree_upgma_from_traits /
-    build_tree_nj_from_traits), toggleable live -- watch the exact same
-    files regroup differently under the two algorithms' different
-    assumptions (constant mutation rate vs. not).
-
-LIVE PHYSICS, not a one-shot static layout: a continuously-running
-force simulation (repulsion between all nodes, springs along edges, a
-weak centering pull, and -- in Tree/Clade Tree modes -- a weak vertical
-bias keeping children below parents) runs every ~33ms. Dragging a node
-"pins" it (the simulation stops writing its position but keeps reading
-it, so neighbors still react in real time) and releases it back into the
-simulation on mouse-up. This is what makes the graph feel alive/organic
-under a drag instead of just a static diagram with movable dots.
-
-OVERLAYS: search (dims non-matches), Time Machine slider (hides anything
-that didn't exist yet, by real birth_timestamp), Outline Clades (draws a
-boundary around each TreeConstructor.compute_clades() cluster, web mode),
-Dedup Heat (recolors by shared vs. unique content, both graph modes), a
-minimap inset (always-visible small overview + viewport indicator), and a
-live stats HUD in the status bar.
-
-WRITE ACTIONS, all routed through the same VaultSession methods the CLI
-uses: right-click a node for Info / Rename / Duplicate (zero-cost alias)
-/ Delete / Trace ancestry / Reveal in Tree (web mode); Info / Checkout /
-Prune / Fork from here / Merge branches (tree mode, where applicable).
-"+ New File" and canvas drag-and-drop both support MULTIPLE files at
-once. Selecting two nodes (ctrl-click) shows a live similarity/shared-
-chunk readout between them. A newly-appearing node grows in with a short
-animation; successful actions show a toast instead of a silent rebuild.
-
-Deferred, tracked in gui_ideas.txt (not silently dropped): a full ⌘K
-command palette, a fully bespoke curved/interlocking "braid" edge
-renderer (current per-branch edge coloring + working Merge is the
-functional core), point-in-time CONTENT reconstruction in the Time
-Machine (current version is existence-based), and a light theme variant.
+Overlays: search, Time Machine slider, clade outlines (background clade
+worker), dedup heat, minimap, stats HUD. Writes go through the same
+session methods as the CLI.
 """
 import argparse
 import sys
@@ -96,9 +57,7 @@ BORDER = "#2a2d38"
 TEXT = "#e4e6ec"
 TEXT_DIM = "#8891a5"
 
-# One hue per FORMAT, not per broad "kind" -- more visual variety across
-# a real, diverse vault (the flat 7-color grouping in the first version
-# made anything but a handful of file types look monotone).
+# One hue per detected format.
 _COLOR_RULES = [
     ("PDF", "#4c8bf5"), ("Text", "#5aa9e6"),
     ("PNG", "#e8a33d"), ("JPEG", "#f2b705"), ("GIF", "#f4d35e"), ("BMP", "#eec170"),
@@ -108,12 +67,8 @@ _COLOR_RULES = [
 ]
 _UNKNOWN_COLOR = "#7a7a85"
 
-# Extension hint ONLY for the temp copy handed to the OS's default-app
-# opener (Edit action) -- the vault itself stays fully extensionless,
-# this is purely so "open with the right app" has its best chance of
-# working, since not every desktop environment's file-open dialog
-# reliably content-sniffs an extensionless file the way this project's
-# own phenotype detection does.
+# Extension hint for the temporary copy handed to an external app; the
+# vault itself stores no extensions.
 _PHENOTYPE_EXTENSION_RULES = [
     ("PDF", ".pdf"), ("PNG", ".png"), ("JPEG", ".jpg"), ("GIF", ".gif"), ("BMP", ".bmp"),
     ("MP3", ".mp3"), ("MP4", ".mp4"), ("RIFF", ".wav"), ("ZIP", ".zip"), ("GZIP", ".gz"),
@@ -128,11 +83,7 @@ def _extension_for_phenotype(name: str) -> str:
     return ""
 
 
-# Plain typographic symbols, deliberately NOT full-color emoji -- emoji
-# glyphs don't reliably respect QGraphicsSimpleTextItem's single-color
-# brush (color-emoji fonts render their own fixed colors, ignoring
-# setBrush), so a faint, tinted, always-visible glyph needs a character
-# a normal text font actually has a monochrome glyph for.
+# Monochrome symbols, not emoji: color-emoji fonts ignore the item's brush.
 _PHENOTYPE_GLYPH_RULES = [
     ("PDF", "▤"), ("Text", "▤"),
     ("PNG", "▧"), ("JPEG", "▧"), ("GIF", "▧"), ("BMP", "▧"),
@@ -150,16 +101,8 @@ def _glyph_for_phenotype(name: str) -> str:
     return _UNKNOWN_GLYPH
 
 
-# Which phenotypes get a genuine in-app, real-time editor/viewer instead
-# of round-tripping through an external OS app (with all the sandboxing/
-# multi-tab/save-detection unreliability that comes with that). Kept
-# deliberately small and honest: Qt's own QPlainTextEdit/QPixmap already
-# handle these formats natively with zero extra dependencies, so there's
-# no reason to hand them off to an external app at all. Formats that
-# genuinely need a real editor (video, audio, PDF layout, spreadsheets,
-# databases...) still use the external-app path -- building bespoke
-# in-app editors for those is real, dedicated software in its own right,
-# not something to fake with a text box.
+# Phenotypes opened in an in-app editor/viewer (Qt handles them natively);
+# everything else goes to the OS default app.
 _INAPP_TEXT_PHENOTYPES = {"Plain Text"}
 _INAPP_IMAGE_PHENOTYPES = {"PNG Image", "JPEG Image", "GIF Image", "BMP Image"}
 
@@ -178,28 +121,13 @@ _HEATMAP_LOW = "#e0524a"
 _HEATMAP_HIGH = ACCENT
 BRANCH_COLORS = ["#e08a3d", "#4c8bf5", "#4caf6e", "#e05252", "#c96fd6"]
 
-# Lineage diff chunk-map colors -- matches Project_idea.txt's own framing
-# ("red for deleted blocks, green for new code blocks"). CHANGED and NEW
-# both read as green (a mutated position and a genuinely new/appended
-# position are both "green" per the brief and per this project's own
-# diff spec), but NEW gets the brighter shade so "the file grew here" is
-# still visually distinguishable from "this existing position mutated"
-# on hover/inspection, without contradicting the two-color brief.
+# Lineage diff colors: red = removed, green = changed, brighter green = new.
 _DIFF_UNCHANGED_COLOR = "#3a3d4a"
 _DIFF_CHANGED_COLOR = "#4caf6e"
 _DIFF_NEW_COLOR = "#8ee6a8"
 _DIFF_DELETED_COLOR = "#e05252"
 
-# The single source of truth for "how visible should a normal, non-dimmed
-# edge be" -- EdgeItem's own resting opacity, the appearance-animation's
-# end value, and the search/trace "on" states all read from this ONE
-# constant instead of each hardcoding their own number. That drift is
-# exactly what caused a real bug: the appearance animation used to end at
-# 0.55 while the item's own resting opacity was a separately-hardcoded
-# 0.75 -- any newly-created edge (every Duplicate, every Graft, every new
-# write) silently ended up MORE faint than an edge that was never
-# animated at all, which is what "some links are so very faint I can't
-# see them" turned out to be.
+# Resting opacity of a normal edge; every edge state and animation reads this one value.
 EDGE_REST_OPACITY = 0.94
 
 
@@ -229,21 +157,12 @@ CLADE_HEIGHT_SCALE = 700.0
 WEB_EDGE_REST_LENGTH = 220.0
 LATERAL_EDGE_REST_LENGTH = 200.0
 
-# Deliberately NOT system /tmp: strictly-confined Snap apps (e.g. Ubuntu's
-# default VLC) get their own private per-snap /tmp via mount namespacing and
-# genuinely cannot see anything under the real /tmp -- opening a video for
-# Edit/View would silently fail with "input can't be opened" no matter what
-# this app does. Paths under $HOME are visible to sandboxed apps through the
-# standard 'home' interface/portal, which is why XDG's own cache convention
-# points here for exactly this kind of interop.
+# Under $HOME, not /tmp: confined Snap apps get a private /tmp and
+# couldn't open files placed there.
 EDIT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "pfs_gui_edit")
 
-# Light theme -- a real second palette, not just an afterthought toggle.
-# Node/edge colors (phenotype hues, branch colors, heatmap gradient) are
-# deliberately left theme-INDEPENDENT: they're medium-saturation colors
-# chosen to read clearly on either a near-black or near-white canvas, so
-# swapping the theme doesn't require re-deriving the whole data-driven
-# palette, only the UI CHROME and the canvas background/grid.
+# Light theme. Data colors (phenotypes, branches, heat) are shared by both
+# themes; only the chrome and canvas change.
 LIGHT_ACCENT = "#0d9488"
 LIGHT_ACCENT_DIM = "#99f2e4"
 LIGHT_BG = "#f3f4f6"
@@ -304,11 +223,10 @@ LIGHT_STYLESHEET = _build_stylesheet(LIGHT_ACCENT, LIGHT_ACCENT_DIM, LIGHT_BG, L
 # ---------- graph items ----------
 
 class NodeItem(QGraphicsEllipseItem):
-    """A file (web/clade-tree leaf) or one generation (lineage tree).
-    Position IS scene position. `pinned` is True only while the user is
-    actively dragging it -- the live physics simulation reads a pinned
-    node's position (so neighbors still react to it) but never writes
-    to it, handing full control back the moment the mouse is released."""
+    """A file (web / clade-tree leaf) or one generation (lineage tree).
+    While `pinned` (being dragged) the simulation reads its position but
+    doesn't move it.
+    """
 
     def __init__(self, radius: float, display_text: str, base_color: QColor, glyph: str = ""):
         super().__init__(QRectF(-radius, -radius, radius * 2, radius * 2))
@@ -337,9 +255,7 @@ class NodeItem(QGraphicsEllipseItem):
 
         self._apply_color(base_color)
 
-        # A faint, ALWAYS-visible type glyph (unlike the label, which is
-        # hover-only) -- lets similarly-colored file types be told apart
-        # at a glance without needing to hover each one.
+        # Always-visible type glyph (the label shows only on hover).
         self.glyph_item = None
         if glyph:
             self.glyph_item = QGraphicsSimpleTextItem(glyph, self)
@@ -374,16 +290,7 @@ class NodeItem(QGraphicsEllipseItem):
             self.setPen(self._pen_normal)
 
     def set_focus_dim(self, dimmed: bool):
-        """The 'depth of field' effect for search/ancestry-trace: not
-        just a lower opacity (which the Time Machine and search already
-        used, and still layers with this), but a real desaturation
-        toward gray, so out-of-focus nodes read as 'defocused,' closer
-        to a camera depth-of-field blur than a plain disabled/greyed-out
-        state. A true Gaussian blur (QGraphicsBlurEffect) was considered
-        and rejected: applying a blur effect per-item is a real
-        per-frame cost when dozens of nodes could be dimmed at once
-        under the continuously-running physics simulation -- this gets
-        the same VISUAL intent for negligible cost."""
+        """Out-of-focus look for search/trace: desaturate toward gray (a per-item blur would cost too much per frame)."""
         if dimmed:
             hsv = self._base_color.toHsv()
             desat = QColor.fromHsv(hsv.hue(), int(hsv.saturation() * 0.12), hsv.value())
@@ -392,17 +299,10 @@ class NodeItem(QGraphicsEllipseItem):
             self._apply_color(self._base_color)
 
     def mark_pulsing(self, pulsing: bool):
-        """Just tracks whether a pulse animation currently owns this
-        node's halo -- the animation ITSELF is created and owned by the
-        window (see VaultGraphWindow._start_node_pulse), parented to the
-        window's own QObject lifetime and tracked in _active_animations
-        so _rebuild() stops it before scene.clear() destroys this item.
-        An untracked, infinitely-looping (setLoopCount(-1)) animation
-        owned by the item itself would hit the exact same dangling-C++-
-        reference crash already found and fixed for the grow-in
-        animation -- this keeps pulse animations on the SAME safe,
-        already-proven lifecycle instead of a second, separately-managed
-        one."""
+        """Marks that a pulse animation owns this node's halo. The window owns
+        and tracks the animation, so _rebuild() stops it before the item is
+        destroyed.
+        """
         self._pulsing = pulsing
         if not pulsing and not self._hovering:
             self.halo.setVisible(False)
@@ -447,14 +347,9 @@ class NodeItem(QGraphicsEllipseItem):
 
 
 class EdgeItem(QGraphicsLineItem):
-    """A relationship between two nodes, drawn as a directed arrow (from
-    parent -> child, showing which way the edit/derivation flows) with a
-    COSMETIC pen -- setCosmetic(True) means the stroke width is specified
-    in constant SCREEN pixels rather than scene units, so it stays
-    visible at any zoom level instead of shrinking toward invisibility
-    when zoomed out (a real bug found via direct feedback: at low zoom
-    the previous non-cosmetic 1.3px scene-unit pen could render as a
-    fraction of a device pixel)."""
+    """A directed edge (parent -> child) with a cosmetic pen, so its width is
+    in screen pixels and it stays visible at any zoom.
+    """
 
     ARROW_LENGTH = 8.0
     ARROW_WIDTH = 6.0
@@ -475,7 +370,7 @@ class EdgeItem(QGraphicsLineItem):
         pen.setCapStyle(Qt.RoundCap)
         if dashed:
             pen.setStyle(Qt.DashLine)
-            pen.setDashPattern([4.0, 2.5])  # denser than Qt's default dash -- a sparse dash reads as faint
+            pen.setDashPattern([4.0, 2.5])  # denser than Qt's default dash, which reads as faint
         self.setPen(pen)
         self.setOpacity(EDGE_REST_OPACITY)
         self.setZValue(0)
@@ -487,11 +382,7 @@ class EdgeItem(QGraphicsLineItem):
         self.setLine(QLineF(self.node_a.scenePos(), self.node_b.scenePos()))
 
     def set_flow_active(self, active: bool):
-        """A slow animated dash-offset ('marching ants,' but gentle) on
-        edges touching a recently-edited node -- suggests lineage
-        actively flowing parent -> child, distinct from the static
-        directed arrowhead which just shows WHICH way, not that
-        something recently moved through it."""
+        """Slow marching dashes on edges touching a recently edited node."""
         self.flow_active = active
         pen = self.pen()
         if active:
@@ -499,7 +390,7 @@ class EdgeItem(QGraphicsLineItem):
             pen.setDashPattern([2.5, 3.5])
         elif self._originally_dashed:
             pen.setStyle(Qt.CustomDashLine)
-            pen.setDashPattern([4.0, 2.5])  # match the denser resting dash set in __init__
+            pen.setDashPattern([4.0, 2.5])
         else:
             pen.setStyle(Qt.SolidLine)
             pen.setDashOffset(0.0)
@@ -520,8 +411,7 @@ class EdgeItem(QGraphicsLineItem):
         if length < 1.0:
             return
         ux, uy = dx / length, dy / length
-        # Pulled back off node_b's own edge so the arrowhead sits next to
-        # it rather than being swallowed underneath the node's fill.
+        # Stop short of node_b so the arrowhead isn't hidden under it.
         pullback = self.node_b.radius + 5
         if pullback >= length:
             return
@@ -537,15 +427,10 @@ class EdgeItem(QGraphicsLineItem):
 
 
 class BraidEdgeItem(EdgeItem):
-    """The real 'branch braid' renderer: a divergent branch's edge drawn
-    as a curved strand (quadratic bezier) instead of a straight line, so
-    multiple branch heads open from the same fork point visually
-    separate into distinct interlocking paths rather than overlapping
-    straight lines. curve_offset alternates sign/magnitude per branch
-    (assigned by _compute_branch_visuals) so N simultaneous branches fan
-    out distinctly instead of colliding. Physics (spring/repulsion)
-    still treats the underlying node pair the same as any other edge --
-    only the DRAWN path is curved, not the simulated attraction."""
+    """A branch edge drawn as a quadratic curve, so branches leaving the same
+    fork fan out instead of overlapping. curve_offset comes from
+    _compute_branch_visuals. Physics treats it like any other edge.
+    """
 
     def __init__(self, node_a, node_b, color, curve_offset, rest_length, vertical_bias):
         super().__init__(node_a, node_b, dashed=False, color=color,
@@ -571,8 +456,7 @@ class BraidEdgeItem(EdgeItem):
         return QRectF(min(xs) - pad, min(ys) - pad, max(xs) - min(xs) + 2 * pad, max(ys) - min(ys) + 2 * pad)
 
     def paint(self, painter, option, widget=None):
-        # Deliberately does NOT call EdgeItem.paint (which draws a
-        # straight line) -- draws its own curved path + arrowhead instead.
+        # Draws its own curve and arrowhead instead of EdgeItem's straight line.
         p1, p2 = self.line().p1(), self.line().p2()
         cp = self._control_point()
         path = QPainterPath()
@@ -582,9 +466,7 @@ class BraidEdgeItem(EdgeItem):
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(path)
 
-        # Arrowhead tangent to the curve's own end direction (control
-        # point -> p2 for a quadratic bezier), not the straight p1->p2
-        # chord, so it visually matches the curve it's attached to.
+        # Arrowhead follows the curve's end tangent.
         dx, dy = p2.x() - cp.x(), p2.y() - cp.y()
         length = math.hypot(dx, dy)
         if length < 1.0:
@@ -603,15 +485,12 @@ class BraidEdgeItem(EdgeItem):
 
 
 class CanvasView(QGraphicsView):
-    """Owns pan/drag/zoom/drop. NoDrag mode + manual panning (rather than
-    ScrollHandDrag) is what lets a click on empty canvas pan while a click
-    on a NODE moves it. Right-click is handled directly in
-    mousePressEvent (not via contextMenuEvent, which proved unreliable in
-    practice) so the menu fires every time."""
+    """Pan, drag, zoom and drop. Manual panning (NoDrag) lets a click on empty
+    canvas pan while a click on a node moves it. Right-click is handled in
+    mousePressEvent because contextMenuEvent proved unreliable.
+    """
 
-    # Deliberately far outside any normal fit-to-view scale -- see the
-    # module docstring / manual.txt for why a tighter bound here was a
-    # real bug (it sat ABOVE the natural fit scale, freezing zoom-out).
+    # Far below any fit-to-view scale, so zoom-out never freezes.
     MIN_SCALE = 0.0008
     MAX_SCALE = 20.0
 
@@ -636,12 +515,7 @@ class CanvasView(QGraphicsView):
         self._panning = False
         self._pan_last = None
         self._drag_active = False
-        # valueChanged emits the new int value; viewChanged takes none --
-        # connecting directly to .emit mismatches arg counts (PySide6
-        # reports this as a TypeError printed to stderr on every single
-        # pan/scroll rather than raising, so it's easy to miss without
-        # actually watching the console -- confirmed via a real headless
-        # test run, not just code review).
+        # Adapters: valueChanged passes an int, viewChanged takes none.
         self.horizontalScrollBar().valueChanged.connect(lambda _v: self.viewChanged.emit())
         self.verticalScrollBar().valueChanged.connect(lambda _v: self.viewChanged.emit())
 
@@ -654,10 +528,7 @@ class CanvasView(QGraphicsView):
     def drawBackground(self, painter, rect):
         super().drawBackground(painter, rect)
 
-        # Subtle vignette -- a radial gradient over the CURRENT VIEWPORT
-        # (mapped to scene coords, not the full scene), so it reads as a
-        # camera lens effect that stays anchored to the window rather
-        # than a fixed spot on the canvas that scrolls away.
+        # Vignette over the current viewport, so it stays fixed to the window.
         viewport_rect = self.mapToScene(self.viewport().rect()).boundingRect()
         vignette = QRadialGradient(viewport_rect.center(), viewport_rect.width() * 0.75)
         edge_color = QColor(self.bg_color)
@@ -683,16 +554,7 @@ class CanvasView(QGraphicsView):
     def drawForeground(self, painter, rect):
         super().drawForeground(painter, rect)
         if self._drag_active:
-            # A visible drop-zone highlight the instant an OS-level drag
-            # enters the canvas -- gives immediate, unambiguous
-            # confirmation the app registered the drag at the Qt/Wayland
-            # protocol level, independent of whatever happens after the
-            # drop itself. If this never appears while dragging a file
-            # over the window, the drag isn't reaching Qt at all (a
-            # compositor/desktop-environment matter, not something this
-            # app's own drop handling can fix); if it DOES appear but
-            # nothing happens on release, that narrows the problem to
-            # the drop handler specifically.
+            # Drop-zone highlight: shows the drag reached Qt at all.
             pen = QPen(QColor(ACCENT))
             pen.setWidth(4)
             painter.setPen(pen)
@@ -725,15 +587,7 @@ class CanvasView(QGraphicsView):
         self.viewChanged.emit()
 
     def event(self, evt):
-        # A real trackpad's native PINCH gesture (the natural, expected
-        # way most people zoom on a touchpad -- distinct from a two-
-        # finger vertical SCROLL, which wheelEvent above already
-        # handles) arrives as QEvent.NativeGesture, a completely
-        # different event type that wheelEvent alone never sees. Without
-        # this, pinch-to-zoom does nothing at all in this app regardless
-        # of how well wheelEvent is tuned -- found by reasoning through
-        # what "still can't zoom easily with my touchpad" most likely
-        # meant after the wheel-delta fix, not by direct observation.
+        # Trackpad pinch arrives as a NativeGesture, which wheelEvent never sees.
         if evt.type() == QEvent.NativeGesture and evt.gestureType() == Qt.ZoomNativeGesture:
             self._apply_zoom_factor(1.0 + evt.value())
             return True
@@ -822,10 +676,7 @@ class CanvasView(QGraphicsView):
 
 
 class MinimapView(QGraphicsView):
-    """A small always-visible overview sharing the SAME QGraphicsScene as
-    the main view (Qt supports multiple views on one scene natively --
-    no separate copy of the graph to keep in sync). drawForeground paints
-    a rectangle showing the main view's current visible region."""
+    """Overview sharing the main scene; drawForeground marks the visible region."""
 
     def __init__(self, scene, main_view: CanvasView, parent=None):
         super().__init__(scene, parent)
@@ -855,11 +706,8 @@ class MinimapView(QGraphicsView):
 
 
 # ---------- command palette ("Lineage Shell") ----------
-# Every command below routes to a real VaultSession call or an existing
-# window method -- there is no separate, unreviewed command-only code
-# path. Handlers take (window, *args); a wrong argument count raises
-# TypeError, which the palette turns into a usage hint rather than a
-# traceback.
+# Handlers take (window, *args) and call real session/window methods; a
+# wrong argument count shows a usage hint.
 
 def _cmd_write(window, label=None):
     path, _ = QFileDialog.getOpenFileName(window, "Choose a file to add")
@@ -898,14 +746,9 @@ def _cmd_graft(window, label_a, label_b, new_label):
 
 
 def _parse_tag_value(raw):
-    """'true'/'false'/'yes'/'no'/'1'/'0' (case-insensitive) become real
-    booleans -- matching pfs_cli.py's own _parse_tag_value exactly, and
-    necessary for cross-engine consistency: Python's own 'protected'/
-    'no_graft_source' enforcement checks a tag's truthiness (a non-empty
-    STRING "true" would already count), but the C++ engine's enforcement
-    checks for a real boolean specifically -- passing the bare string
-    through would silently fail to protect a label on the C++ engine
-    while appearing to work on the Python one."""
+    """true/false/yes/no/1/0 become booleans, as in pfs_cli.py -- the C++
+    engine's 'protected' check needs a real boolean, not the string.
+    """
     if not isinstance(raw, str):
         return raw
     lowered = raw.lower()
@@ -1018,10 +861,7 @@ COMMAND_REGISTRY = {
 
 
 class CommandPalette(QDialog):
-    """The real 'Lineage Shell': Ctrl+K opens a typed-command box over
-    the canvas. Every command name filters as you type; Enter runs the
-    top/selected suggestion's underlying handler against the real
-    VaultSession -- no separate simulation of what the CLI does."""
+    """Ctrl+K command box: filters as you type, Enter runs the top match."""
 
     def __init__(self, window):
         super().__init__(window, Qt.Popup)
@@ -1076,16 +916,9 @@ class CommandPalette(QDialog):
 # ---------- in-app editors (real-time, no external process/watcher/poll) ----------
 
 class InAppTextEditorDialog(QDialog):
-    """A genuine in-process editor: Save writes straight through
-    on_save_callback (which calls commit_write directly, in the same
-    Python process, no temp-file watcher, no polling, no external app at
-    all) -- so the canvas update is exactly as fast as any other write
-    action already is, closing the whole class of external-editor
-    reliability problems (Snap sandboxing, multi-tab tracking, save
-    detection lag) for the single most common case: plain text.
-    Non-modal (persists after Save) so you can keep editing and save
-    again -- each Save is its own new generation, same as saving
-    multiple times in any real editor."""
+    """In-process text editor: Save commits a new generation directly. Stays
+    open, so each Save is another generation.
+    """
 
     def __init__(self, parent, label: str, initial_text: str, on_save_callback):
         super().__init__(parent)
@@ -1127,9 +960,7 @@ class InAppTextEditorDialog(QDialog):
 
 
 class ImageViewerDialog(QDialog):
-    """Read-only, in-app, instant -- no external app, no temp-file
-    lifecycle to manage at all beyond the one reconstruction that
-    already happened before this dialog was created."""
+    """Read-only in-app viewer."""
 
     def __init__(self, parent, label: str, image_bytes: bytes):
         super().__init__(parent)
@@ -1153,16 +984,9 @@ class ImageViewerDialog(QDialog):
 
 
 class ChunkMapWidget(QWidget):
-    """The universal, always-correct visualization for a lineage diff:
-    one colored cell per chunk POSITION, ordered exactly like the real
-    manifests (green = new/mutated since the older generation, red =
-    present in the older generation but gone from the newer one, gray =
-    unchanged) -- works for ANY content type, including binary, unlike
-    a text-line diff which only makes sense for text. Sized
-    proportionally to the widget's own width; segments thinner than a
-    pixel are simply merged visually (still painted, just not
-    individually distinguishable), which is the correct degradation for
-    a file with thousands of chunks."""
+    """Lineage diff as one cell per chunk position: green = new/changed, red =
+    removed, gray = unchanged. Works for any content type.
+    """
 
     def __init__(self, positions, parent=None):
         super().__init__(parent)
@@ -1215,18 +1039,15 @@ class ChunkMapWidget(QWidget):
 
 
 class LineageDiffDialog(QDialog):
-    """Renders a real lineage diff between two generations of the SAME
-    label -- the chunk-map (always shown, correct for any content type)
-    plus, as a bonus when both generations decode as text, a real
-    difflib line-level diff. Deliberately a separate dialog/code path
-    from the existing clade-similarity comparison panel
-    (_show_diff_between's _render_cards call) -- see lineage_diff.py's
-    module docstring for why the two must not be conflated."""
+    """Lineage diff between two generations of the same label: the chunk map,
+    plus a line diff when both decode as text. Separate from the clade
+    similarity comparison (_show_diff_between).
+    """
 
     def __init__(self, parent, result: "lineage_diff.LineageDiffResult", theme_colors: dict,
                  text_diff_lines=None):
         super().__init__(parent)
-        self.result = result  # kept for tests/callers that want the structured result, not just the rendering
+        self.result = result  # the structured result, for tests and callers
         self.setWindowTitle(f"Lineage diff -- '{result.label}' gen {result.generation_old} -> "
                              f"gen {result.generation_new}")
         self.resize(880, 620)
@@ -1294,33 +1115,27 @@ class VaultGraphWindow(QMainWindow):
         self._clade_version_drawn = None
         self.setWindowTitle("Phylogenetic File System")
         self.resize(1440, 940)
-        self.setAcceptDrops(True)  # defensive: drops are handled by self.view, but some
-        # compositors key drop-target advertisement off the TOPLEVEL surface's own flag too
+        self.setAcceptDrops(True)  # drops go to self.view, but some
+        # compositors check the toplevel surface's flag
 
         self._mode = "web"
         self._clade_algorithm = "upgma"
         self._node_items = {}
         self._edge_items = []
         self._clade_blob_items = []
-        self._clade_membership = {}     # label -> clade_key, only for multi-member (drawn) clades
-        self._clade_leash_radius = {}   # clade_key -> containment radius
+        self._clade_membership = {}  # label -> clade_key, for multi-member clades
+        self._clade_leash_radius = {}
         self._empty_state_item = None
         self._time_bounds = None
         self._time_cutoff = None
         self._time_machine_histories = {}
         self._syncing_zoom = False
         self._active_animations = []
-        self._pending_timers = []  # delayed one-shot timers not yet fired (e.g. staggered particle starts)
-        # label -> list of {"path", "watcher", "last_mtime"} -- a LIST, not a
-        # single session, because re-clicking Edit on an already-open label
-        # (a second temp file/editor tab) used to silently orphan the first
-        # one from tracking; if the user then saved in that first tab, it
-        # vanished with no error and no toast. Now every open session for a
-        # label stays tracked until its temp file's gone, so any of them
-        # being saved -- even an "old" tab the user went back to -- still
-        # lands as a new generation.
+        self._pending_timers = []  # pending one-shot timers (e.g. staggered particle starts)
+        # label -> list of {"path", "watcher", "last_mtime"}: every open edit
+        # session of a label stays tracked, so saving in any of them commits.
         self._edit_sessions = {}
-        self._active_dialogs = []  # keeps non-modal in-app editor/viewer dialogs alive (Qt parenting alone isn't enough to stop Python GC of the wrapper)
+        self._active_dialogs = []  # keeps non-modal dialogs alive (Qt parenting doesn't stop Python GC)
 
         self.scene = QGraphicsScene(self)
         self.scene.selectionChanged.connect(self._on_selection_changed)
@@ -1355,9 +1170,7 @@ class VaultGraphWindow(QMainWindow):
         self._edit_poll_timer = QTimer(self)
         self._edit_poll_timer.timeout.connect(self._poll_edited_files)
         self._edit_poll_timer.start(1500)
-        # Redraw the clade outlines when the background clade worker
-        # publishes a newer partition (e.g. a recompute that finished
-        # after the last redraw).
+        # Redraw clade outlines when the worker publishes a newer partition.
         self._clade_poll_timer = QTimer(self)
         self._clade_poll_timer.timeout.connect(self._poll_clade_updates)
         self._clade_poll_timer.start(700)
@@ -1474,7 +1287,7 @@ class VaultGraphWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
     def _build_list_dock(self):
-        container = QWidget(self)  # background comes from the app-wide QWidget rule -- re-themes automatically
+        container = QWidget(self)  # background from the app-wide stylesheet, so it re-themes
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(6)
@@ -1496,10 +1309,7 @@ class VaultGraphWindow(QMainWindow):
             header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         header.setSortIndicatorShown(True)
         header.setCursor(Qt.PointingHandCursor)
-        # Styling comes from the app-wide stylesheet (_build_stylesheet's
-        # QTableWidget/QHeaderView rules) rather than a local override
-        # here, specifically so the Sort/List view re-themes correctly
-        # when Light/Dark is toggled instead of staying stuck dark.
+        # Styled by the app-wide stylesheet so it re-themes.
         layout.addWidget(self.list_table)
 
         self.list_dock = QDockWidget("Files -- Sort View", self)
@@ -1595,13 +1405,9 @@ class VaultGraphWindow(QMainWindow):
             self.toast_label.move(x, y)
 
     def _maybe_show_tour(self):
-        """A dismissible first-launch overlay -- helps a first-time
-        viewer (a portfolio reviewer, e.g.) understand the interface in
-        seconds instead of hunting through toolbar tooltips. Shown once
-        per VAULT (not once per app install), tracked via a small marker
-        file alongside the vault's own housekeeping files
-        (.fuse_scratch/, catalog.enc, etc.) -- deliberately not something
-        that needs its own settings/config system."""
+        """First-launch overlay explaining the interface, shown once per vault
+        (tracked by a marker file in the vault).
+        """
         marker_path = os.path.join(self.engine.storage_root, ".gui_tour_seen")
         if os.path.exists(marker_path):
             return
@@ -1715,11 +1521,9 @@ class VaultGraphWindow(QMainWindow):
         return {"panel": INPUT_BG, "border": BORDER, "text": TEXT, "dim": TEXT_DIM, "accent": ACCENT}
 
     def _render_cards(self, title, cards):
-        """Renders the Details panel as a stack of visually distinct
-        rounded 'cards' (a heading + a small key/value table each)
-        instead of a flat wall of plain text -- an inspector-panel look
-        closer to Figma/Blender's properties sidebar. `cards` is a list
-        of {"heading": str, "rows": [(key, value), ...], "note": str?}."""
+        """Renders the Details panel as cards. `cards`: list of
+        {"heading": str, "rows": [(key, value), ...], "note": str?}.
+        """
         c = self._theme_colors()
         parts = [f'<div style="font-family: sans-serif; color:{c["text"]};">']
         parts.append(f'<div style="font-size:14px; font-weight:600; margin-bottom:12px; '
@@ -1743,18 +1547,13 @@ class VaultGraphWindow(QMainWindow):
         self.info_panel.setHtml("".join(parts))
 
     def _refresh_details_panel_theme(self):
-        """Re-render whatever's currently selected so a theme toggle
-        doesn't leave stale colors in the details panel until the next
-        click."""
+        """Re-render the selection so a theme change doesn't leave stale colors."""
         selected = self.scene.selectedItems()
         if selected:
             self._on_selection_changed()
 
     def _fit_to_view(self):
-        """Instant -- used right after a rebuild (mode switch, search,
-        most write actions), where an animated fly-to would be
-        distracting rather than polished since the scene just changed
-        out from under the user anyway."""
+        """Instant fit, for use right after a rebuild."""
         target = self.scene.itemsBoundingRect()
         if target.isEmpty():
             return
@@ -1763,20 +1562,14 @@ class VaultGraphWindow(QMainWindow):
         self.view.viewChanged.emit()
 
     def _fit_to_view_animated(self):
-        """The Focus button's own version -- a deliberate user action,
-        where a smooth fly-to reads as polish rather than distraction."""
+        """Animated fit, for the Focus button."""
         target = self.scene.itemsBoundingRect()
         if target.isEmpty():
             return
         self._animate_view_to(target.adjusted(-60, -60, 60, 60))
 
     def _animate_view_to(self, target_rect, duration=320):
-        """Smoothly interpolates BOTH zoom scale and view center toward
-        target_rect over `duration` ms, instead of jumping instantly the
-        way fitInView()/centerOn() do on their own -- used for Focus,
-        double-click-to-zoom, Reveal in Tree, and list-row selection, so
-        camera moves feel like part of the same animation language as
-        the grow-in/toast polish elsewhere rather than a jarring cut."""
+        """Animates zoom and center toward target_rect over `duration` ms."""
         if target_rect.isEmpty():
             return
         viewport_size = self.view.viewport().size()
@@ -1813,10 +1606,7 @@ class VaultGraphWindow(QMainWindow):
         anim.start()
 
     def _zoom_to_node(self, node):
-        """Double-click a node -> fly to a close-up view of it AND its
-        immediate neighbors (not a blind fixed zoom level), so the
-        result is actually useful context, not just 'now everything is
-        bigger'."""
+        """Double-click: fly to the node and its immediate neighbors."""
         self.scene.clearSelection()
         node.setSelected(True)
         rect = QRectF(node.scenePos().x() - node.radius, node.scenePos().y() - node.radius,
@@ -1834,10 +1624,7 @@ class VaultGraphWindow(QMainWindow):
         if mode == self._mode:
             return
         self._mode = mode
-        # Keep the toolbar's exclusive Web/Tree/Clade-Tree button group in
-        # sync -- callers that switch mode programmatically (command
-        # palette, Reveal in Tree, auto-jump-after-edit) used to leave the
-        # OLD button looking active while the canvas had already moved on.
+        # Keep the mode buttons in sync when the mode changes programmatically.
         if mode == "web":
             self.web_action.setChecked(True)
         elif mode == "tree":
@@ -1857,17 +1644,8 @@ class VaultGraphWindow(QMainWindow):
         for anim in list(self._active_animations):
             anim.stop()
         self._active_animations = []
-        # A running QVariantAnimation stopped via _active_animations
-        # above does NOT cancel a separate QTimer.singleShot that's
-        # merely waiting to CALL .start() on it later (e.g. the
-        # particle trail's staggered start delays) -- confirmed via a
-        # real rapid-fire-writes test that reproduced exactly this:
-        # crashed with "libshiboken: Internal C++ object already
-        # deleted" when an earlier write's delayed particle-start timer
-        # fired after a LATER write's rebuild had already destroyed that
-        # particle's scene item. Stopping pending timers here closes
-        # that gap the same way _active_animations already closes it
-        # for animations already in flight.
+        # Stop pending one-shot timers too: stopping an animation doesn't cancel a
+        # timer that would start it later, after its item is gone.
         for t in list(self._pending_timers):
             t.stop()
         self._pending_timers = []
@@ -1895,12 +1673,10 @@ class VaultGraphWindow(QMainWindow):
             self.minimap.refresh_extent()
         self._update_pulsing_nodes()
 
-    PULSE_RECENCY_SECONDS = 300  # nodes touched in the last 5 minutes get the ambient heartbeat
+    PULSE_RECENCY_SECONDS = 300  # nodes touched in the last 5 minutes pulse
 
     def _update_pulsing_nodes(self):
-        # Real wall-clock time, not the vault's own max timestamp --
-        # using the latter would make whichever node is newest ALWAYS
-        # pulse regardless of how long ago that actually was.
+        # Wall-clock time, not the vault's newest timestamp.
         now = time.time()
         recent_nodes = set()
         for node in self._node_items.values():
@@ -2030,12 +1806,9 @@ class VaultGraphWindow(QMainWindow):
         self.list_table.setSortingEnabled(True)
 
     def _on_list_selection_changed(self):
-        """Finds the right canvas node for the clicked label REGARDLESS
-        of view mode. This used to only work in Web mode -- self._node_items
-        is keyed by LABEL there, but by node_uuid in Tree mode (one entry
-        per generation, not per label) and by a freshly-random per-build
-        node_uuid in Clade Tree mode, so a plain `label in self._node_items`
-        check silently found nothing in either of those two modes."""
+        """The canvas node for a label in any mode (web keys by label, tree and
+        clade tree by node uuid).
+        """
         items = self.list_table.selectedItems()
         if not items:
             return
@@ -2052,8 +1825,8 @@ class VaultGraphWindow(QMainWindow):
             history = self.engine.get_history(label)
             if history:
                 target_node = self._node_items.get(history[-1].node_uuid)
-        else:  # cladetree -- nodes are keyed by a fresh-per-build uuid, but
-            # every leaf node's data(1) is set to its real label at creation
+        else:  # cladetree: keyed by a per-build uuid, but
+            # each leaf's data(1) is its label
             target_node = next((n for n in self._node_items.values() if n.data(1) == label), None)
 
         if target_node is not None:
@@ -2161,12 +1934,9 @@ class VaultGraphWindow(QMainWindow):
         return positions, by_uuid
 
     def _compute_branch_visuals(self, histories):
-        """{node_uuid: (color, curve_offset)} for edges on a SPECIFIC
-        divergent branch's path (fork point to head) -- the "branch
-        braid": each simultaneously-open branch gets both a distinct
-        color AND a distinct curve direction/magnitude (alternating
-        sign, growing with branch index), so forks read as visibly
-        separate strands rather than overlapping straight lines."""
+        """{node_uuid: (color, curve_offset)} for edges on each divergent branch,
+        so open branches get distinct colors and curves.
+        """
         visuals = {}
         for label, history in histories.items():
             heads = self.engine.get_heads(label)
@@ -2188,7 +1958,7 @@ class VaultGraphWindow(QMainWindow):
     def _build_web_graph(self):
         labels, meta_by_label, fingerprints, histories = self._gather()
         self._update_stats_hud(meta_by_label)
-        self._time_machine_histories = histories  # used by _apply_point_in_time_web
+        self._time_machine_histories = histories
         if not labels:
             self._show_empty_state("Vault is empty -- write something, or drop a file onto the canvas.")
             return
@@ -2353,9 +2123,7 @@ class VaultGraphWindow(QMainWindow):
         self._clear_clade_blobs()
         if self._mode != "web":
             return
-        # Short wait: answers from a fresh partition after a change made a
-        # moment ago, without ever stalling the UI on a long recompute
-        # (_poll_clade_updates redraws once that lands).
+        # Brief wait for a fresh partition; _poll_clade_updates redraws later if needed.
         clades, _label_to_clade, self._clade_version_drawn = self.engine.clades(wait=0.5)
         clade_cards = []
         if clades:
@@ -2372,13 +2140,8 @@ class VaultGraphWindow(QMainWindow):
                 cy = sum(p.y() for p in positions) / len(positions)
                 max_r = max(math.hypot(p.x() - cx, p.y() - cy) for p in positions) + NODE_MAX_RADIUS + 24
 
-                # Local-coordinate rect + setPos (like NodeItem itself),
-                # NOT an absolute-coordinate rect -- this is what lets
-                # the blob be repositioned by just changing .pos(), which
-                # the orbital swirl and (were the centroid to drift)
-                # future containment updates both rely on. The
-                # constellation label is a CHILD of the blob for the same
-                # reason: it then moves/rotates for free with its parent.
+                # Local rect + setPos, so the blob moves by setting pos(); its label is a
+                # child so it moves with it.
                 blob = QGraphicsEllipseItem(-max_r, -max_r, max_r * 2, max_r * 2)
                 blob.setPos(cx, cy)
                 blob.setBrush(QBrush(QColor(color.red(), color.green(), color.blue(), 30)))
@@ -2400,12 +2163,7 @@ class VaultGraphWindow(QMainWindow):
 
                 clade_cards.append({"heading": clade_name, "rows": [], "note": ", ".join(sorted(members))})
 
-        # Every node gets SOME outline, even one with no close relatives --
-        # a monotypic (single-member) clade is still a real clade
-        # biologically. Drawn dim/uncolored and unlabeled so it doesn't
-        # visually compete with real multi-member clusters, but it
-        # closes the "why is this node floating outside every circle"
-        # gap -- nothing is left uncontained.
+        # Single-member clades get a dim, unlabeled outline, so every node is contained.
         solo_color = QColor(TEXT_DIM)
         for label, node in self._node_items.items():
             if label in self._clade_membership:
@@ -2478,10 +2236,7 @@ class VaultGraphWindow(QMainWindow):
         if self._mode == "web" and self._time_machine_histories:
             self._apply_point_in_time_web(cutoff)
         else:
-            # Tree/Clade-Tree modes: each generation is already its own
-            # node, so existence-based fading (did this specific version
-            # exist yet?) already IS the correct point-in-time view --
-            # no separate reconstruction needed there.
+            # Tree modes: each generation is its own node, so existence fading is already point-in-time.
             for node in self._node_items.values():
                 ts = node.data(2)
                 node.setVisible(ts is None or ts <= cutoff)
@@ -2492,11 +2247,7 @@ class VaultGraphWindow(QMainWindow):
         self.time_label.setText(label)
 
     def _historical_generation_for(self, label, cutoff):
-        """The generation that WAS this label's current tip at the given
-        moment -- the last recorded generation with birth_timestamp <=
-        cutoff, or None if the label didn't exist yet. LineageStore
-        appends in chronological order, so a linear scan keeping the
-        last match is correct without needing to sort anything."""
+        """The generation that was label's tip at `cutoff`, or None."""
         candidate = None
         for node in self._time_machine_histories.get(label, []):
             if node.birth_timestamp <= cutoff:
@@ -2506,14 +2257,9 @@ class VaultGraphWindow(QMainWindow):
         return candidate
 
     def _apply_point_in_time_web(self, cutoff):
-        """The real 'point-in-time content reconstruction': not just
-        fading a node in/out by whether it existed yet, but resizing
-        (and, with Dedup Heat on, recoloring) it to match whichever
-        GENERATION was actually current at that moment -- using each
-        LineageNode's own already-recorded total_chunks/new_chunks, no
-        extra decryption needed since that's real data the write path
-        stored at commit time, not something reconstructed just for
-        this view."""
+        """Point in time for web mode: size (and heat color) each node from the
+        generation current at that moment, using its recorded chunk counts.
+        """
         generation_by_label = {}
         max_chunks_at_cutoff = 1
         for label in self._node_items:
@@ -2549,11 +2295,7 @@ class VaultGraphWindow(QMainWindow):
             self._show_diff_between(selected[0].data(0), selected[1].data(0))
             return
         if len(selected) == 2 and self._mode == "tree":
-            # Tree mode's counterpart to Web mode's two-selection diff
-            # above -- but a REAL lineage diff (two generations of the
-            # SAME label's real edit history), not a clade/similarity
-            # comparison, since here each node is a real generation, not
-            # a label's current tip.
+            # Tree mode: two selected generations of one label get a lineage diff.
             self._show_lineage_diff_between_nodes(selected[0].data(0), selected[1].data(0))
             return
         node = selected[0]
@@ -2580,12 +2322,7 @@ class VaultGraphWindow(QMainWindow):
         dedup_pct = 100 * meta.get("duplicate_chunks_found", 0) / total
         branch_note = f"{len(heads)} branch head(s)" + (" -- diverged, see Tree view" if len(heads) > 1 else "")
 
-        # Labels sharing this EXACT manifest -- true storage aliases (e.g.
-        # from Duplicate), not just similar content. The file's own Size
-        # above is its real logical content size (what you get if you
-        # open/read it) -- this row is what actually answers "does this
-        # cost extra space": no, every byte is already stored under the
-        # other label(s) listed here.
+        # Labels sharing this exact manifest: storage aliases that cost nothing extra.
         sharing_labels = sorted(
             other for other in self.engine.labels()
             if other != label and (other_meta := self.engine.get_metadata(other))
@@ -2656,11 +2393,7 @@ class VaultGraphWindow(QMainWindow):
         self._render_cards(f"{label_a} vs {label_b}", cards)
 
     def _show_lineage_diff_between_nodes(self, node_uuid_a, node_uuid_b):
-        """Tree mode's two-selection counterpart to _show_diff_between
-        above -- but a REAL lineage diff (chunk-position diff between
-        two generations of the SAME label's real edit history), not a
-        clade/similarity comparison. See lineage_diff.py's module
-        docstring for why these stay separate code paths."""
+        """Lineage diff of two selected generations of the same label."""
         found_a = self.engine.find_node_by_uuid(node_uuid_a)
         found_b = self.engine.find_node_by_uuid(node_uuid_b)
         if found_a is None or found_b is None:
@@ -2677,10 +2410,7 @@ class VaultGraphWindow(QMainWindow):
         self._run_lineage_diff(label_a, gen_old, gen_new)
 
     def _diff_against_parent(self, owning_label, node_uuid):
-        """Context-menu entry point: diffs a single generation against
-        its own PRIMARY parent -- the most common lineage-diff use case
-        (what mutated in this one edit), needing only a single
-        right-click rather than a two-node multi-select."""
+        """Context menu: diff a generation against its primary parent."""
         found = self.engine.find_node_by_uuid(node_uuid)
         if found is None:
             return
@@ -2696,11 +2426,7 @@ class VaultGraphWindow(QMainWindow):
         self._run_lineage_diff(owning_label, parent_node.generation_index, node.generation_index)
 
     def _try_text_diff(self, label, generation_old, generation_new):
-        """Bonus, nice-to-have on top of the always-correct chunk map:
-        if both generations' full content decodes as UTF-8 text, a real
-        difflib line-level diff. Returns None on ANY failure (binary
-        content, a decode error, a checkout error) -- explicitly a
-        bonus, never allowed to block the core chunk-map result."""
+        """Line diff when both generations decode as UTF-8; None otherwise."""
         path_a = path_b = None
         try:
             fd_a, path_a = tempfile.mkstemp(prefix="pfs_lineage_diff_")
@@ -2723,11 +2449,7 @@ class VaultGraphWindow(QMainWindow):
                                           fromfile=f"gen {generation_old}", tofile=f"gen {generation_new}"))
 
     def _run_lineage_diff(self, label, generation_old, generation_new):
-        """The real entry point every lineage-diff trigger (Tree mode's
-        two-node select, 'Diff against parent') funnels through: runs
-        the chunk-position diff primitive (lineage_diff.diff_generations,
-        engine-agnostic via self.engine's adapter), optionally attempts
-        the bonus text diff, and renders LineageDiffDialog."""
+        """Runs a lineage diff (chunk map, plus line diff if text) and shows LineageDiffDialog."""
         try:
             result = lineage_diff.diff_generations(self.engine, label, generation_old, generation_new)
         except Exception as e:
@@ -2796,8 +2518,7 @@ class VaultGraphWindow(QMainWindow):
         menu.exec(global_pos)
 
     def _rename_label_direct(self, label, new_label):
-        """No-prompt core -- used by both the interactive right-click
-        flow and the command palette's 'rename' command."""
+        """Rename without prompting (context menu and command palette)."""
         if not self.engine.has_label(label):
             raise KeyError(f"No such label: '{label}'")
         if self.engine.has_label(new_label):
@@ -2816,16 +2537,10 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "Rename", str(e))
 
     def _duplicate_label_direct(self, label, new_label):
-        """A duplicate is recorded as a real lineage child of the source
-        label -- lateral_parent_labels=[label] links the new label's
-        generation 0 back to the source's current tip, so the graph
-        shows where it came from (Web mode draws this as a dashed
-        cross-label edge, same as a graft) instead of a disconnected
-        fresh root. It's still effectively zero-cost: the reconstructed
-        content is byte-identical, so FastCDC's content-defined chunking
-        produces the exact same chunk hashes and commit_write's dedup
-        index finds them already in the global pool -- no new chunk data
-        is actually written, only a new manifest + lineage record."""
+        """Duplicate as a lineage child of the source (a lateral parent), drawn
+        connected to it. Identical content dedups fully: only a manifest and a
+        lineage record are written.
+        """
         if not self.engine.has_label(label):
             raise KeyError(f"No such label: '{label}'")
         if self.engine.has_label(new_label):
@@ -2987,12 +2702,9 @@ class VaultGraphWindow(QMainWindow):
         return f"{stem}_{i}{ext}"
 
     def _add_files(self, paths):
-        """No per-file label prompt -- a modal dialog after each dropped
-        file is easy to lose track of (especially with several files at
-        once), and was a real risk of making a successful drop LOOK like
-        it did nothing. Label defaults to the filename (de-duplicated
-        with a numeric suffix if that label's already taken); rename
-        afterward via right-click if you want something else."""
+        """Adds files without a label prompt: each label is its filename, with a
+        numeric suffix if taken. Rename afterwards if needed.
+        """
         added = []
         for path in paths:
             label = self._unique_label_from_path(path)
@@ -3004,43 +2716,20 @@ class VaultGraphWindow(QMainWindow):
             self._toast(f"Added {len(added)} file(s): {', '.join(added)}")
 
     def _add_file(self, path):
-        """Single-file convenience wrapper around _add_files."""
         self._add_files([path])
 
     # ---------- edit-in-place (open in the OS default app, auto-sync back) ----------
 
     def _edit_label(self, label):
-        """Reconstructs the label's current content to a temp file (with
-        an extension HINT derived from its detected phenotype -- purely
-        for the OS's own file-association system, so 'open with the
-        right app' has its best chance of working; the vault itself
-        never stores or needs an extension), opens it in the platform's
-        default app via QDesktopServices, then watches that path --
-        saving in your editor auto-commits a new generation.
+        """Opens the label's content in the OS default app and commits each save
+        as a new generation.
 
-        Two independent detection paths run at once, because inotify-based
-        QFileSystemWatcher signals are genuinely unreliable across editors
-        in practice, not just in theory: many editors (gedit, VS Code,
-        LibreOffice...) save via write-a-new-temp-file-then-rename-over,
-        which silently drops the OS-level watch on the ORIGINAL inode --
-        sometimes the very first save never fires fileChanged at all, not
-        just subsequent ones. So alongside the watcher (fast path, fires
-        instantly when it works), _poll_edited_files() checks this file's
-        mtime every 1.5s as a backstop that doesn't depend on inotify
-        semantics at all -- whichever path notices the change first wins;
-        _check_and_commit_edit's mtime gate makes the other one's later,
-        redundant check a harmless no-op.
-
-        Re-clicking Edit on a label that's already open does NOT tear down
-        the previous session -- it adds a SECOND tracked session alongside
-        it. Every open session for a label stays tracked until you save it
-        (or its temp file disappears), so switching back to an earlier
-        editor tab and saving THERE still lands as a real generation
-        instead of silently vanishing. (If you genuinely edit two open
-        sessions for the same label independently, whichever commits
-        second overwrites the first's changes with its own -- there's no
-        merge here, same as saving over someone else's edit in any
-        non-locking editor.)"""
+        Saves are detected two ways, because editors that save by rename can
+        drop the inotify watch: a QFileSystemWatcher (fast) and an mtime poll
+        every 1.5 s (_poll_edited_files). The mtime check makes the slower one a
+        no-op. Re-opening a label adds another tracked session; if two sessions
+        of one label are both saved, the later save wins.
+        """
         meta = self.engine.get_metadata(label)
         if meta is None:
             return
@@ -3064,12 +2753,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Opened '{label}' in your default app -- saving there auto-updates the vault")
 
     def _view_label(self, label):
-        """Read-only open -- same reconstruction as Edit, opened in the
-        same default app, but never watched for changes. For when you
-        just want to look at something without committing a new
-        generation, and so a viewer app's own incidental temp writes
-        (playback position caches, etc.) never get mistaken for a real
-        edit."""
+        """Opens read-only in the default app; never watched, never committed."""
         meta = self.engine.get_metadata(label)
         if meta is None:
             return
@@ -3088,10 +2772,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Opened '{label}' read-only -- changes there won't be saved back")
 
     def _edit_label_inapp(self, label):
-        """The real-time path for text content: reconstructs once,
-        opens an in-process editor, and Save calls commit_write directly
-        -- no temp-file watcher, no polling, no external app, so there's
-        no detection lag or sandboxing risk to begin with."""
+        """Text: in-app editor whose Save commits directly."""
         if not self.engine.has_label(label):
             return
         os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
@@ -3105,9 +2786,7 @@ class VaultGraphWindow(QMainWindow):
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
             self._perform_write_and_animate(lambda: self.engine.commit_write(label, tmp_path))
-            # Same reasoning as the external-editor auto-sync path: Web
-            # mode collapses a label to one node, so the new generation
-            # needs Tree mode to actually be visible as a new node.
+            # Show Tree mode, where the new generation is its own node.
             self._reveal_in_tree(label)
 
         dlg = InAppTextEditorDialog(self, label, initial_text, on_save)
@@ -3123,8 +2802,7 @@ class VaultGraphWindow(QMainWindow):
         dlg.show()
 
     def _view_image_inapp(self, label):
-        """In-app, read-only, instant -- no external app round trip at
-        all for the common raster formats Qt already decodes natively."""
+        """Images: in-app read-only viewer."""
         if not self.engine.has_label(label):
             return
         fd, tmp_path = tempfile.mkstemp(prefix="pfs_imgview_")
@@ -3146,39 +2824,30 @@ class VaultGraphWindow(QMainWindow):
             if session["path"] == path:
                 watcher = session["watcher"]
                 if path not in watcher.files() and os.path.exists(path):
-                    watcher.addPath(path)  # re-arm after an editor's atomic write-then-rename save
+                    watcher.addPath(path)  # re-arm after a write-then-rename save
                 break
 
     def _check_and_commit_edit(self, label, path):
         session = next((s for s in self._edit_sessions.get(label, []) if s["path"] == path), None)
         if session is None or not os.path.exists(path):
-            return  # some editors briefly remove-then-recreate mid-save; ignore the transient gap
+            return  # editors may briefly remove the file mid-save
         try:
             mtime = os.path.getmtime(path)
         except OSError:
             return
         if mtime <= session["last_mtime"]:
-            return  # already committed this exact save (or nothing changed yet)
+            return  # already committed, or unchanged
         session["last_mtime"] = mtime
         try:
             self._perform_write_and_animate(lambda: self.engine.commit_write(label, path))
             self._toast(f"'{label}' updated from your edit -- new generation created")
-            # Web mode only ever shows one node per label (its current
-            # tip) -- a new generation updates that node in place rather
-            # than making anything new appear, which read as "nothing
-            # happened" even though the delta-only generation WAS
-            # created correctly. Tree mode is where a generation is
-            # genuinely its own visible node, so that's what an edit
-            # should actually show you.
+            # Switch to Tree mode, where the new generation is visible as its own node.
             self._reveal_in_tree(label)
         except Exception as e:
             self._toast(f"Auto-sync for '{label}' failed: {e}")
 
     def _poll_edited_files(self):
-        """Backstop for _edit_label's watcher -- see its docstring. Ticks
-        every 1.5s so a missed inotify event still surfaces within a
-        couple seconds instead of silently never syncing. Walks EVERY
-        open session for every label, not just the newest one."""
+        """Backstop for _edit_label's watcher: checks every open session every 1.5 s."""
         for label, sessions in list(self._edit_sessions.items()):
             for session in list(sessions):
                 path = session["path"]
@@ -3272,10 +2941,7 @@ class VaultGraphWindow(QMainWindow):
         anim.finished.connect(lambda: self._active_animations.remove(anim) if anim in self._active_animations else None)
 
     def _track_pending_timer(self, timer):
-        """Like _track_animation but for a delayed one-shot QTimer (no
-        .finished signal -- uses .timeout instead), so _rebuild() can
-        cancel a still-waiting timer the same way it stops an
-        already-running animation."""
+        """Like _track_animation for a pending one-shot QTimer, so _rebuild() can cancel it."""
         self._pending_timers.append(timer)
         timer.timeout.connect(lambda: self._pending_timers.remove(timer) if timer in self._pending_timers else None)
 
@@ -3300,13 +2966,9 @@ class VaultGraphWindow(QMainWindow):
         anim.start()
 
     def _spawn_particle_trail(self, edge: EdgeItem):
-        """A handful of small glowing particles drifting from parent to
-        child along the new edge, fading in then out -- sells 'this
-        literally came FROM that one' harder than the size-pulse alone.
-        Purely decorative scene items; each particle's own animation is
-        tracked the same way as everything else (_track_animation), so
-        a rebuild mid-flight stops them cleanly instead of leaving a
-        dangling reference the way an untracked one would."""
+        """Small particles drifting from parent to child along a new edge; tracked
+        like other animations so a rebuild stops them.
+        """
         parent_pos, child_pos = edge.node_a.scenePos(), edge.node_b.scenePos()
         for i in range(4):
             particle = QGraphicsEllipseItem(-3, -3, 6, 6)
@@ -3338,15 +3000,8 @@ class VaultGraphWindow(QMainWindow):
             anim.finished.connect(cleanup)
             self._track_animation(anim)
 
-            # A real, OWNED QTimer instead of the QTimer.singleShot
-            # static helper -- the static form gives back no handle to
-            # cancel, so a still-pending staggered start from an EARLIER
-            # write could fire anim.start() after a LATER write's
-            # _rebuild() already destroyed this particle's scene item.
-            # Tracking it the same way animations are tracked closes
-            # that gap (confirmed by reproducing the crash with a rapid-
-            # fire-writes stress test before this fix, and confirming it
-            # stops after).
+            # An owned QTimer (not QTimer.singleShot) so a rebuild can cancel a
+            # pending start before its particle is destroyed.
             delay_timer = QTimer(self)
             delay_timer.setSingleShot(True)
             delay_timer.timeout.connect(anim.start)
@@ -3394,18 +3049,9 @@ class VaultGraphWindow(QMainWindow):
         fx = {n: 0.0 for n in nodes}
         fy = {n: 0.0 for n in nodes}
 
-        # Repulsion via a uniform spatial grid instead of all-pairs: at
-        # REPULSION=9000, force at 400px is already only 0.056 -- smaller
-        # than typical spring/centering forces -- so nodes farther apart
-        # than CUTOFF contribute nothing worth computing. All-pairs was
-        # measured to be genuinely O(n^2): 100 nodes = 21.8ms/tick (fine),
-        # 1000 nodes = 1446ms/tick (unusable, 66x slower for 10x the
-        # nodes). Bucketing nodes into CUTOFF-sized cells and only
-        # comparing each node against its own + neighboring cells keeps
-        # cost roughly proportional to n for any reasonably-spread-out
-        # layout, since node DENSITY per cell stays roughly constant as
-        # the vault grows rather than every node comparing against every
-        # other one regardless of distance.
+        # Repulsion through a uniform grid instead of all pairs: beyond CUTOFF the
+        # force is negligible. All pairs measured 21.8 ms/tick at 100 nodes and
+        # 1446 ms at 1000; the grid keeps it roughly linear.
         CUTOFF = 400.0
         CUTOFF_SQ = CUTOFF * CUTOFF
         grid = {}
@@ -3413,9 +3059,7 @@ class VaultGraphWindow(QMainWindow):
             cell = (int(n.pos().x() // CUTOFF), int(n.pos().y() // CUTOFF))
             grid.setdefault(cell, []).append(n)
 
-        # Each unordered pair of cells within touching distance is visited
-        # exactly once: (0,0) covers pairs WITHIN a cell, the other four
-        # offsets cover each neighboring cell-pair in only one direction.
+        # Each neighboring cell pair is visited once: (0,0) within a cell, four offsets across.
         NEIGHBOR_OFFSETS = ((0, 0), (1, 0), (0, 1), (1, 1), (-1, 1))
         for (cx, cy), cell_nodes in grid.items():
             for dcx, dcy in NEIGHBOR_OFFSETS:
@@ -3461,16 +3105,9 @@ class VaultGraphWindow(QMainWindow):
             fx[n] -= n.pos().x() * CENTER_K
             fy[n] -= n.pos().y() * CENTER_K
 
-        # Clade containment ("Outline" mode, web only): a soft leash, not
-        # a hard wall -- no force at all inside the leash radius, a
-        # gentle pull back in once past it. The centroid is recomputed
-        # from CURRENT member positions every tick (not a fixed point
-        # frozen when the blob was drawn), so the group can drift or
-        # orbit together without the leash fighting that drift -- it
-        # only resists a member actually SEPARATING from its own group.
-        # A dragged-and-released node re-enters this same force loop the
-        # next tick once it's no longer pinned, which is what makes it
-        # drift back on its own instead of needing a special-cased snap.
+        # Clade containment (web outline mode): no force inside the leash
+        # radius, a gentle pull back beyond it, toward the members' current
+        # centroid, so a group can drift together.
         if self._mode == "web" and self.clade_action.isChecked() and self._clade_membership:
             CONTAINMENT_K = 0.12
             LEASH_FRACTION = 0.7
@@ -3507,16 +3144,9 @@ class VaultGraphWindow(QMainWindow):
             if abs(n.vx) > 0.02 or abs(n.vy) > 0.02:
                 n.setPos(n.pos().x() + n.vx, n.pos().y() + n.vy)
 
-        # Slow "galaxy" swirl (web mode only, per explicit request --
-        # NOT tree/clade-tree, where a rotating genealogy would just be
-        # confusing). Implemented as a RIGID rotation of every unpinned
-        # node (and, so they stay visually attached to their contents,
-        # every clade blob) around the origin by a small fixed angle
-        # each tick. A rigid rotation preserves every pairwise distance
-        # exactly, so it doesn't fight repulsion/spring/containment at
-        # all -- those forces reach the same equilibrium SHAPE, which
-        # then just slowly turns. ~0.0012 rad/tick at 30fps is one full
-        # revolution in about 3 minutes -- deliberately slow, not "spinny."
+        # Slow rigid rotation of every unpinned node and clade blob (web mode
+        # only). Rotation preserves distances, so it doesn't fight the other
+        # forces. One turn takes about 3 minutes.
         if self._mode == "web" and self.swirl_action.isChecked():
             ORBIT_ANGULAR_SPEED = 0.0012
             cos_a, sin_a = math.cos(ORBIT_ANGULAR_SPEED), math.sin(ORBIT_ANGULAR_SPEED)
@@ -3531,11 +3161,7 @@ class VaultGraphWindow(QMainWindow):
 
 
 def _existing_vault_engine(storage_root: str):
-    """Returns 'python', 'cpp', or None -- same check pfs_cli.py's
-    CppPFSShell/PFSShell use before either engine touches a directory.
-    Necessary because the two engines' data_container.bin and
-    global_index.db use the SAME filenames despite incompatible
-    formats -- only the catalog/keyring filenames actually differ."""
+    """'python', 'cpp', or None, from each engine's marker files (see pfs_cli.py)."""
     from vault_session import CATALOG_FILENAME
     from gearhash.keyring import KEYRING_FILENAME
     is_python = os.path.exists(os.path.join(storage_root, CATALOG_FILENAME)) or \

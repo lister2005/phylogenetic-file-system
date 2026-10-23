@@ -28,20 +28,13 @@ namespace pfs_engine {
 
 namespace {
 
-constexpr uint64_t kChunkMask = 0x1FFF;   // matches pipeline.py's default chunk_mask
-constexpr size_t kMinSize = 4096;         // matches STORAGE_MIN_SIZE
-constexpr size_t kMaxSize = 16384;        // matches STORAGE_MAX_SIZE
+constexpr uint64_t kChunkMask = 0x1FFF;  // pipeline.py's chunk_mask
+constexpr size_t kMinSize = 4096;  // STORAGE_MIN_SIZE
+constexpr size_t kMaxSize = 16384;  // STORAGE_MAX_SIZE
 
-// PART 8 item #1 (see cpp_port_plan.txt's 1.5GB-benchmark profiling --
-// dedup index lookup+register was ~19% of the core loop, one SELECT + one
-// INSERT per chunk): chunks are grouped into windows of this many before
-// touching the dedup index, resolved with one batched `IN (...)` SELECT
-// and one multi-row upsert per window instead of two round trips per
-// chunk. 300 keeps bound-parameter counts (up to 300 for the SELECT, up
-// to 600 for the upsert) safely under SQLite's variable-count ceiling on
-// every version this project might run against (999 pre-3.32, 32766
-// after) -- see pipeline.py's DEDUP_INDEX_BATCH_SIZE for the same choice
-// made for the same reason on the Python side.
+// Chunks per dedup-index batch: one lookup_many and one upsert_many per
+// window instead of two round trips per chunk. Keeps bound parameters (up
+// to 600) under SQLite's limit (999 before 3.32), as in pipeline.py.
 constexpr size_t kDedupBatchSize = 300;
 
 struct ChunkSpan {
@@ -93,16 +86,14 @@ StoragePipeline::StoragePipeline(std::string storage_root, const Bytes32& kek)
 WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_path,
                                                        const std::string& original_filename) {
     MappedFile src(file_path);
-    auto [epoch_id, dek] = keyring_.get_current_dek();  // fetched once, not per chunk
+    auto [epoch_id, dek] = keyring_.get_current_dek();  // once per call
 
     uint64_t current_offset = file_size(container_path_);
     int out_fd = open(container_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
     if (out_fd < 0) throw std::runtime_error("failed to open container '" + container_path_ + "' for append: " + strerror(errno));
 
-    // Lazily opened -- most writes never touch either (mirroring is
-    // triggered only when a chunk actually crosses the threshold, and
-    // most chunks in a real vault are only referenced once or twice).
-    int mirror_read_primary_fd = -1;  // reads an ALREADY-STORED chunk's bytes back, to copy them
+    // Opened only if a chunk crosses the mirror threshold.
+    int mirror_read_primary_fd = -1;  // reads a stored chunk back to copy it
     int mirror_write_fd = -1;
     uint64_t mirror_offset = file_exists(mirror_container_path_) ? file_size(mirror_container_path_) : 0;
 
@@ -113,25 +104,10 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
 
     index_.begin();
     try {
-        // Windowed batching (PART 8 item #1): chunk boundary scanning and
-        // per-chunk SHA-256 are unchanged (native, already cheap per the
-        // profiling) -- what changes is that the dedup index is no longer
-        // consulted per chunk. Each window is gathered first (offsets +
-        // digests only, no DB/encryption yet), resolved with ONE batched
-        // `lookup_many` covering the whole window, then walked in order
-        // to apply ref-count/mirroring logic against an in-memory
-        // `local_state` map before flushing with ONE `upsert_many` call.
-        // Repeat occurrences of the same hash within one window (a
-        // self-duplicate chunk inside this file) collapse into a single
-        // final-state row instead of one upsert per occurrence -- and,
-        // unlike the old per-chunk `increment_ref()`, never re-queries
-        // the row a second time internally, since the window's own
-        // lookup_many result (or an earlier occurrence's own local_state
-        // entry) already has everything needed. Final DB state (ref
-        // counts, exactly-once mirror-crossing point) is identical to
-        // what the old one-chunk-at-a-time loop produced -- order of
-        // ref-count increments within a window is preserved by walking
-        // the window in original chunk order, same as before.
+        // Windowed batching: gather a window (offsets + digests), resolve it with
+        // one lookup_many, apply ref counts and mirroring in chunk order against
+        // local_state, then one upsert_many. A hash repeated within a window
+        // collapses into one final row; the end state matches chunk-at-a-time.
         while (cursor < src.size) {
             std::vector<ChunkSpan> window;
             window.reserve(kDedupBatchSize);
@@ -183,17 +159,12 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
                         new_chunks++;
                         auto inserted = local_state.emplace(span.digest, e);
                         entry_ptr = &inserted.first->second;
-                        // crossed stays false -- a chunk born at ref_count
-                        // 1 can't equal kMirrorRefThreshold (3) on arrival.
+                        // a new chunk (ref_count 1) can't equal the threshold
                     }
                 }
 
-                // Ancestral Hardening: the moment this chunk's ref count
-                // CROSSES the threshold, mirror it -- copy its already-
-                // encrypted bytes as-is (no re-encryption needed) into
-                // the separate mirror container. Matches pipeline.py's
-                // `ref_count_before + 1 == MIRROR_REF_THRESHOLD` check
-                // exactly (triggers once, not on every subsequent ref).
+                // Crossing the threshold: copy the ciphertext as-is into the mirror
+                // container (once, as pipeline.py does).
                 if (crossed && !index_.get_mirror(span.digest)) {
                     if (mirror_read_primary_fd < 0) {
                         mirror_read_primary_fd = open(container_path_.c_str(), O_RDONLY);
@@ -236,12 +207,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
     if (mirror_read_primary_fd >= 0) close(mirror_read_primary_fd);
     if (mirror_write_fd >= 0) close(mirror_write_fd);
 
-    // Whole-file hash computed from the already-mmapped buffer -- no
-    // separate read needed (this is what gearhash/pipeline.py's fix,
-    // done in Python earlier this port, achieves via a streaming
-    // incremental hash instead; mmap gets the same "only one real read
-    // of the file" property for free here since the whole buffer is
-    // already addressable).
+    // Whole-file hash from the mmapped buffer: no second read.
     Bytes32 content_sha256 = sha256(src.data, src.size);
     std::string manifest_filename = manifest_filename_for(content_sha256);
     std::string manifest_path = storage_root_ + "/" + manifest_filename;
@@ -253,11 +219,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
     result.duplicate_chunks_found = dup_chunks;
 
     if (file_exists(manifest_path)) {
-        // Exact duplicate of already-stored content -- every chunk above
-        // hit the "existing" branch, so nothing new was ever physically
-        // appended. Roll back the ref-count bookkeeping instead of
-        // committing it (same fix as gearhash/pipeline.py, applied here
-        // natively rather than needing its own follow-up correction).
+        // Already stored: nothing was appended, so roll back the ref-count changes.
         index_.rollback();
         result.was_duplicate_of_existing = true;
         return result;
@@ -275,13 +237,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
     meta.phenotype_mask = phenotype.mask;
     meta.phenotype_name = phenotype.name;
 
-    // SIMILARITY_PROFILE fingerprint, for the clade tree ('tree'/
-    // 'similar'). Computed synchronously from the SAME already-mmap'd
-    // source buffer (no second file read) -- unlike pfs_cli.py's Python
-    // shell, which backgrounds this on its own thread to avoid stalling
-    // the prompt on a slow interpreter loop, the C++ engine's whole
-    // point is that this loop isn't slow, so no threading complexity is
-    // needed here to get the same "don't block the caller" property.
+    // Similarity fingerprint, computed synchronously from the same mmapped buffer.
     TraitSet fingerprint = extract_similarity_traits(src.data, src.size);
     meta.similarity_fingerprint = std::vector<Bytes32>(fingerprint.begin(), fingerprint.end());
 
@@ -314,8 +270,7 @@ std::vector<uint8_t> StoragePipeline::fetch_verified_block(uint64_t idx, const B
     }
 
     if (!ok) {
-        // Ancestral Hardening fallback -- always SURFACE that the
-        // primary was bad, never silently recover without saying so.
+        // Mirror fallback, always reported.
         auto mirror_loc = index_.get_mirror(content_hash);
         if (mirror_loc && file_exists(mirror_container_path_)) {
             if (mirror_fd < 0) mirror_fd = open(mirror_container_path_.c_str(), O_RDONLY);
@@ -335,7 +290,7 @@ std::vector<uint8_t> StoragePipeline::fetch_verified_block(uint64_t idx, const B
                     }
                 }
             } catch (const std::exception&) {
-                // mirror also failed -- ok stays false, handled below
+                // mirror failed too
             }
         }
     }
@@ -355,7 +310,7 @@ void StoragePipeline::reconstruct(const std::string& manifest_path, const std::s
 
     int primary_fd = open(container_path_.c_str(), O_RDONLY);
     if (primary_fd < 0) throw std::runtime_error("failed to open container '" + container_path_ + "': " + strerror(errno));
-    int mirror_fd = -1;  // opened lazily, only if a primary copy ever actually fails
+    int mirror_fd = -1;  // opened only if a primary copy fails
 
     std::ofstream out(output_path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -609,10 +564,7 @@ VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manife
                 }
                 new_offset += entry.length;
             }
-            // remove()'s bool return tracks whether THIS dead chunk had a
-            // mirrors row -- dead_mirrors gates the mirror-container
-            // compaction pass below so it's skipped entirely (no file
-            // touched) when nothing mirrored actually died this call.
+            // remove() reports whether the dead chunk had a mirror; dead_mirrors gates mirror compaction.
             for (const auto& content_hash : dead_hashes) {
                 if (index_.remove(content_hash)) dead_mirrors++;
             }
@@ -630,14 +582,7 @@ VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manife
 
     uint64_t new_size = file_exists(container_path_) ? file_size(container_path_) : 0;
 
-    // Ancestral Hardening's mirror container: the dead-hash sweep above
-    // already dropped every dead chunk's `mirrors` DB row (index_.remove())
-    // -- this physically compacts data_container_mirror.bin itself to
-    // match, the same way the primary container was just compacted above.
-    // Gated on dead_mirrors > 0 (not merely "does the file exist"), so a
-    // vacuum() that killed dead PRIMARY chunks but none of them were ever
-    // mirrored -- the common case -- doesn't pay for a full mirror-
-    // container rewrite for zero actual benefit.
+    // Compact the mirror container too, only if a mirrored chunk died.
     uint64_t mirror_old_size = 0;
     uint64_t mirror_new_size = 0;
     uint64_t live_mirrors_count = 0;
@@ -689,21 +634,11 @@ VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manife
     uint64_t mirror_bytes_reclaimed = mirror_old_size - mirror_new_size;
 
     if (!dead_hashes.empty()) {
-        // SQLite refuses to VACUUM a connection that still has any
-        // prepared statements associated with it -- index_ keeps four
-        // cached ones alive for its whole lifetime (the fix for an
-        // earlier "looked slower than Python" benchmark bug), so
-        // compacting HAS to happen on a brand-new, separate connection
-        // to the same file, exactly like pipeline.py's vacuum() does
-        // (its own comment: "Opened as its own connection, after the
-        // one above is fully closed").
+        // VACUUM on a separate connection: SQLite refuses it on a connection with
+        // prepared statements, and index_ keeps some cached.
         DedupIndex compactor(storage_root_ + "/global_index.db", kek_);
         compactor.compact();
-        // VACUUM rebuilds the whole database file, invalidating index_'s
-        // own cached prepared statements even though IT didn't run the
-        // VACUUM -- without this, the next write's dedup-index upsert
-        // fails ("upsert failed"), a real bug caught by testing write
-        // -> delete -> vacuum -> write, not just vacuum in isolation.
+        // VACUUM invalidates index_'s cached statements: re-prepare them.
         index_.refresh_prepared_statements();
     }
 

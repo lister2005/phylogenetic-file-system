@@ -1,23 +1,9 @@
 """
-Passphrase-protected master key storage.
+Passphrase-protected master key (KEK) file.
 
-The previous design stored the raw 32-byte KEK directly on disk with no
-protection at all -- anyone with filesystem access could read it and
-decrypt everything. This replaces that with standard envelope-around-a-
-passphrase practice (the same idea LUKS, VeraCrypt, and age all use):
-
-    passphrase --[Scrypt, slow+memory-hard]--> wrapping key
-    wrapping key --[AES-256-GCM]--> wraps the real KEK
-
-The file on disk holds: a random salt, the Scrypt parameters, and the
-KEK ciphertext. None of that is useful to an attacker without the
-passphrase -- Scrypt is deliberately expensive to brute-force, unlike
-a fast hash.
-
-This does NOT protect against a keylogger, a weak/guessable passphrase,
-or someone who has both the file AND the passphrase. It protects against
-exactly what the previous design failed at: filesystem access alone
-being enough to decrypt the vault.
+passphrase --scrypt--> wrapping key --AES-256-GCM--> wrapped KEK. The file
+holds the salt, scrypt parameters and wrapped KEK, so filesystem access
+alone can't decrypt the vault.
 """
 
 import os
@@ -28,9 +14,7 @@ from .immutability import set_immutable
 
 MASTER_KEY_FILENAME = "master.key"
 
-# Scrypt cost parameters. n=2**15 takes ~200-400ms on typical hardware --
-# deliberately slow enough to make brute-forcing a stolen file expensive,
-# fast enough not to be annoying for one passphrase entry per session.
+# Scrypt cost: n=2**15 is roughly 200-400 ms, slow to brute-force but fine once per session.
 SCRYPT_N = 2 ** 15
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -39,7 +23,7 @@ KEK_SIZE = 32
 
 
 class WrongPassphraseError(Exception):
-    """Raised when the supplied passphrase doesn't unwrap the stored KEK."""
+    """The passphrase doesn't unwrap the stored KEK."""
 
 
 def _derive_wrapping_key(passphrase: str, salt: bytes, n: int, r: int, p: int) -> bytes:
@@ -48,10 +32,7 @@ def _derive_wrapping_key(passphrase: str, salt: bytes, n: int, r: int, p: int) -
 
 
 def create_new_vault_key(storage_root: str, passphrase: str) -> bytes:
-    """Generates a brand new random KEK, wraps it under the given
-    passphrase, and writes the wrapped form to disk. Returns the raw KEK
-    for immediate use. Refuses to overwrite an existing key file --
-    call load_vault_key or explicitly delete the old file first."""
+    """Creates a random KEK, writes it wrapped under `passphrase`, returns it. Won't overwrite."""
     path = os.path.join(storage_root, MASTER_KEY_FILENAME)
     if os.path.exists(path):
         raise FileExistsError(
@@ -81,9 +62,7 @@ def create_new_vault_key(storage_root: str, passphrase: str) -> bytes:
 
 
 def load_vault_key(storage_root: str, passphrase: str) -> bytes:
-    """Reads the wrapped key file and unwraps the KEK using the given
-    passphrase. Raises WrongPassphraseError on a wrong passphrase --
-    never silently returns garbage key material."""
+    """Unwraps the KEK. Raises WrongPassphraseError on a wrong passphrase."""
     path = os.path.join(storage_root, MASTER_KEY_FILENAME)
     if not os.path.exists(path):
         raise FileNotFoundError(
@@ -104,10 +83,7 @@ def load_vault_key(storage_root: str, passphrase: str) -> bytes:
 
 
 def change_passphrase(storage_root: str, old_passphrase: str, new_passphrase: str) -> None:
-    """Re-wraps the existing KEK under a new passphrase. Cheap -- only
-    re-wraps 32 bytes, never touches any vault data. The actual KEK
-    (and therefore every DEK and every byte of content) is completely
-    unchanged; only what protects the key file changes."""
+    """Re-wraps the same KEK under a new passphrase; vault data is untouched."""
     kek = load_vault_key(storage_root, old_passphrase)
 
     path = os.path.join(storage_root, MASTER_KEY_FILENAME)
@@ -130,11 +106,9 @@ def change_passphrase(storage_root: str, old_passphrase: str, new_passphrase: st
 
 
 def _atomic_write(path: str, data: bytes) -> None:
-    """Write-temp-then-rename: the target path either has its old
-    complete contents or the new complete contents, never a partial
-    write, even if the process dies mid-write."""
+    """Temp file + rename: never a partially written key file."""
     if os.path.exists(path):
-        set_immutable(path, False)  # nothing to unset on a brand new file
+        set_immutable(path, False)
     tmp_path = path + ".tmp"
     with open(tmp_path, "wb") as f:
         f.write(data)

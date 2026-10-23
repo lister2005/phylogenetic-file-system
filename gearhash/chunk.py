@@ -21,8 +21,7 @@ class Chunk:
 
 @dataclass(eq=True)
 class StreamedChunk:
-    """Like Chunk, but carries its own bytes -- needed because streaming
-    mode has no full in-memory buffer left to slice offset/len out of."""
+    """A Chunk that carries its own bytes (streaming mode has no buffer to slice)."""
     hash: int
     offset: int
     len: int
@@ -91,7 +90,7 @@ class Iter(Iterator[Chunk]):
             self.hasher.hash = c_hash.value
             self.cursor += chunk_len
         else:
-            # Fallback Path
+            # Pure-Python fallback
             max_limit = min(offset + self.max_size, len(self.data))
             min_limit = min(offset + self.min_size, len(self.data))
             
@@ -111,12 +110,8 @@ class Iter(Iterator[Chunk]):
 
 
 class StreamingIter(Iterator[StreamedChunk]):
-    """Same chunk-boundary semantics as Iter, but reads from a file object
-    in bounded increments instead of requiring the whole file in memory.
-
-    Peak memory is O(read_ahead + max_size), independent of file size --
-    this is what makes it safe to run against multi-GB files, unlike Iter
-    which needs the entire file loaded as `data: bytes` up front.
+    """Same boundaries as Iter, reading a file in bounded increments.
+    Peak memory is O(read_ahead + max_size), independent of file size.
     """
 
     def __init__(
@@ -133,7 +128,7 @@ class StreamingIter(Iterator[StreamedChunk]):
         self.file_obj = file_obj
         self.min_size = min_size if min_size is not None else MIN_SIZE
         self.max_size = max_size if max_size is not None else MAX_SIZE
-        # Always keep enough buffered ahead to satisfy one full max_size scan.
+        # Keep at least one full max_size scan buffered.
         self.read_ahead = max(read_ahead, self.max_size)
         self.buffer = bytearray()
         self.buffer_offset = 0  # absolute file position of buffer[0]
@@ -160,16 +155,9 @@ class StreamingIter(Iterator[StreamedChunk]):
         data_len = len(self.buffer)
 
         if USING_C_EXTENSION:
-            # scan_chunk_c(data, data_len, cursor=0, ...) never looks past
-            # min(cursor + max_size, data_len) -- so it never needs more
-            # than max_size bytes from the front of the buffer, regardless
-            # of how much read-ahead is currently sitting behind it. Slicing
-            # first bounds BOTH the bytearray copy and the bytes() copy to
-            # max_size (<=16KB); the previous bytes(self.buffer) converted
-            # the FULL buffer (up to read_ahead, 8MB) on every single call,
-            # which dominated the entire write path's cost (measured: 77%
-            # of total time on a 300MB file, cProfile-confirmed 2026-07-23)
-            # for something the C code was going to ignore past 16KB anyway.
+            # scan_chunk_c never looks past cursor + max_size, so pass only that
+            # prefix: converting the whole read-ahead buffer on every call dominated
+            # write time.
             window = bytes(self.buffer[:self.max_size])
             c_hash = ctypes.c_uint64(self.hasher.hash)
             chunk_len = _c_lib.scan_chunk_c(
@@ -203,7 +191,7 @@ class StreamingIter(Iterator[StreamedChunk]):
             chunk_len = cursor
 
         chunk_bytes = bytes(self.buffer[:chunk_len])
-        del self.buffer[:chunk_len]  # drop consumed prefix -- bounds memory
+        del self.buffer[:chunk_len]  # drop the consumed prefix
         self.buffer_offset += chunk_len
 
         return StreamedChunk(hash=self.hasher.digest(), offset=offset, len=chunk_len, data=chunk_bytes)

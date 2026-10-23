@@ -1,23 +1,12 @@
 """
-How a file's similarity fingerprint (its SIMILARITY_PROFILE trait set)
-is stored inside a Python-engine manifest's metadata.
+How a Python-engine manifest stores a similarity fingerprint.
 
-Manifests written since 2026-10-23 store it PACKED: the 32-byte trait
-hashes, sorted, concatenated into one bytes object -- the same layout as
-the C++ manifest's fingerprint_hashes array. Older manifests store a
-pickled set of bytes objects. Decrypting a manifest unpickles whatever
-it holds, and the old form builds one Python object per trait on EVERY
-manifest read (FUSE open/stat, clustering, 'info'), even when the
-fingerprint isn't used. Measured on a 16 MB file (~50,000 traits):
-reading the old form peaks at 9.4 MB and keeps 5.1 MB; the packed form
-peaks at 5.1 MB and keeps 1.5 MB. The peak can't drop further while the
-fingerprint lives inside the manifest: the encrypted file, the
-decrypted pickle stream and the unpickled value all exist at once.
-
-Both forms are read; only the packed form is written. Nothing is
-migrated: an old manifest keeps its set until something rewrites it.
-Code that needs the traits calls unpack(); code that only needs how
-many there are calls count(), which never builds the set.
+New manifests store it packed: the sorted 32-byte traits concatenated,
+as in the C++ manifest. Older ones hold a pickled set, which costs one
+Python object per trait on every manifest read. Measured at 16 MB
+(~50,000 traits): reading peaks at 9.4 MB and keeps 5.1 MB for the old
+form, 5.1 MB and 1.5 MB packed. Both forms are read; only packed is
+written; nothing is migrated. unpack() builds the set; count() doesn't.
 """
 from typing import Iterable, Optional, Set
 
@@ -38,8 +27,7 @@ def _is_packed(stored) -> bool:
 
 
 def unpack(stored) -> Optional[Set[bytes]]:
-    """The trait set from a manifest's stored value (packed or the older
-    pickled set), or None if the manifest has no fingerprint."""
+    """The trait set from a stored value (packed or old set), or None."""
     if stored is None:
         return None
     if _is_packed(stored):
@@ -51,8 +39,7 @@ def unpack(stored) -> Optional[Set[bytes]]:
 
 
 def count(stored) -> int:
-    """Number of traits in a stored fingerprint, without unpacking it.
-    0 if there's none."""
+    """Number of traits, without unpacking. 0 if none."""
     if stored is None:
         return 0
     if _is_packed(stored):

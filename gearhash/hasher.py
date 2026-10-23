@@ -18,10 +18,9 @@ class Hasher:
     __slots__ = ("table", "hash")
 
     def __init__(self, table: Optional[Table] = None) -> None:
-        """Create a new hasher for computing a digest.
+        """Create a new hasher.
 
-        If ``table`` is omitted, the default :data:`GEAR_TABLE` is used
-        (equivalent to Rust's ``Hasher::default()``).
+        If ``table`` is omitted, :data:`GEAR_TABLE` is used.
         """
         self.table: Table = table if table is not None else GEAR_TABLE
         self.hash: int = 0
@@ -42,7 +41,6 @@ class Hasher:
 
     def chunks(self, mask: int, data: bytes, min_size: int = None, max_size: int = None) -> Iter:
         """Return an iterator over the chunks determined by chunk boundaries."""
-        # Explicitly pass the arguments down to the Iter constructor
         return Iter(self, mask, data, min_size=min_size, max_size=max_size)
 
     def stream_chunks(self, mask: int, file_obj, min_size: int = None, max_size: int = None,
@@ -53,26 +51,19 @@ class Hasher:
         return StreamingIter(self, mask, file_obj, min_size=min_size, max_size=max_size, read_ahead=read_ahead)
 
     def is_chunk_boundary(self, mask: int) -> bool:
-        """Return ``True`` if the current digest is a chunk boundary with `mask`.
-
-        To generate a mask value, see :func:`mask`.
-        """
+        """True if the current digest is a chunk boundary for `mask` (see :func:`mask`)."""
         return (self.hash & mask) == 0
 
     def __repr__(self) -> str:
         return f"Hasher(hash={self.hash:#018x})"
-    # ... inside Hasher class in hasher.py ...
-
 
 
 def mask(n: int) -> int:
-    """Return a mask with the `n` most-significant bits set (i.e. 1 bits).
+    """A mask with the `n` most-significant bits set.
 
-    Raises:
-        ValueError: if `n` is outside the range ``1..=64``.
+    Raises ValueError if `n` is outside ``1..=64``.
     """
     if not (1 <= n <= MASK_SIZE):
         raise ValueError(f"n must be in range 1..={MASK_SIZE}, got {n}")
     
-    # Restored correct high-bit mask logic
     return _U64_MASK ^ ((1 << (64 - n)) - 1)

@@ -40,7 +40,7 @@ std::string VaultSession::commit_write(const std::string& label, const std::stri
     auto existing_history = lineage.get_history(label);
     bool should_record;
     if (fork_from_node) {
-        should_record = true;  // the fork itself is the meaningful event, even if content matches something else
+        should_record = true;  // a fork always records a generation
     } else if (existing_history.empty()) {
         should_record = true;
     } else {
@@ -123,8 +123,7 @@ DeleteLabelResult VaultSession::delete_label(const std::string& label, bool forc
             pipeline.delete_file(manifest_path);
             result.manifests_freed++;
         } catch (const std::exception&) {
-            // Already gone (or never had a manifest, e.g. a fully-pruned
-            // generation) -- nothing to free, not an error.
+            // Already gone (or pruned): nothing to free.
         }
     }
     return result;

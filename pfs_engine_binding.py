@@ -1,25 +1,8 @@
 """
-Python <-> C++ engine binding -- ctypes wrapper around
-cpp_engine/build/libpfs_engine_capi.so (built from cpp_engine/include/
-c_api.h, cpp_engine/src/c_api.cpp).
-
-Division of responsibility, deliberate (see c_api.h's own docstring):
-this module does NOT do passphrase-based unlocking -- that still goes
-through the existing, already-tested gearhash.master_key_store.
-load_vault_key(). Once you have the real 32-byte KEK (the same way
-VaultSession/pfs_cli.py/pfs_gui.py already get it), this class gives
-you the SAME kind of operations vault_session.py's VaultSession does,
-but running on the compiled C++ engine instead of pure Python.
-
-Coverage as of 2026-08-21: commit_write, reconstruct_label, delete_label
-(with force + manifest-reference-counted reclamation), list_labels,
-get_history, get_heads, get_manifest_info, fork_write, graft,
-merge_branches, checkout, rename_label, prune_generation, vacuum, fsck,
-tags (get/set/remove), rotate_key, build_tree/similar/compute_clades
-(clade clustering -- TreeConstructor/PhylogeneticAnalyzer's C++ port in
-phylo.hpp), unreliable_fingerprint_labels (small-file low-confidence
-warning, added 2026-08-21). Still Python-only: phenotype detection --
-see cpp_port_plan.txt.
+ctypes binding to the C++ engine (cpp_engine/build/libpfs_engine_capi.so,
+see c_api.h): CppVaultSession offers the same operations as VaultSession.
+It takes the 32-byte KEK; passphrase unlocking stays in
+gearhash.master_key_store.
 """
 import ctypes
 import functools
@@ -32,8 +15,7 @@ _LIB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 class PfsEngineError(Exception):
-    """Raised when a call into the C++ engine fails -- message comes
-    directly from the C++ side's pfs_last_error()."""
+    """A C++ engine call failed; the message is pfs_last_error()."""
 
 
 class GenerationInfo:
@@ -130,7 +112,7 @@ _LABEL_COUNT_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_uint64,
 _RAW_HASH_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.POINTER(ctypes.c_uint8), ctypes.c_void_p)
 _UUID_CALLBACK = ctypes.CFUNCTYPE(None, ctypes.c_char_p, ctypes.c_void_p)
 
-_UINT32_ERROR = 0xFFFFFFFF  # UINT32_MAX -- pfs_rotate_key's error sentinel (0 is a valid epoch_id)
+_UINT32_ERROR = 0xFFFFFFFF  # UINT32_MAX: pfs_rotate_key's error value (0 is a valid epoch)
 
 
 def _load_lib():
@@ -260,16 +242,11 @@ def _generation_info_from_c(info) -> GenerationInfo:
 
 
 def _serialize_calls(cls):
-    """Runs every method and property of `cls` under its instance's own
-    reentrant lock (self._call_lock). The C++ VaultSession behind a
-    handle isn't thread-safe, and the clade worker (clade_worker.py)
-    loads fingerprints from its own thread while the front end keeps
-    using the same session -- so calls into one session must take turns.
-    Reentrant because some methods call others. Error text needs no
-    lock: pfs_last_error() is thread_local in c_api.cpp.
-
-    Also refuses any call on a closed session with PfsEngineError --
-    passing the C API a NULL handle would crash the whole process."""
+    """Runs every method and property under the instance's reentrant
+    self._call_lock: the C++ session isn't thread-safe and the clade worker
+    calls it from another thread. Refuses calls on a closed session (a NULL
+    handle would crash the process). pfs_last_error() is thread_local.
+    """
     lifecycle = {"close", "__enter__", "__exit__", "__del__"}
 
     def locked(fn):
@@ -296,10 +273,7 @@ def _serialize_calls(cls):
 
 @_serialize_calls
 class CppVaultSession:
-    """The C++-engine-backed counterpart to vault_session.py's
-    VaultSession -- same operations, compiled backend. `kek` is the
-    real 32-byte Key-Encryption-Key, obtained the same way the Python
-    engine already obtains it (gearhash.master_key_store.load_vault_key)."""
+    """C++-engine counterpart to VaultSession. `kek`: the 32-byte KEK."""
 
     def __init__(self, storage_root: str, kek: bytes):
         if len(kek) != 32:
@@ -468,8 +442,7 @@ class CppVaultSession:
         return tags
 
     def get_node_tags(self, uuid_hex: str) -> dict:
-        """Tags recorded on THIS SPECIFIC generation -- can differ from
-        get_tags(label)'s CURRENT-tip tags if one was added/removed since."""
+        """Tags recorded on this generation (may differ from the current tip's)."""
         tags = {}
 
         @_TAG_CALLBACK
@@ -483,9 +456,7 @@ class CppVaultSession:
         return tags
 
     def get_lateral_parents(self, uuid_hex: str) -> list:
-        """Every lateral (non-primary) parent uuid recorded on this
-        SPECIFIC generation -- both source uuids for a graft, the one
-        source uuid for a duplicate. Needed to draw cross-label edges."""
+        """Lateral parent uuids of this generation (graft sources, duplicate source)."""
         uuids = []
 
         @_UUID_CALLBACK
@@ -551,11 +522,7 @@ class CppVaultSession:
         }
 
     def get_fingerprint(self, label: str) -> set:
-        """The raw SIMILARITY_PROFILE fingerprint (a set of 32-byte
-        hashes) for `label`'s current tip -- for a caller (the GUI) that
-        wants to run its own Jaccard-distance math, e.g. against a
-        Python-engine label's fingerprint using the same analyzer code.
-        Empty set if none is stored."""
+        """The current tip's similarity fingerprint (set of 32-byte hashes); empty if none."""
         traits = set()
 
         @_RAW_HASH_CALLBACK
@@ -568,9 +535,7 @@ class CppVaultSession:
         return traits
 
     def find_node_by_uuid(self, uuid_hex: str):
-        """Returns (label, GenerationInfo) for the lineage node with
-        this hex uuid, searched across EVERY label, or None if not
-        found."""
+        """(label, GenerationInfo) for a node uuid in any label, or None."""
         label_buf = ctypes.create_string_buffer(256)
         info = _CGenerationInfo()
         rc = _lib.pfs_find_node_by_uuid(self._handle, uuid_hex.encode("ascii"), label_buf, len(label_buf),
@@ -580,10 +545,7 @@ class CppVaultSession:
         return label_buf.value.decode("utf-8"), _generation_info_from_c(info)
 
     def build_tree(self, algorithm: str = "upgma") -> str:
-        """Clade tree (UPGMA or NJ) over every label with a stored
-        fingerprint -- every C++-engine write attaches one synchronously,
-        so unlike the Python engine there's no 'still fingerprinting in
-        the background' case to worry about here."""
+        """Clade tree (UPGMA or NJ) over every label with a fingerprint."""
         rendering = []
 
         @_TEXT_CALLBACK
@@ -596,9 +558,7 @@ class CppVaultSession:
         return rendering[0] if rendering else ""
 
     def similar(self, label: str) -> list:
-        """Every OTHER label with a stored fingerprint, ranked by
-        Jaccard distance to `label` (closest first) -- returns a list
-        of (other_label, distance) tuples."""
+        """Every other fingerprinted label, as (label, distance), closest first."""
         ranked = []
 
         @_SIMILAR_CALLBACK
@@ -611,18 +571,9 @@ class CppVaultSession:
         return ranked
 
     def compute_clades(self, label: str, threshold: float = 0.0) -> tuple:
-        """The clade (similarity connected-component) `label` belongs
-        to -- exposes phylo.hpp's existing compute_clades() (already
-        used internally by pfs_fuse_cpp.cpp's clade directories, just
-        not previously reachable from here) rather than reimplementing
-        the clustering. threshold <= 0.0 uses the design doc's own
-        default (kDefaultCladeThreshold, 0.80); a positive value
-        overrides it, same knob TreeConstructor.py's compute_clades()
-        takes on the Python side. Returns (representative,
-        [member_labels, ...]) -- representative is compute_clades()'s
-        own lexicographically-smallest-member map key, NOT a real
-        lineage root (a clade is a similarity grouping with no
-        parent/child structure of its own)."""
+        """(representative, [members]) of `label`'s clade. threshold <= 0 uses the
+        default 0.80. The representative is the smallest member, not a root.
+        """
         members = []
 
         @_TEXT_CALLBACK
@@ -637,12 +588,7 @@ class CppVaultSession:
         return rep_buf.value.decode("utf-8"), members
 
     def unreliable_fingerprint_labels(self) -> dict:
-        """{label: chunk_count} for every label (of those with a stored
-        similarity fingerprint) whose fingerprint has fewer chunks than
-        phylo.hpp's kMinReliableTraitCount -- the C++-engine mirror of
-        PhylogeneticAnalyzer.py's trait_set_is_reliable() check, used by
-        CppPFSShell's tree/similar/clade commands to print the same
-        low-confidence warning the Python engine prints."""
+        """{label: chunk_count} for fingerprints below kMinReliableTraitCount."""
         unreliable = {}
 
         @_LABEL_COUNT_CALLBACK
@@ -655,12 +601,7 @@ class CppVaultSession:
         return unreliable
 
     def get_generation_chunk_hashes(self, label: str, generation_index: int) -> list:
-        """This generation's ordered (block_index -> content_hash) list,
-        as a list of 32-byte hashes -- unlike debug_get_block_hash
-        (current tip only), reaches ANY past generation_index of
-        `label`. This is the primitive a real lineage diff (comparing
-        two generations of the SAME label's real edit history, distinct
-        from clade/similarity comparisons) is built on."""
+        """Ordered chunk hashes of any generation of `label` (for lineage diffs)."""
         hashes = []
 
         @_RAW_HASH_CALLBACK
@@ -673,7 +614,7 @@ class CppVaultSession:
         return hashes
 
     def debug_get_block_hash(self, label: str, block_index: int) -> bytes:
-        """Diagnostic only, for the 'attack' self-test -- see c_api.h."""
+        """Diagnostic, for 'attack'."""
         buf = (ctypes.c_uint8 * 32)()
         rc = _lib.pfs_debug_get_block_hash(self._handle, label.encode("utf-8"), block_index, buf)
         if rc != 0:
@@ -681,7 +622,7 @@ class CppVaultSession:
         return bytes(buf)
 
     def debug_lookup_chunk(self, content_hash: bytes) -> dict:
-        """Diagnostic only, for the 'attack' self-test -- see c_api.h."""
+        """Diagnostic, for 'attack'."""
         if len(content_hash) != 32:
             raise ValueError("content_hash must be exactly 32 bytes")
         buf = (ctypes.c_uint8 * 32).from_buffer_copy(content_hash)
@@ -695,8 +636,7 @@ class CppVaultSession:
         return {"offset": offset.value, "length": length.value, "epoch_id": epoch_id.value}
 
     def debug_get_mirror(self, content_hash: bytes) -> Optional[dict]:
-        """Diagnostic only -- Ancestral Hardening mirror location for a
-        chunk, or None if it has never been mirrored. See c_api.h."""
+        """Diagnostic: a chunk's mirror location, or None."""
         if len(content_hash) != 32:
             raise ValueError("content_hash must be exactly 32 bytes")
         buf = (ctypes.c_uint8 * 32).from_buffer_copy(content_hash)
@@ -726,10 +666,7 @@ class CppVaultSession:
         return new_epoch_id
 
     def get_stats(self) -> dict:
-        """Vault-wide statistics -- container size, unique/dead chunks,
-        total chunk references (dedup ratio), files tracked, key epoch
-        count. Computed for real off a full dedup-index scan (same
-        iter_all() vacuum/fsck use), not cached or approximated."""
+        """Vault statistics from a full dedup-index scan."""
         stats = _CVaultStats()
         rc = _lib.pfs_get_stats(self._handle, ctypes.byref(stats))
         if rc != 0:
