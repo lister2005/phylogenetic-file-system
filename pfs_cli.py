@@ -21,7 +21,9 @@ sys.path.insert(0, os.getcwd())
 
 from gearhash.master_key_store import (load_vault_key, create_new_vault_key, change_passphrase,
                                         WrongPassphraseError, MASTER_KEY_FILENAME)
+from gearhash import fingerprint as stored_fingerprint
 from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME
+from gearhash.pipeline import release_free_memory
 from gearhash.fks_index import FKSLookupEngine
 from gearhash.keyring import KEYRING_FILENAME
 from gearhash.immutability import set_immutable
@@ -435,6 +437,8 @@ Example:
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(file_path)
                 self.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
+                del fingerprint
+                release_free_memory()
                 self._clades.changed(label)  # before the message, so a 'clade' after it sees this
                 print(f"\n[background] fingerprint ready for '{label}' -- 'tree' can now include it.\n{self.prompt}", end="", flush=True)
             except Exception as e:
@@ -541,18 +545,17 @@ Example:
   delete my_report force
 (removes every generation of each label. Storage still shared with
 other labels stays until nothing uses it. Labels are deleted
-independently; 'force' overrides the 'protected' tag for all of them.)"""
+independently; 'force' overrides the 'protected' tag for all of them.
+Only a final 'force' after at least one label is the flag, so
+'delete force' deletes a label named force.)"""
         parts = _split_args(arg)
         if parts is None:
             return
         if not parts:
             print("Usage: delete <label> [<label2> ...] [force]")
             return
-        force = any(p.lower() == "force" for p in parts)
-        labels = [p for p in parts if p.lower() != "force"]
-        if not labels:
-            print("Usage: delete <label> [<label2> ...] [force]")
-            return
+        force = len(parts) > 1 and parts[-1].lower() == "force"
+        labels = parts[:-1] if force else parts
 
         unknown = [l for l in labels if l not in self.catalog]
         for l in unknown:
@@ -984,11 +987,18 @@ vault is then deleted best-effort; it is already unrecoverable by then."""
 
     def _gather_named_traits(self, description: str) -> dict:
         """{label: fingerprint} for every label that has one, noting any left
-        out (still fingerprinting, or none stored).
+        out (still fingerprinting, or none stored). Taken from the clade
+        worker's copy when it is up to date, otherwise read from disk.
         """
+        cached = {}
+        if self._clades.wait_idle(CLADE_WAIT_SECONDS):
+            cached = self._clades.snapshot().fingerprints
         named_traits = {}
         missing = []
         for label, manifest_filename in self.catalog.items():
+            if label in cached:
+                named_traits[label] = stored_fingerprint.unpack(cached[label])
+                continue
             manifest_path = os.path.join(self.storage_root, manifest_filename)
             if not os.path.exists(manifest_path):
                 continue
@@ -1992,11 +2002,11 @@ Example:
         parts = _split_args(arg)
         if parts is None:
             return
-        if len(parts) not in (1, 2):
+        if len(parts) not in (1, 2) or (len(parts) == 2 and parts[1].lower() != "force"):
             print("Usage: delete <label> [force]")
             return
         label = parts[0]
-        force = len(parts) == 2 and parts[1].lower() == "force"
+        force = len(parts) == 2
         if not self._require_reauth(f"delete '{label}'", always_ask=True):
             return
         try:

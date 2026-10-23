@@ -4,7 +4,7 @@
 
 This is a **small, deliberately toy-scoped proof-of-concept**, built to
 answer one narrow question raised by this project's own design brief
-(`Project_idea.txt`, section 4, "The Linux Kernel Module (LKM) & Hybrid
+(`Project_idea.txt`, section 9, "The Linux Kernel Module (LKM) & Hybrid
 Architectures"): *is it actually feasible to intercept file operations at
 the Linux VFS layer via a `struct file_operations` table, the way a real
 "Phase 3" PFS kernel driver eventually would?*
@@ -74,7 +74,7 @@ module:
 ```
 filename:       pfs_lkm.ko
 version:        0.1
-description:    PFS-LKM: toy character device demonstrating VFS file_operations interception as a feasibility proof for PFS's 'Phase 3' design, per Project_idea.txt section 4. NOT a production filesystem.
+description:    PFS-LKM: toy character device demonstrating VFS file_operations interception as a feasibility proof for PFS's 'Phase 3' design, per Project_idea.txt section 9. NOT a production filesystem.
 license:        GPL
 name:           pfs_lkm
 vermagic:       7.0.0-29-generic SMP preempt mod_unload modversions

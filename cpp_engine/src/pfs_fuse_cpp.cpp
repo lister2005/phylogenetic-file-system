@@ -26,6 +26,9 @@
 #include <vector>
 
 #include <fcntl.h>
+#ifdef __GLIBC__
+#include <malloc.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -222,6 +225,10 @@ void commit(PfsFuseState* st, const std::string& label, const std::string& scrat
         throw;
     }
     remove(scratch_path.c_str());
+#ifdef __GLIBC__
+    // A commit frees memory the size of its batches; hand it back to the OS.
+    malloc_trim(0);
+#endif
 }
 
 // ---------- FUSE operation callbacks ----------

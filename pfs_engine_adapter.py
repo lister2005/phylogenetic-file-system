@@ -12,6 +12,7 @@ from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_
 from reconstruct import reconstruct
 from vault_session import MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
+from gearhash.pipeline import release_free_memory
 
 _CONFLICT_POSITIONS_RE = re.compile(r"since their common ancestor:\s*([\d,\s]+)")
 
@@ -173,6 +174,8 @@ class PythonEngineAdapter(_CladeTracking):
         fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(path)
         manifest_path = self._session.commit_write(
             label, path, fork_from_generation=fork_from_generation, similarity_fingerprint=fingerprint)
+        del fingerprint
+        release_free_memory()
         self._clade_event("changed", label)
         return manifest_path
 
@@ -213,6 +216,8 @@ class PythonEngineAdapter(_CladeTracking):
             fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(tmp_path)
             self._session.commit_write(new_label, tmp_path, lateral_parent_labels=[label],
                                         similarity_fingerprint=fingerprint)
+            del fingerprint
+            release_free_memory()
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)

@@ -31,16 +31,18 @@ class CladeSnapshot:
     """An immutable partition. clade_to_labels: representative (smallest
     member) -> sorted members, singletons included; label_to_clade: member ->
     representative. version counts snapshots (0 = none yet); pending means
-    changes were queued when it was taken.
+    changes were queued when it was taken. fingerprints: label -> packed
+    fingerprint, for every label clustered.
     """
 
-    __slots__ = ("clade_to_labels", "label_to_clade", "version", "pending")
+    __slots__ = ("clade_to_labels", "label_to_clade", "version", "pending", "fingerprints")
 
-    def __init__(self, clade_to_labels, label_to_clade, version, pending):
+    def __init__(self, clade_to_labels, label_to_clade, version, pending, fingerprints=None):
         self.clade_to_labels = clade_to_labels
         self.label_to_clade = label_to_clade
         self.version = version
         self.pending = pending
+        self.fingerprints = {} if fingerprints is None else fingerprints
 
 
 def filtered_view(snapshot: CladeSnapshot, live_labels, min_members: int = 1):
@@ -137,7 +139,7 @@ class CladeWorker:
             pending = bool(self._events) or self._busy
         if pending == snap.pending:
             return snap
-        return CladeSnapshot(snap.clade_to_labels, snap.label_to_clade, snap.version, pending)
+        return CladeSnapshot(snap.clade_to_labels, snap.label_to_clade, snap.version, pending, snap.fingerprints)
 
     def wait_idle(self, timeout: Optional[float] = None) -> bool:
         """Waits until every change posted so far is in snapshot(). False on timeout."""
@@ -206,6 +208,10 @@ class CladeWorker:
                 if old in dirty:
                     dirty.discard(old)
                     dirty.add(new)
+                elif old not in self._traits and new not in self._traits:
+                    # Unknown under the old name: a load that ran after the
+                    # rename found nothing. Load it under the new one.
+                    dirty.add(new)
 
         loaded: Dict[str, bytes] = {}
         for label in sorted(dirty):
@@ -270,4 +276,4 @@ class CladeWorker:
 
         with self._cond:
             self._snapshot = CladeSnapshot(clade_to_labels, label_to_clade,
-                                           self._snapshot.version + 1, False)
+                                           self._snapshot.version + 1, False, dict(self._traits))

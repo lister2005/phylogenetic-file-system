@@ -50,6 +50,7 @@ from vault_session import VaultSession, VaultUnlockError
 from reconstruct import ManifestReader
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from clade_worker import CladeWorker, filtered_view, python_session_loader
+from gearhash.pipeline import release_free_memory
 
 SCRATCH_DIRNAME = ".fuse_scratch"
 # Bytes per ManifestReader read when copying a version into a scratch file.
@@ -388,6 +389,8 @@ class PFSFuse(Operations):
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(tmp_path)
                 self.session.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
+                del fingerprint
+                release_free_memory()
             except Exception as e:
                 sys.stderr.write(f"[pfs_fuse background] fingerprinting '{label}' failed: "
                                   f"{type(e).__name__}: {e}\n")
