@@ -62,12 +62,18 @@ test, so it fails when run bare like this.)
 
 | Read | For |
 |---|---|
+| `manual_two.pdf` | A plain-language introduction: the idea, how it works, its history and limits |
+| `gui_manual.pdf` | Using the desktop app, with screenshots and troubleshooting |
 | `PORTFOLIO.md` | What PFS is and why it's designed this way |
-| `manual.txt` | Every CLI command, both engines, security posture, known limitations |
-| `gui_manual.txt` | The GUI |
+| `manual.txt` / `manual.pdf` | Every CLI command, both engines, security posture, known limitations |
 | `NEW_USER_ACCEPTANCE_REPORT.md` | An adversarial first-time-user test of the whole system |
 | `cpp_engine/*_FORMAT.md` | The C++ engine's on-disk formats |
 | `kernel_module/README.md` | A toy kernel-module proof of concept — read before touching; never load it casually |
+
+The PDFs are generated from text sources: `manual.txt` by
+`generate_manual_pdf.py`; `gui_manual.txt` and `manual_two.txt` by
+`generate_guides_pdf.py` (screenshots in `doc_images/gui/` come from
+`make_gui_screenshots.py`). Edit the source, then rerun the script.
 
 Vault directories (`pfs_storage_vault*/`) hold real key material and are
 kept out of git.
