@@ -18,6 +18,7 @@ import math
 import tempfile
 import time
 import difflib
+import shlex
 from datetime import datetime
 
 from PySide6.QtWidgets import (
@@ -45,6 +46,7 @@ from vault_session import VaultSession, VaultUnlockError, MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer
 from TreeConstructor import TreeConstructor
 from pfs_engine_adapter import PythonEngineAdapter, CppEngineAdapter
+from gearhash.phenotype import detect_from_file
 import lineage_diff
 
 # ---------- palette ----------
@@ -787,6 +789,10 @@ def _cmd_view(window, label):
     window._view_label(label)
 
 
+def _cmd_view_generation(window, label, generation):
+    window._view_generation(label, int(generation))
+
+
 def _cmd_edit_inapp(window, label):
     window._edit_label_inapp(label)
 
@@ -848,6 +854,7 @@ COMMAND_REGISTRY = {
     "view": ("<label>", _cmd_view),
     "editinapp": ("<label>", _cmd_edit_inapp),
     "viewimage": ("<label>", _cmd_view_image),
+    "viewgen": ("<label> <generation>", _cmd_view_generation),
     "search": ("<text>", _cmd_search),
     "focus": ("", _cmd_focus),
     "web": ("", _cmd_web),
@@ -898,7 +905,13 @@ class CommandPalette(QDialog):
         self.close()
         if not text:
             return
-        parts = text.split()
+        try:
+            parts = shlex.split(text)  # quotes group words: rename "my file" "new name"
+        except ValueError:
+            self.window._toast("Couldn't read that command -- check your quotes")
+            return
+        if not parts:
+            return
         cmd, args = parts[0].lower(), parts[1:]
         entry = COMMAND_REGISTRY.get(cmd)
         if entry is None:
@@ -957,6 +970,27 @@ class InAppTextEditorDialog(QDialog):
             self.status_label.setText("Saved -- new generation created")
         except Exception as e:
             self.status_label.setText(f"Save failed: {e}")
+
+
+class TextViewerDialog(QDialog):
+    """Read-only in-app text viewer (past generations)."""
+
+    def __init__(self, parent, title: str, text: str):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(760, 600)
+        layout = QVBoxLayout(self)
+        view = QPlainTextEdit(self)
+        view.setPlainText(text)
+        view.setReadOnly(True)
+        mono = QFont("Monospace")
+        mono.setStyleHint(QFont.TypeWriter)
+        mono.setPointSize(11)
+        view.setFont(mono)
+        layout.addWidget(view)
+        close_button = QPushButton("Close", self)
+        close_button.clicked.connect(self.close)
+        layout.addWidget(close_button)
 
 
 class ImageViewerDialog(QDialog):
@@ -1126,6 +1160,8 @@ class VaultGraphWindow(QMainWindow):
         self._clade_membership = {}  # label -> clade_key, for multi-member clades
         self._clade_leash_radius = {}
         self._clade_blob_by_key = {}  # clade_key -> its outline item
+        self._scene_mode = None  # the mode the current scene was built for
+        self._saved_positions = {}  # mode -> {node key: (x, y)}
         self._empty_state_item = None
         self._time_bounds = None
         self._time_cutoff = None
@@ -1641,6 +1677,10 @@ class VaultGraphWindow(QMainWindow):
             self._mode = "cladetree"
         self._rebuild()
 
+    # The Clade Tree's layout is its shape (it changes with UPGMA/NJ), so it
+    # is always laid out afresh.
+    REMEMBERED_LAYOUT_MODES = ("web", "tree")
+
     def _rebuild(self):
         for anim in list(self._active_animations):
             anim.stop()
@@ -1650,6 +1690,11 @@ class VaultGraphWindow(QMainWindow):
         for t in list(self._pending_timers):
             t.stop()
         self._pending_timers = []
+        # Remember where nodes were, so a redraw (a write, a search, a mode
+        # switch and back) keeps the layout instead of re-scattering it.
+        if self._scene_mode in self.REMEMBERED_LAYOUT_MODES and self._node_items:
+            self._saved_positions[self._scene_mode] = {
+                key: (node.pos().x(), node.pos().y()) for key, node in self._node_items.items()}
         self.scene.clear()
         self._node_items = {}
         self._edge_items = []
@@ -1664,6 +1709,11 @@ class VaultGraphWindow(QMainWindow):
             self._build_tree_graph()
         else:
             self._build_clade_tree_graph()
+        self._scene_mode = self._mode
+        for key, (x, y) in self._saved_positions.get(self._mode, {}).items():
+            node = self._node_items.get(key)
+            if node is not None:
+                node.setPos(x, y)
 
         self._refresh_list_table()
         self._fit_to_view()
@@ -2502,6 +2552,9 @@ class VaultGraphWindow(QMainWindow):
             heads = self.engine.get_heads(owning_label)
             is_tip = bool(history) and history[-1].node_uuid == node_uuid
             menu.addAction("Info", lambda: self._show_details_for_generation(node_uuid))
+            if not lineage_node.pruned:
+                menu.addAction("View this version",
+                                lambda: self._view_generation(owning_label, lineage_node.generation_index))
             menu.addAction("Checkout to file...",
                             lambda: self._checkout_generation(owning_label, lineage_node.generation_index))
             menu.addAction("Fork from here...",
@@ -2529,6 +2582,8 @@ class VaultGraphWindow(QMainWindow):
         if self.engine.has_label(new_label):
             raise ValueError(f"'{new_label}' already exists")
         self.engine.rename_label(label, new_label)
+        if self._mode == "web" and label in self._node_items:  # keep its place on the map
+            self._node_items[new_label] = self._node_items.pop(label)
         self._toast(f"Renamed '{label}' -> '{new_label}'")
         self._rebuild()
 
@@ -2775,6 +2830,41 @@ class VaultGraphWindow(QMainWindow):
                                                f"The content is at: {tmp_path}")
             return
         self._toast(f"Opened '{label}' read-only -- changes there won't be saved back")
+
+    def _view_generation(self, label, generation_index):
+        """Shows one past generation read-only: text and images in-app, other
+        types in the OS default app. Nothing is committed.
+        """
+        os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="pfs_viewgen_", dir=EDIT_CACHE_DIR)
+        os.close(fd)
+        try:
+            self.engine.checkout(label, generation_index, tmp_path)
+        except Exception as e:  # pruned, or no such generation (either engine)
+            os.remove(tmp_path)
+            QMessageBox.warning(self, "View", str(e))
+            return
+        phenotype_name = detect_from_file(tmp_path).name
+        title = f"{label} -- generation {generation_index} (read-only)"
+        if _is_inapp_text_phenotype(phenotype_name) or _is_inapp_image_phenotype(phenotype_name):
+            with open(tmp_path, "rb") as f:
+                data = f.read()
+            os.remove(tmp_path)
+            if _is_inapp_text_phenotype(phenotype_name):
+                dlg = TextViewerDialog(self, title, data.decode("utf-8", errors="replace"))
+            else:
+                dlg = ImageViewerDialog(self, title, data)
+            self._active_dialogs.append(dlg)
+            dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
+            dlg.show()
+            return
+        view_path = tmp_path + _extension_for_phenotype(phenotype_name)
+        os.replace(tmp_path, view_path)
+        if not QDesktopServices.openUrl(QUrl.fromLocalFile(view_path)):
+            QMessageBox.warning(self, "View", f"Couldn't find a default app to open this file type.\n"
+                                               f"The content is at: {view_path}")
+            return
+        self._toast(f"Opened '{label}' generation {generation_index} read-only")
 
     def _edit_label_inapp(self, label):
         """Text: in-app editor whose Save commits directly."""
