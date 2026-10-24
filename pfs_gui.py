@@ -161,6 +161,9 @@ LATERAL_EDGE_REST_LENGTH = 200.0
 
 # Under $HOME, not /tmp: confined Snap apps get a private /tmp and
 # couldn't open files placed there.
+# How long the Clade Tree view waits for the background tree before
+# building it itself.
+CLADE_TREE_WAIT_SECONDS = 5.0
 EDIT_CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "pfs_gui_edit")
 
 # Light theme. Data colors (phenotypes, branches, heat) are shared by both
@@ -2114,12 +2117,14 @@ class VaultGraphWindow(QMainWindow):
             self._show_empty_state("Need at least 2 fingerprinted files to build a clade tree.")
             return
 
-        analyzer = PhylogeneticAnalyzer()
-        tc = TreeConstructor(analyzer)
-        if self._clade_algorithm == "nj":
-            all_nodes = tc.build_tree_nj_from_traits(fingerprints)
-        else:
-            all_nodes = tc.build_tree_upgma_from_traits(fingerprints)
+        # The clade worker keeps this tree up to date in the background.
+        all_nodes = self.engine.clade_tree(self._clade_algorithm, fingerprints, wait=CLADE_TREE_WAIT_SECONDS)
+        if all_nodes is None:
+            tc = TreeConstructor(PhylogeneticAnalyzer())
+            if self._clade_algorithm == "nj":
+                all_nodes = tc.build_tree_nj_from_traits(fingerprints)
+            else:
+                all_nodes = tc.build_tree_upgma_from_traits(fingerprints)
 
         positions, by_uuid = self._clade_tree_layout(all_nodes)
         max_leaf_count = max((n.leaf_count or 1) for n in all_nodes) or 1

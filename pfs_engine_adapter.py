@@ -85,6 +85,15 @@ class _CladeTracking:
         clade_to_labels, label_to_clade = filtered_view(snapshot, set(self.labels()), min_members=2)
         return clade_to_labels, label_to_clade, snapshot.version
 
+    def clade_tree(self, algorithm: str, labels, wait: float = 0.0):
+        """The worker's background UPGMA/NJ tree over exactly `labels`, or None
+        if it isn't ready within `wait` seconds (then build it directly).
+        """
+        self.start_clade_worker()
+        if self._clade_worker is None:
+            return None
+        return self._clade_worker.tree(algorithm, labels, timeout=wait)
+
     def _clade_event(self, kind: str, *labels) -> None:
         # start() loads every label, so nothing to report before it.
         if self._clade_worker is not None:

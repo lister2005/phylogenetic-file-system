@@ -1046,9 +1046,13 @@ Example:
             return
 
         analyzer = PhylogeneticAnalyzer(SIMILARITY_PROFILE)
+        # Built in the background by the clade worker; build it here only if
+        # it isn't ready in time.
         tc = TreeConstructor(analyzer)
-        nodes = tc.build_tree_upgma_from_traits(named_traits) if algorithm == "upgma" \
-            else tc.build_tree_nj_from_traits(named_traits)
+        nodes = self._clades.tree(algorithm, named_traits, timeout=CLADE_WAIT_SECONDS)
+        if nodes is None:
+            nodes = tc.build_tree_upgma_from_traits(named_traits) if algorithm == "upgma" \
+                else tc.build_tree_nj_from_traits(named_traits)
 
         unreliable = {lbl: len(traits) for lbl, traits in named_traits.items()
                       if not analyzer.trait_set_is_reliable(traits)}

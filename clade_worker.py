@@ -8,6 +8,10 @@ compares only the changed labels against the rest (O(n), not O(n^2)).
 snapshot() returns the last complete partition at once; filtered_view()
 hides labels that no longer exist; wait_idle() waits for a fresh one.
 
+It also keeps the UPGMA/NJ tree up to date (tree()), but only for an
+algorithm someone has asked for: building one is O(n^2) to O(n^3), so it
+runs after each batch of changes, not on demand.
+
 A thread in the process holding the vault, not a separate process: the
 vault lock admits one process per vault. Fingerprints come from a loader
 called only on the worker thread, and are cached packed (32 bytes per
@@ -92,6 +96,13 @@ def cpp_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
     return load
 
 
+class _DistanceAnalyzer:
+    """Adapts a distance function to the analyzer TreeConstructor expects."""
+
+    def __init__(self, distance):
+        self.calculate_distance = distance
+
+
 class CladeWorker:
     def __init__(self, load_traits: Callable[[str], Optional[Set[bytes]]],
                  threshold: float = DEFAULT_CLADE_THRESHOLD,
@@ -107,6 +118,8 @@ class CladeWorker:
         self._busy = False  # guarded by _cond
         self._stopping = False           # guarded by _cond
         self._snapshot = CladeSnapshot({}, {}, 0, False)
+        self._tree_algorithms: Set[str] = set()  # guarded by _cond; ones asked for
+        self._trees: Dict[str, tuple] = {}         # guarded by _cond; alg -> (version, labels, nodes)
         self._thread: Optional[threading.Thread] = None
         self.last_error: Optional[str] = None
 
@@ -146,6 +159,29 @@ class CladeWorker:
         with self._cond:
             return self._cond.wait_for(lambda: not self._events and not self._busy, timeout)
 
+    def tree(self, algorithm: str, labels: Iterable[str], timeout: Optional[float] = None):
+        """The tree ("upgma" or "nj") over exactly `labels`, built in the
+        background for the current partition, or None if it isn't ready
+        within `timeout` or covers different labels (callers then build it
+        themselves). The first call for an algorithm starts keeping it.
+        Returned nodes are shared: don't modify them.
+        """
+        wanted = frozenset(labels)
+        with self._cond:
+            self._tree_algorithms.add(algorithm)
+            self._cond.notify_all()
+
+            def ready():
+                entry = self._trees.get(algorithm)
+                idle = not self._events and not self._busy
+                return idle and entry is not None and entry[0] == self._snapshot.version
+
+            self._cond.wait_for(ready, timeout)
+            entry = self._trees.get(algorithm)
+            if entry is None or entry[0] != self._snapshot.version or entry[1] != wanted:
+                return None
+            return entry[2]
+
     def stop(self, timeout: Optional[float] = None) -> None:
         with self._cond:
             self._stopping = True
@@ -160,14 +196,27 @@ class CladeWorker:
 
     # ---------- worker thread ----------
 
+    def _stale_trees(self) -> List[str]:
+        """Algorithms asked for whose tree predates the partition. Under _cond."""
+        version = self._snapshot.version
+        return [a for a in sorted(self._tree_algorithms)
+                if a not in self._trees or self._trees[a][0] != version]
+
     def _run(self) -> None:
         while True:
             with self._cond:
-                self._cond.wait_for(lambda: self._events or self._stopping)
+                self._cond.wait_for(lambda: self._events or self._stopping or self._stale_trees())
                 if self._stopping:
                     return
-                events, self._events = self._events, []
-                self._busy = True
+                if not self._events:
+                    stale, version = self._stale_trees(), self._snapshot.version
+                    events = None
+                else:
+                    events, self._events = self._events, []
+                    self._busy = True
+            if events is None:
+                self._build_trees(stale, version)
+                continue
             try:
                 self._process(events)
             except Exception as e:  # keep serving
@@ -177,6 +226,30 @@ class CladeWorker:
                 with self._cond:
                     self._busy = bool(self._events)  # more may have arrived
                     self._cond.notify_all()
+
+    def _build_trees(self, algorithms: List[str], version: int) -> None:
+        """Builds each tree from the cached fingerprints (worker thread)."""
+        named = {label: stored_fingerprint.unpack(packed) for label, packed in self._traits.items()}
+        for algorithm in algorithms:
+            try:
+                if len(named) < 2:
+                    nodes = []
+                else:
+                    tc = TreeConstructor(_DistanceAnalyzer(self._distance))
+                    nodes = tc.build_tree_nj_from_traits(named) if algorithm == "nj" \
+                        else tc.build_tree_upgma_from_traits(named)
+                    for node in nodes:  # only needed while building; don't keep a copy
+                        node.trait_matrix = set()
+            except Exception as e:
+                self.last_error = f"building the {algorithm} tree: {type(e).__name__}: {e}"
+                sys.stderr.write(f"[{self._name}] {self.last_error}\n")
+                nodes = None
+            with self._cond:
+                if nodes is not None:
+                    self._trees[algorithm] = (version, frozenset(named), nodes)
+                else:  # don't retry the same partition in a loop
+                    self._trees[algorithm] = (version, frozenset(), [])
+                self._cond.notify_all()
 
     def _drop(self, label: str) -> None:
         self._traits.pop(label, None)
