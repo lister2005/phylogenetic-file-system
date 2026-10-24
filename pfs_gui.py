@@ -1125,6 +1125,7 @@ class VaultGraphWindow(QMainWindow):
         self._clade_blob_items = []
         self._clade_membership = {}  # label -> clade_key, for multi-member clades
         self._clade_leash_radius = {}
+        self._clade_blob_by_key = {}  # clade_key -> its outline item
         self._empty_state_item = None
         self._time_bounds = None
         self._time_cutoff = None
@@ -1653,6 +1654,7 @@ class VaultGraphWindow(QMainWindow):
         self._node_items = {}
         self._edge_items = []
         self._clade_blob_items = []
+        self._clade_blob_by_key = {}
         self._empty_state_item = None
         self._time_bounds = None
 
@@ -2118,6 +2120,7 @@ class VaultGraphWindow(QMainWindow):
         self._clade_blob_items = []
         self._clade_membership = {}
         self._clade_leash_radius = {}
+        self._clade_blob_by_key = {}
 
     def _draw_clade_blobs(self):
         self._clear_clade_blobs()
@@ -2160,6 +2163,7 @@ class VaultGraphWindow(QMainWindow):
                 for member in members:
                     self._clade_membership[member] = clade_name
                 self._clade_leash_radius[clade_name] = max_r
+                self._clade_blob_by_key[clade_name] = blob
 
                 clade_cards.append({"heading": clade_name, "rows": [], "note": ", ".join(sorted(members))})
 
@@ -2180,6 +2184,7 @@ class VaultGraphWindow(QMainWindow):
             self._clade_blob_items.append(blob)
             self._clade_membership[label] = clade_key
             self._clade_leash_radius[clade_key] = max_r
+            self._clade_blob_by_key[clade_key] = blob
 
         if not clade_cards:
             clade_cards.append({"heading": "No shared clades yet", "rows": [],
@@ -2360,7 +2365,7 @@ class VaultGraphWindow(QMainWindow):
                 ("New chunks", node.new_chunks),
                 ("Total chunks", node.total_chunks),
                 ("Pruned", "yes" if node.pruned else "no"),
-                ("Lateral parents", node.lateral_parent_count),
+                ("Lateral parents", len(node.lateral_parent_uuids or [])),
             ]},
             {"heading": "Tags (inherited forward)", "rows": [(k, v) for k, v in tags.items()] if tags else [("(none)", "")]},
         ]
@@ -3143,6 +3148,19 @@ class VaultGraphWindow(QMainWindow):
                 n.vy = n.vy / speed * MAX_SPEED
             if abs(n.vx) > 0.02 or abs(n.vy) > 0.02:
                 n.setPos(n.pos().x() + n.vx, n.pos().y() + n.vy)
+
+        # Outlines follow their members' current centroid.
+        if self._mode == "web" and self._clade_blob_by_key:
+            sums = {}
+            for n in nodes:
+                clade_key = self._clade_membership.get(n.data(1))
+                if clade_key in self._clade_blob_by_key:
+                    s = sums.setdefault(clade_key, [0.0, 0.0, 0])
+                    s[0] += n.pos().x()
+                    s[1] += n.pos().y()
+                    s[2] += 1
+            for clade_key, (sx, sy, count) in sums.items():
+                self._clade_blob_by_key[clade_key].setPos(sx / count, sy / count)
 
         # Slow rigid rotation of every unpinned node and clade blob (web mode
         # only). Rotation preserves distances, so it doesn't fight the other
