@@ -5,7 +5,6 @@ uses: labels, metadata, lineage, the mutating operations, and file content
 only through checkout()/reconstruct_current().
 """
 import os
-import re
 import tempfile
 
 from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
@@ -13,19 +12,6 @@ from reconstruct import reconstruct
 from vault_session import MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from gearhash.pipeline import release_free_memory
-
-_CONFLICT_POSITIONS_RE = re.compile(r"since their common ancestor:\s*([\d,\s]+)")
-
-
-def _parse_conflict_positions(message: str) -> list:
-    """Conflicting chunk positions from the C++ engine's conflict message (same
-    wording as Python's), so both engines raise MutationConflictError.
-    """
-    m = _CONFLICT_POSITIONS_RE.search(message)
-    if not m:
-        return []
-    return [int(tok) for tok in m.group(1).split(",") if tok.strip().isdigit()]
-
 
 class NodeInfo:
     """A lineage node in either engine; uuids are hex strings in both."""
@@ -202,8 +188,8 @@ class PythonEngineAdapter(_CladeTracking):
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
         self._session.prune_generation(label, generation_index, force=force)
 
-    def merge_branches(self, label: str, generation_a: int, generation_b: int) -> None:
-        self._session.merge_branches(label, generation_a, generation_b)
+    def merge_branches(self, label: str, generation_a: int, generation_b: int, resolutions=None) -> None:
+        self._session.merge_branches(label, generation_a, generation_b, resolutions)
         self._clade_event("changed", label)
 
     def checkout(self, label: str, generation_index: int, out_path: str) -> None:
@@ -340,14 +326,12 @@ class CppEngineAdapter(_CladeTracking):
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
         self._session.prune_generation(label, generation_index, force=force)
 
-    def merge_branches(self, label: str, generation_a: int, generation_b: int) -> None:
+    def merge_branches(self, label: str, generation_a: int, generation_b: int, resolutions=None) -> None:
+        from pfs_engine_binding import PfsMergeConflictError  # only importable with the C++ engine built
         try:
-            self._session.merge_branches(label, generation_a, generation_b)
-        except Exception as e:
-            positions = _parse_conflict_positions(str(e))
-            if positions or "changed differently" in str(e):
-                raise MutationConflictError(positions) from e
-            raise
+            self._session.merge_branches(label, generation_a, generation_b, resolutions)
+        except PfsMergeConflictError as e:
+            raise MutationConflictError(e.conflicting_positions) from e
         self._clade_event("changed", label)
 
     def checkout(self, label: str, generation_index: int, out_path: str) -> None:

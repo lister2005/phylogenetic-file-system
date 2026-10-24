@@ -293,6 +293,30 @@ int pfs_merge_branches(pfs_session_t* session_h, const char* label, uint64_t gen
     }
 }
 
+int pfs_merge_branches_resolved(pfs_session_t* session_h, const char* label, uint64_t generation_a,
+                                uint64_t generation_b, const uint64_t* positions, const char* sides,
+                                size_t resolution_count, char* out_manifest_filename, size_t out_buf_len,
+                                uint64_t* out_conflicts, size_t conflicts_cap, size_t* out_conflict_count) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    if (out_conflict_count) *out_conflict_count = 0;
+    try {
+        MergeResolutions resolutions;
+        for (size_t i = 0; i < resolution_count; i++) resolutions[positions[i]] = sides[i];
+        MergeResult result = s->session.merge(label, generation_a, generation_b, resolutions);
+        copy_out(result.manifest_path.substr(result.manifest_path.find_last_of('/') + 1), out_manifest_filename, out_buf_len);
+        return 0;
+    } catch (const MutationConflictError& e) {
+        set_error(e);
+        const auto& found = e.conflicting_positions;
+        for (size_t i = 0; i < found.size() && i < conflicts_cap; i++) out_conflicts[i] = found[i];
+        if (out_conflict_count) *out_conflict_count = found.size();
+        return 1;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
 int pfs_checkout(pfs_session_t* session_h, const char* label, uint64_t generation_index, const char* output_path) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {

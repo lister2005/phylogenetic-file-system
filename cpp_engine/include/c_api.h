@@ -116,6 +116,18 @@ int pfs_commit_write_lateral(pfs_session_t* session, const char* label, const ch
 int pfs_merge_branches(pfs_session_t* session, const char* label, uint64_t generation_a, uint64_t generation_b,
                        char* out_manifest_filename, size_t out_buf_len);
 
+/*
+ * Like pfs_merge_branches, with resolutions: positions[i] is settled by
+ * sides[i] ('a' or 'b'). Returns 0 on success, 1 on an unresolved conflict
+ * (the first `conflicts_cap` conflicting positions go to out_conflicts and
+ * the total to *out_conflict_count; nothing is committed), -1 on any other
+ * error (see pfs_last_error()).
+ */
+int pfs_merge_branches_resolved(pfs_session_t* session, const char* label, uint64_t generation_a,
+                                uint64_t generation_b, const uint64_t* positions, const char* sides,
+                                size_t resolution_count, char* out_manifest_filename, size_t out_buf_len,
+                                uint64_t* out_conflicts, size_t conflicts_cap, size_t* out_conflict_count);
+
 /* Reconstructs one past generation of `label` to output_path. */
 int pfs_checkout(pfs_session_t* session, const char* label, uint64_t generation_index, const char* output_path);
 

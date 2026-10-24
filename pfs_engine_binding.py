@@ -18,6 +18,16 @@ class PfsEngineError(Exception):
     """A C++ engine call failed; the message is pfs_last_error()."""
 
 
+class PfsMergeConflictError(PfsEngineError):
+    """A merge hit conflicts nobody resolved; `conflicting_positions` lists
+    all of them. Nothing was committed.
+    """
+
+    def __init__(self, message, conflicting_positions):
+        super().__init__(message)
+        self.conflicting_positions = list(conflicting_positions)
+
+
 class GenerationInfo:
     __slots__ = ("generation_index", "birth_timestamp", "new_chunks", "total_chunks",
                  "pruned", "has_parent", "node_uuid_hex", "parent_uuid_hex", "lateral_parent_count")
@@ -144,6 +154,11 @@ def _load_lib():
     lib.pfs_merge_branches.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64,
                                         ctypes.c_char_p, ctypes.c_size_t]
     lib.pfs_merge_branches.restype = ctypes.c_int
+    lib.pfs_merge_branches_resolved.argtypes = [
+        ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t,
+        ctypes.POINTER(ctypes.c_uint64), ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+    lib.pfs_merge_branches_resolved.restype = ctypes.c_int
     lib.pfs_commit_write_lateral.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_char_p, ctypes.c_char_p,
                                               ctypes.c_char_p, ctypes.c_size_t]
     lib.pfs_commit_write_lateral.restype = ctypes.c_int
@@ -336,9 +351,32 @@ class CppVaultSession:
             raise _err()
         return buf.value.decode("utf-8")
 
-    def merge_branches(self, label: str, generation_a: int, generation_b: int) -> str:
+    def merge_branches(self, label: str, generation_a: int, generation_b: int, resolutions=None) -> str:
+        """resolutions: {position: "a" or "b"}. Raises PfsMergeConflictError
+        listing every unresolved conflict.
+        """
+        resolutions = resolutions or {}
+        bad = [side for side in resolutions.values() if side not in ("a", "b")]
+        if bad:
+            raise ValueError(f"A resolution must be 'a' or 'b', not {bad[0]!r}.")
+        items = sorted(resolutions.items())
+        positions = (ctypes.c_uint64 * len(items))(*[p for p, _ in items])
+        sides = "".join(s for _, s in items).encode("ascii")
         buf = ctypes.create_string_buffer(256)
-        rc = _lib.pfs_merge_branches(self._handle, label.encode("utf-8"), generation_a, generation_b, buf, len(buf))
+        cap = 1024
+        while True:
+            conflicts = (ctypes.c_uint64 * cap)()
+            count = ctypes.c_size_t(0)
+            rc = _lib.pfs_merge_branches_resolved(
+                self._handle, label.encode("utf-8"), generation_a, generation_b, positions, sides, len(items),
+                buf, len(buf), conflicts, cap, ctypes.byref(count))
+            if rc == 1 and count.value > cap:  # nothing was committed: ask again with room for all
+                cap = count.value
+                continue
+            break
+        if rc == 1:
+            message = _lib.pfs_last_error().decode("utf-8", errors="replace")
+            raise PfsMergeConflictError(message, list(conflicts[:count.value]))
         if rc != 0:
             raise _err()
         return buf.value.decode("utf-8")

@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QLineEdit, QMessageBox, QDockWidget, QTextEdit,
     QStatusBar, QToolBar, QSlider, QLabel, QPushButton, QMenu, QFileDialog,
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QTableWidget, QTableWidgetItem,
-    QWidget, QHeaderView, QPlainTextEdit, QScrollArea, QToolTip,
+    QWidget, QHeaderView, QPlainTextEdit, QScrollArea, QToolTip, QComboBox,
 )
 from PySide6.QtGui import (
     QColor, QBrush, QPen, QPainter, QFont, QKeySequence, QAction,
@@ -973,6 +973,71 @@ class InAppTextEditorDialog(QDialog):
             self.status_label.setText("Saved -- new generation created")
         except Exception as e:
             self.status_label.setText(f"Save failed: {e}")
+
+
+class ConflictResolutionDialog(QDialog):
+    """Lets the user settle each conflicting chunk position of a merge by
+    choosing branch A's or branch B's version. Merge stays disabled until
+    every position has a choice.
+    """
+
+    def __init__(self, parent, label, generation_a, generation_b, positions, describe):
+        super().__init__(parent)
+        self.setWindowTitle(f"Resolve merge conflicts -- {label}")
+        self.resize(640, 460)
+        self.positions = list(positions)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"Generations {generation_a} (A) and {generation_b} (B) changed {len(self.positions)} "
+            f"part(s) of '{label}' in different ways. Choose which version of each part to keep. "
+            f"Nothing is saved until you press Merge.", self)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.table = QTableWidget(len(self.positions), 2, self)
+        self.table.setHorizontalHeaderLabels(["Part (chunk position)", "Keep"])
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.combos = []
+        for row, pos in enumerate(self.positions):
+            self.table.setItem(row, 0, QTableWidgetItem(str(pos)))
+            combo = QComboBox(self.table)
+            combo.addItem("Choose...", None)
+            combo.addItem(f"A -- generation {generation_a} ({describe('a', pos)})", "a")
+            combo.addItem(f"B -- generation {generation_b} ({describe('b', pos)})", "b")
+            combo.currentIndexChanged.connect(self._update_merge_button)
+            self.table.setCellWidget(row, 1, combo)
+            self.combos.append(combo)
+        layout.addWidget(self.table)
+
+        buttons = QHBoxLayout()
+        all_a = QPushButton(f"All from A (gen {generation_a})", self)
+        all_a.clicked.connect(lambda: self.choose_all("a"))
+        all_b = QPushButton(f"All from B (gen {generation_b})", self)
+        all_b.clicked.connect(lambda: self.choose_all("b"))
+        buttons.addWidget(all_a)
+        buttons.addWidget(all_b)
+        buttons.addStretch(1)
+        self.merge_button = QPushButton("Merge", self)
+        self.merge_button.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel", self)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.merge_button)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self._update_merge_button()
+
+    def choose_all(self, side):
+        for combo in self.combos:
+            combo.setCurrentIndex(combo.findData(side))
+
+    def resolutions(self):
+        """{position: 'a' or 'b'} for every chosen row."""
+        return {pos: combo.currentData() for pos, combo in zip(self.positions, self.combos)
+                if combo.currentData() is not None}
+
+    def _update_merge_button(self, *_):
+        self.merge_button.setEnabled(len(self.resolutions()) == len(self.positions))
 
 
 class TextViewerDialog(QDialog):
@@ -2729,20 +2794,35 @@ class VaultGraphWindow(QMainWindow):
         choice_b, ok = QInputDialog.getItem(self, "Merge", "Second branch:", remaining, editable=False)
         if not ok:
             return
-        head_a = heads[choices.index(choice_a)]
-        head_b = heads[choices.index(choice_b)]
+        gen_a = heads[choices.index(choice_a)].generation_index
+        gen_b = heads[choices.index(choice_b)].generation_index
         try:
-            self._perform_write_and_animate(
-                lambda: self.engine.merge_branches(label, head_a.generation_index, head_b.generation_index)
-            )
-            self._toast(f"Merged '{label}' generations {head_a.generation_index} and {head_b.generation_index}")
+            self._merge_with_resolutions(label, gen_a, gen_b, {})
         except MutationConflictError as e:
-            QMessageBox.warning(
-                self, "Mutation Conflict",
-                f"These branches changed the same content differently and can't be auto-merged.\n\n{e}",
-            )
+            dlg = self._conflict_dialog(label, gen_a, gen_b, e.conflicting_positions)
+            if dlg.exec() != QDialog.Accepted:
+                self._toast("Merge cancelled -- nothing was saved")
+                return
+            try:
+                self._merge_with_resolutions(label, gen_a, gen_b, dlg.resolutions())
+            except (MutationConflictError, ValueError) as e2:
+                QMessageBox.warning(self, "Merge failed", str(e2))
         except ValueError as e:
             QMessageBox.warning(self, "Merge failed", str(e))
+
+    def _merge_with_resolutions(self, label, gen_a, gen_b, resolutions):
+        self._perform_write_and_animate(
+            lambda: self.engine.merge_branches(label, gen_a, gen_b, resolutions or None))
+        extra = f" ({len(resolutions)} conflict(s) resolved)" if resolutions else ""
+        self._toast(f"Merged '{label}' generations {gen_a} and {gen_b}{extra}")
+
+    def _conflict_dialog(self, label, gen_a, gen_b, positions):
+        chunks = {"a": self.engine.get_chunk_hashes(label, gen_a),
+                  "b": self.engine.get_chunk_hashes(label, gen_b)}
+
+        def describe(side, pos):
+            return "its version" if pos < len(chunks[side]) else "the file ends before here"
+        return ConflictResolutionDialog(self, label, gen_a, gen_b, positions, describe)
 
     def _new_file_dialog(self):
         paths, _ = QFileDialog.getOpenFileNames(self, "Choose one or more files to add to the vault")

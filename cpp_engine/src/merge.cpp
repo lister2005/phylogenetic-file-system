@@ -46,7 +46,12 @@ std::vector<Bytes32> manifest_chunk_list(const std::string& storage_root, const 
 }  // namespace
 
 MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
-                            uint64_t generation_a, uint64_t generation_b) {
+                            uint64_t generation_a, uint64_t generation_b, const MergeResolutions& resolutions) {
+    for (const auto& kv : resolutions) {
+        if (kv.second != 'a' && kv.second != 'b') {
+            throw std::invalid_argument("A resolution must be 'a' or 'b'.");
+        }
+    }
     auto node_a_opt = lineage.get_generation(label, generation_a);
     auto node_b_opt = lineage.get_generation(label, generation_b);
     if (!node_a_opt) throw std::invalid_argument("No generation " + std::to_string(generation_a) +
@@ -107,6 +112,8 @@ MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, con
             winner = b;
         } else if (a == b) {
             winner = a;  // both changed the same way (including both truncating)
+        } else if (auto r = resolutions.find(i); r != resolutions.end()) {
+            winner = r->second == 'a' ? a : b;
         } else {
             // Changed differently by both, including truncation vs. edit.
             conflicts.push_back(static_cast<uint64_t>(i));

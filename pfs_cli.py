@@ -36,11 +36,14 @@ from lineage import LINEAGE_FILENAME
 
 # Optional: only --engine cpp needs the compiled engine.
 try:
-    from pfs_engine_binding import CppVaultSession, PfsEngineError
+    from pfs_engine_binding import CppVaultSession, PfsEngineError, PfsMergeConflictError
     _CPP_ENGINE_IMPORT_ERROR = None
 except OSError as e:
     CppVaultSession = None
     PfsEngineError = Exception
+
+    class PfsMergeConflictError(Exception):
+        conflicting_positions = []
     _CPP_ENGINE_IMPORT_ERROR = e
 
 # Marker files that tell the engines' vaults apart. Both use
@@ -89,6 +92,50 @@ def _index_probe(storage_root, crypto) -> bool:
     gi.lookup(secrets.token_bytes(32))
     gi.close()
     return True
+
+
+MERGE_USAGE = "Usage: merge <label> <generation_a> <generation_b> [a|b|<position>:<a|b>,...]"
+
+
+def _parse_merge_choice(text: str):
+    """'a' or 'b': every conflict to that branch -> (side, {}). '3:a,7:b':
+    those positions -> (None, {3: 'a', 7: 'b'}). None if malformed.
+    """
+    text = text.strip().lower()
+    if text in ("a", "b"):
+        return text, {}
+    choices = {}
+    for item in text.split(","):
+        pos, sep, side = item.partition(":")
+        if not sep or not pos.strip().isdigit() or side.strip() not in ("a", "b"):
+            return None
+        choices[int(pos)] = side.strip()
+    return None, choices
+
+
+def _merge_resolving(merge, conflict_error, all_side, choices):
+    """Runs merge(resolutions) with `choices`; if all_side is set, settles
+    every conflict reported in its favour and runs it again. Re-raises a
+    conflict that is still unresolved.
+    """
+    resolutions = dict(choices)
+    while True:
+        try:
+            return merge(resolutions)
+        except conflict_error as e:
+            pending = [p for p in e.conflicting_positions if p not in resolutions]
+            if all_side is None or not pending:
+                raise
+            resolutions.update({p: all_side for p in pending})
+
+
+def _print_merge_conflict(e) -> None:
+    positions = e.conflicting_positions
+    preview = ", ".join(str(p) for p in positions[:20]) + (" ..." if len(positions) > 20 else "")
+    print("MUTATION CONFLICT -- merge refused, nothing was committed.")
+    print(f"  {len(positions)} chunk position(s) were changed differently on both branches: {preview}")
+    print("  Choose a side and merge again: add 'a' or 'b' to take every conflict from that branch,")
+    print("  or list positions, e.g. '3:a,7:b'. 'a' is the first generation you named, 'b' the second.")
 
 
 def _split_args(arg: str):
@@ -1408,20 +1455,28 @@ new -- see the 'new' count.)"""
         print(f"  {meta['original_size']:,} bytes total")
 
     def do_merge(self, arg):
-        """merge <label> <generation_a> <generation_b>  -- reconcile two divergent branches of one label
+        """merge <label> <generation_a> <generation_b> [a|b|<position>:<a|b>,...]  -- reconcile two divergent branches of one label
 
 Example:
   merge my_report 3 5
+  merge my_report 3 5 a          (every conflict: keep generation 3's chunk)
+  merge my_report 3 5 12:a,40:b  (choose per conflicting position)
 (3-way diff of chunk positions against the common ancestor: a chunk
 changed by one branch, or the same way by both, merges; a chunk changed
-differently by both is a conflict and nothing is committed)"""
+differently by both is a conflict. An unresolved conflict refuses the
+merge and nothing is committed.)"""
         parts = _split_args(arg)
         if parts is None:
             return
-        if len(parts) != 3:
-            print("Usage: merge <label> <generation_a> <generation_b>")
+        if len(parts) not in (3, 4):
+            print(MERGE_USAGE)
             return
-        label, gen_a_str, gen_b_str = parts
+        choice = _parse_merge_choice(parts[3]) if len(parts) == 4 else (None, {})
+        if choice is None:
+            print(MERGE_USAGE)
+            return
+        all_side, choices = choice
+        label, gen_a_str, gen_b_str = parts[:3]
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1434,13 +1489,11 @@ differently by both is a conflict and nothing is committed)"""
             return
 
         try:
-            manifest_path = self._session.merge_branches(label, generation_a, generation_b)
+            manifest_path = _merge_resolving(
+                lambda r: self._session.merge_branches(label, generation_a, generation_b, r),
+                MutationConflictError, all_side, choices)
         except MutationConflictError as e:
-            print(f"MUTATION CONFLICT -- merge refused, nothing was committed.")
-            print(f"  {e}")
-            print(f"  Both branches changed the same chunk position(s) differently since their "
-                  f"common ancestor -- pick manually (write a fresh version by hand, or 'checkout' "
-                  f"whichever branch you want to keep and go from there).")
+            _print_merge_conflict(e)
             return
         except Exception as e:
             print(f"Merge failed: {type(e).__name__}: {e}")
@@ -2094,20 +2147,27 @@ either source is tagged 'no_graft_source'.)"""
               f"rest already existed from '{label_a}' and '{label_b}')")
 
     def do_merge(self, arg):
-        """merge <label> <generation_a> <generation_b>  -- reconcile two divergent branches (C++ engine)
+        """merge <label> <generation_a> <generation_b> [a|b|<position>:<a|b>,...]  -- reconcile two divergent branches (C++ engine)
 
 Example:
   merge my_report 3 5
+  merge my_report 3 5 b          (every conflict: keep generation 5's chunk)
+  merge my_report 3 5 12:a,40:b  (choose per conflicting position)
 (3-way diff of chunk positions against the common ancestor; a chunk
-changed differently by both branches is a conflict and nothing is
-committed)"""
+changed differently by both branches is a conflict. An unresolved
+conflict refuses the merge and nothing is committed.)"""
         parts = _split_args(arg)
         if parts is None:
             return
-        if len(parts) != 3:
-            print("Usage: merge <label> <generation_a> <generation_b>")
+        if len(parts) not in (3, 4):
+            print(MERGE_USAGE)
             return
-        label, gen_a_str, gen_b_str = parts
+        choice = _parse_merge_choice(parts[3]) if len(parts) == 4 else (None, {})
+        if choice is None:
+            print(MERGE_USAGE)
+            return
+        all_side, choices = choice
+        label, gen_a_str, gen_b_str = parts[:3]
         try:
             generation_a, generation_b = int(gen_a_str), int(gen_b_str)
         except ValueError:
@@ -2116,9 +2176,14 @@ committed)"""
         if not self._require_reauth(f"merge '{label}' generations {generation_a} and {generation_b}"):
             return
         try:
-            manifest = self._session.merge_branches(label, generation_a, generation_b)
+            manifest = _merge_resolving(
+                lambda r: self._session.merge_branches(label, generation_a, generation_b, r),
+                PfsMergeConflictError, all_side, choices)
+        except PfsMergeConflictError as e:
+            _print_merge_conflict(e)
+            return
         except PfsEngineError as e:
-            print(f"MUTATION CONFLICT or merge failure -- nothing was committed.\n  {e}")
+            print(f"Merge failed -- nothing was committed.\n  {e}")
             return
         self._clades.changed(label)
         print(f"Merged '{label}' generations {generation_a} + {generation_b} -> {manifest}")

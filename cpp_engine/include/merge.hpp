@@ -4,10 +4,13 @@
 //
 // Finds the lowest common ancestor along primary parents, then a 3-way
 // diff of chunk positions against it: changed by one branch (or the same
-// way by both) merges; changed differently by both throws
-// MutationConflictError and commits nothing. The result's primary parent is
-// generation_a, with generation_b as a lateral parent.
+// way by both) merges; changed differently by both is a conflict. A
+// resolution ('a' or 'b' for a position) settles a conflict by taking that
+// branch's chunk, or its end if that branch ends there; an unresolved
+// conflict throws MutationConflictError and commits nothing. The result's
+// primary parent is generation_a, with generation_b as a lateral parent.
 #include <cstdint>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -46,10 +49,14 @@ struct MergeResult {
     uint64_t duplicate_chunks_found = 0;
 };
 
+// position -> 'a' or 'b'
+using MergeResolutions = std::map<uint64_t, char>;
+
 // Throws std::invalid_argument for invalid requests (unknown, pruned or
-// identical generations, no common ancestor, linear history) and
-// MutationConflictError for a real conflict.
+// identical generations, no common ancestor, linear history, a resolution
+// other than 'a'/'b') and MutationConflictError for an unresolved conflict.
 MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage,
-                            const std::string& label, uint64_t generation_a, uint64_t generation_b);
+                            const std::string& label, uint64_t generation_a, uint64_t generation_b,
+                            const MergeResolutions& resolutions = {});
 
 }  // namespace pfs_engine

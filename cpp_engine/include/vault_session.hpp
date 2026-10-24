@@ -53,7 +53,8 @@ public:
 
     // merge_branches() (merge.hpp) plus the catalog update on success.
     // Throws MutationConflictError on a conflict, committing nothing.
-    MergeResult merge(const std::string& label, uint64_t generation_a, uint64_t generation_b);
+    MergeResult merge(const std::string& label, uint64_t generation_a, uint64_t generation_b,
+                      const MergeResolutions& resolutions = {});
 
     // Vacuums with the live-manifest set from this session's catalog and lineage.
     VacuumReport vacuum();

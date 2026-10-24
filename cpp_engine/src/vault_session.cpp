@@ -57,8 +57,9 @@ std::string VaultSession::commit_write(const std::string& label, const std::stri
     return write_result.manifest_path;
 }
 
-MergeResult VaultSession::merge(const std::string& label, uint64_t generation_a, uint64_t generation_b) {
-    MergeResult result = merge_branches(pipeline, lineage, label, generation_a, generation_b);
+MergeResult VaultSession::merge(const std::string& label, uint64_t generation_a, uint64_t generation_b,
+                                const MergeResolutions& resolutions) {
+    MergeResult result = merge_branches(pipeline, lineage, label, generation_a, generation_b, resolutions);
     std::string manifest_filename = result.manifest_path.substr(result.manifest_path.find_last_of('/') + 1);
     catalog.set(label, manifest_filename);
     return result;

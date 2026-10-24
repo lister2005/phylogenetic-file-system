@@ -7,6 +7,7 @@ the catalog and lineage together. Prompts are passed in as callbacks.
 import os
 import pickle
 import hashlib
+from typing import Dict, Optional
 from cryptography.exceptions import InvalidTag
 from gearhash.master_key_store import create_new_vault_key, load_vault_key, WrongPassphraseError, MASTER_KEY_FILENAME
 from gearhash.pipeline import (StoragePipeline, MANIFEST_SUFFIX, TRAITS_SUFFIX,
@@ -423,16 +424,24 @@ class VaultSession:
             )
         return self._manifest_chunk_list(node.manifest_filename)
 
-    def merge_branches(self, label: str, generation_a: int, generation_b: int) -> str:
+    def merge_branches(self, label: str, generation_a: int, generation_b: int,
+                       resolutions: Optional[Dict[int, str]] = None) -> str:
         """Merges two branches of `label` by a 3-way diff of chunk positions
         against their lowest common ancestor.
 
         Per position: unchanged or changed identically -> kept; changed by one
-        branch -> that branch's; changed differently by both ->
-        MutationConflictError, nothing committed. The result is committed as an
-        ordinary write with generation_a as primary parent and generation_b as
-        lateral parent. Returns the new manifest path.
+        branch -> that branch's; changed differently by both -> a conflict.
+        `resolutions` ({position: "a" or "b"}) settles conflicts by taking that
+        branch's chunk (or its end, if that branch ends there). Any conflict
+        left unresolved raises MutationConflictError and nothing is committed.
+        The result is committed as an ordinary write with generation_a as
+        primary parent and generation_b as lateral parent. Returns the new
+        manifest path.
         """
+        resolutions = resolutions or {}
+        bad = [side for side in resolutions.values() if side not in ("a", "b")]
+        if bad:
+            raise ValueError(f"A resolution must be 'a' or 'b', not {bad[0]!r}.")
         if label not in self.catalog:
             raise KeyError(f"No such label: '{label}'")
 
@@ -485,6 +494,8 @@ class VaultSession:
                 winner = b
             elif a == b:
                 winner = a  # both changed the same way (including both truncating)
+            elif i in resolutions:
+                winner = a if resolutions[i] == "a" else b
             else:
                 # Changed differently by both, including truncation vs. edit.
                 conflicts.append(i)
