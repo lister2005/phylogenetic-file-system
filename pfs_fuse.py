@@ -81,6 +81,9 @@ class PFSFuse(Operations):
         self._catalog_epoch = 0
         self._clade_view = None
         self._clade_view_key = None
+        # Other processes may change the vault: check at most this often.
+        self._last_refresh = 0.0
+        self.session.add_change_listener(self._on_external_change)
 
     # ---------- setup ----------
 
@@ -116,6 +119,27 @@ class PFSFuse(Operations):
     def _catalog_changed(self) -> None:
         with self._lock:
             self._catalog_epoch += 1
+
+    REFRESH_INTERVAL_SECONDS = 0.5
+
+    def _refresh(self) -> None:
+        """Picks up changes other processes made to the vault (throttled)."""
+        now = time.monotonic()
+        if now - self._last_refresh < self.REFRESH_INTERVAL_SECONDS:
+            return
+        self._last_refresh = now
+        with self._lock:  # same lock order as every write: self._lock, then the vault's
+            if self.session.refresh():
+                self._catalog_epoch += 1
+
+    def _on_external_change(self, changed, removed) -> None:
+        # Runs under the vault's write lock: only queue events, take no other lock.
+        if self._clades is None:
+            return
+        for label in removed:
+            self._clades.removed(label)
+        for label in changed:
+            self._clades.changed(label)
 
     def _get_clades(self):
         """(clade_to_labels, label_to_clade) from the worker's latest snapshot,
@@ -165,6 +189,7 @@ class PFSFuse(Operations):
     # ---------- directory / metadata ----------
 
     def getattr(self, path, fh=None):
+        self._refresh()
         now = time.time()
         resolved = self._resolve(path)
         if resolved is None:
@@ -195,6 +220,7 @@ class PFSFuse(Operations):
                     st_ctime=mtime, st_mtime=mtime, st_atime=mtime)
 
     def readdir(self, path, fh):
+        self._refresh()
         resolved = self._resolve(path)
         if resolved is None:
             raise FuseOSError(errno.ENOENT)
@@ -253,6 +279,7 @@ class PFSFuse(Operations):
         return handle["reader"].size
 
     def open(self, path, flags):
+        self._refresh()
         resolved = self._resolve(path)
         if resolved is None or resolved[0] != "file":
             raise FuseOSError(errno.ENOENT)
@@ -432,13 +459,16 @@ class PFSFuse(Operations):
             raise FuseOSError(errno.EINVAL)
         new_label = new_parts[-1]
 
-        with self._lock:
+        if new_label == old_label:
+            return
+        with self._lock, self.session.write_lock():  # replace + rename as one change
             if new_label in self.session.catalog and new_label != old_label:
                 # Replacing an existing destination goes through delete_label too.
                 self.session.delete_label(new_label)
-            self.session.catalog[new_label] = self.session.catalog.pop(old_label)
-            self.session.lineage.rename_label(old_label, new_label)
-            self.session.save_catalog()
+            try:
+                self.session.rename_label(old_label, new_label)
+            except KeyError:  # another program removed it meanwhile
+                raise FuseOSError(errno.ENOENT)
         self._catalog_changed()
         self._clades.renamed(old_label, new_label)
 

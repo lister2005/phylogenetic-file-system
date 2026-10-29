@@ -22,6 +22,9 @@ STORAGE_READ_AHEAD = 8 * 1024 * 1024
 # redundant copy in a separate mirror container when it crosses the
 # threshold, so one bad sector can't take out every file sharing it.
 MIRROR_REF_THRESHOLD = 3
+# Per-vault settings (encrypted). "mirror_all": every chunk gets a mirror copy,
+# not only chunks shared by MIRROR_REF_THRESHOLD manifests.
+SETTINGS_FILENAME = "settings.enc"
 
 MIRROR_CONTAINER_FILENAME = "data_container_mirror.bin"
 
@@ -142,6 +145,56 @@ class StoragePipeline:
 
         # crypto.key is the KEK: it wraps DEKs and never encrypts content.
         self.keyring = KeyRing(self.storage_root, self.crypto.key)
+        self.settings = self.load_settings()
+
+    def load_settings(self) -> dict:
+        path = os.path.join(self.storage_root, SETTINGS_FILENAME)
+        if not os.path.exists(path):
+            return {"mirror_all": False}
+        with open(path, "rb") as f:
+            return pickle.loads(self.crypto.decrypt_block(f.read(), associated_data=b"settings"))
+
+    def save_settings(self) -> None:
+        path = os.path.join(self.storage_root, SETTINGS_FILENAME)
+        _atomic_write(path, self.crypto.encrypt_block(pickle.dumps(self.settings), associated_data=b"settings"))
+
+    def mirror_existing_chunks(self) -> int:
+        """Gives every live chunk without a mirror one (for mirror_all).
+        Returns how many were mirrored.
+        """
+        if not os.path.exists(self.container_path):
+            return 0
+        global_index = GlobalBlockIndex(self.storage_root, self.crypto)
+        added = 0
+        try:
+            todo = [(h, off, length) for h, off, length, rc, _ep in global_index.iter_all()
+                    if rc > 0 and global_index.get_mirror(h) is None]
+            if not todo:
+                return 0
+            if os.path.exists(self.mirror_container_path):
+                set_immutable(self.mirror_container_path, False)
+            mirror_offset = os.path.getsize(self.mirror_container_path) \
+                if os.path.exists(self.mirror_container_path) else 0
+            global_index.begin()
+            try:
+                with open(self.container_path, "rb") as src, open(self.mirror_container_path, "ab") as dst:
+                    for content_hash, offset, length in todo:
+                        src.seek(offset)
+                        data = src.read(length)
+                        dst.write(data)
+                        global_index.set_mirror(content_hash, mirror_offset, len(data))
+                        mirror_offset += len(data)
+                        added += 1
+                    dst.flush()
+                    os.fsync(dst.fileno())
+            except Exception:
+                global_index.rollback()
+                raise
+            global_index.commit()
+            set_immutable(self.mirror_container_path, True)
+        finally:
+            global_index.close()
+        return added
 
     def rotate_keys(self) -> int:
         """Starts a new epoch with a fresh DEK for future writes; existing data
@@ -212,6 +265,14 @@ class StoragePipeline:
                 # hash repeated within a window collapses into one final row. Same final
                 # state as chunk-at-a-time, with memory bounded by the window size.
                 window = []  # (content_hash, chunk_data), in order
+                mirror_all = bool(self.settings.get("mirror_all"))
+
+                def open_mirror_writer():
+                    if os.path.exists(self.mirror_container_path):
+                        set_immutable(self.mirror_container_path, False)
+                    offset = os.path.getsize(self.mirror_container_path) \
+                        if os.path.exists(self.mirror_container_path) else 0
+                    return open(self.mirror_container_path, "ab"), offset
 
                 def flush_window():
                     nonlocal current_offset, mirror_offset, primary_reader, mirror_writer
@@ -245,19 +306,25 @@ class StoragePipeline:
                             current_offset += len(encrypted_chunk)
                             new_chunks_written += 1
                             ref_count_before = None  # ref_count 1 can't equal the threshold on arrival
+                            if mirror_all:
+                                if mirror_writer is None:
+                                    mirror_writer, mirror_offset = open_mirror_writer()
+                                mirror_writer.write(encrypted_chunk)
+                                global_index.set_mirror(content_hash, mirror_offset, len(encrypted_chunk))
+                                mirror_offset += len(encrypted_chunk)
+                                continue
 
-                        # Crossing the threshold: copy the ciphertext as-is into the mirror container.
-                        if ref_count_before is not None and ref_count_before + 1 == MIRROR_REF_THRESHOLD \
+                        # Crossing the threshold (or any unmirrored chunk with mirror_all):
+                        # copy the ciphertext as-is into the mirror container.
+                        if ref_count_before is not None \
+                                and (mirror_all or ref_count_before + 1 == MIRROR_REF_THRESHOLD) \
                                 and global_index.get_mirror(content_hash) is None:
                             m_offset, m_length, _rc, _ep = entry
+                            container.flush()  # it may have been written moments ago through our buffered handle
                             if primary_reader is None:
                                 primary_reader = open(self.container_path, "rb")
                             if mirror_writer is None:
-                                if os.path.exists(self.mirror_container_path):
-                                    set_immutable(self.mirror_container_path, False)
-                                mirror_writer = open(self.mirror_container_path, "ab")
-                                mirror_offset = os.path.getsize(self.mirror_container_path) \
-                                    if os.path.exists(self.mirror_container_path) else 0
+                                mirror_writer, mirror_offset = open_mirror_writer()
                             primary_reader.seek(m_offset)
                             mirrored_bytes = primary_reader.read(m_length)
                             mirror_writer.write(mirrored_bytes)
@@ -512,6 +579,12 @@ class StoragePipeline:
                     live_entries.append((content_hash, offset, length, ref_count, epoch_id))
                 else:
                     dead_hashes.append(content_hash)
+
+            if not os.path.exists(self.container_path) and not live_entries and not dead_hashes:
+                # Nothing has ever been stored: nothing to reclaim.
+                return {"old_size": 0, "new_size": 0, "bytes_reclaimed": 0, "live_chunks": 0,
+                        "mirror_old_size": 0, "mirror_new_size": 0, "mirror_bytes_reclaimed": 0,
+                        "live_mirrors": 0}
 
             with open(self.container_path, "rb") as src, open(tmp_container_path, "wb") as dst:
                 new_offset = 0

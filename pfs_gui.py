@@ -18,6 +18,7 @@ import math
 import tempfile
 import time
 import difflib
+import html
 import shlex
 from datetime import datetime
 
@@ -161,6 +162,13 @@ LATERAL_EDGE_REST_LENGTH = 200.0
 
 # Under $HOME, not /tmp: confined Snap apps get a private /tmp and
 # couldn't open files placed there.
+# Time Machine preview: shown this long after the slider stops; text files
+# up to this size show their first lines.
+TIME_PREVIEW_DELAY_MS = 400
+TIME_PREVIEW_MAX_BYTES = 5 * 1024 * 1024
+TIME_PREVIEW_LINES = 12
+TIME_PREVIEW_LINE_CHARS = 120
+
 # How long the Clade Tree view waits for the background tree before
 # building it itself.
 CLADE_TREE_WAIT_SECONDS = 5.0
@@ -1279,6 +1287,15 @@ class VaultGraphWindow(QMainWindow):
         self._clade_poll_timer = QTimer(self)
         self._clade_poll_timer.timeout.connect(self._poll_clade_updates)
         self._clade_poll_timer.start(700)
+        # Another program (the shell, a mounted folder) may change the vault too.
+        self._vault_refresh_timer = QTimer(self)
+        self._vault_refresh_timer.timeout.connect(self._poll_vault_changes)
+        self._vault_refresh_timer.start(2000)
+        # The Time Machine previews the selected file once the slider settles.
+        self._time_preview_timer = QTimer(self)
+        self._time_preview_timer.setSingleShot(True)
+        self._time_preview_timer.timeout.connect(self._preview_selection_at_cutoff)
+        self._time_preview_cache = {}  # (label, generation) -> (size, type, preview lines or None)
 
         self._rebuild()
         self._maybe_show_tour()
@@ -1764,6 +1781,7 @@ class VaultGraphWindow(QMainWindow):
             self._saved_positions[self._scene_mode] = {
                 key: (node.pos().x(), node.pos().y()) for key, node in self._node_items.items()}
         self.scene.clear()
+        getattr(self, "_time_preview_cache", {}).clear()  # versions may have been pruned meanwhile
         self._node_items = {}
         self._edge_items = []
         self._clade_blob_items = []
@@ -2314,7 +2332,18 @@ class VaultGraphWindow(QMainWindow):
 
     def closeEvent(self, event):
         self._clade_poll_timer.stop()
+        self._vault_refresh_timer.stop()
         super().closeEvent(event)
+
+    def _poll_vault_changes(self):
+        try:
+            changed = self.engine.refresh()
+        except Exception as e:  # e.g. the write lock timed out; try again next tick
+            self.status.showMessage(f"Couldn't check the vault for outside changes: {e}", 5000)
+            return
+        if changed:
+            self._rebuild()
+            self._toast("Updated with changes made by another program")
 
     def _poll_clade_updates(self):
         if self._mode != "web" or not self.clade_action.isChecked():
@@ -2370,6 +2399,66 @@ class VaultGraphWindow(QMainWindow):
 
         label = "now" if value >= 1000 else datetime.fromtimestamp(cutoff).strftime("%Y-%m-%d %H:%M:%S")
         self.time_label.setText(label)
+        if self._mode == "web":
+            if value >= 1000:
+                self._time_preview_timer.stop()
+                self._on_selection_changed()  # back to the file as it is now
+            else:
+                self._time_preview_timer.start(TIME_PREVIEW_DELAY_MS)
+
+    def _preview_selection_at_cutoff(self):
+        """Details panel: the selected file as it was at the slider's moment,
+        with the first lines of its content if it is text."""
+        selected = self.scene.selectedItems()
+        if self._mode != "web" or len(selected) != 1 or self._time_cutoff is None:
+            return
+        label = selected[0].data(0)
+        when = datetime.fromtimestamp(self._time_cutoff).strftime("%Y-%m-%d %H:%M:%S")
+        node = self._historical_generation_for(label, self._time_cutoff)
+        if node is None:
+            self._render_cards(f"{label} \u00b7 as of {when}", [
+                {"heading": "Time Machine", "rows": [], "note": "This file didn't exist yet at that moment."}])
+            return
+        key = (label, node.generation_index)
+        if key not in self._time_preview_cache:
+            self._time_preview_cache[key] = self._generation_preview(label, node)
+        size, type_name, lines = self._time_preview_cache[key]
+        rows = [("Generation", node.generation_index),
+                ("Saved", datetime.fromtimestamp(node.birth_timestamp).strftime("%Y-%m-%d %H:%M:%S")),
+                ("Size", f"{size:,} bytes" if size is not None else "unavailable (pruned)"),
+                ("Type", type_name)]
+        cards = [{"heading": f"As of {when}", "rows": rows}]
+        if lines:
+            preview = "<br>".join(html.escape(line) or "&nbsp;" for line in lines)
+            cards.append({"heading": "Beginning of the file then", "rows": [],
+                          "note": f'<span style="font-family: monospace;">{preview}</span>'})
+        cards.append({"heading": "Open it", "rows": [],
+                      "note": "In the Tree view, right-click this generation and choose View this version."})
+        self._render_cards(f"{label} \u00b7 as of {when}", cards)
+
+    def _generation_preview(self, label, node):
+        """(size, type name, first lines if text) for one generation, or
+        (None, '?', None) if it was pruned. Big files aren't decrypted."""
+        if node.pruned:
+            return None, "?", None
+        os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix="pfs_timepreview_", dir=EDIT_CACHE_DIR)
+        os.close(fd)
+        try:
+            self.engine.checkout(label, node.generation_index, tmp_path)
+            size = os.path.getsize(tmp_path)
+            type_name = detect_from_file(tmp_path).name
+            lines = None
+            if _is_inapp_text_phenotype(type_name) and size <= TIME_PREVIEW_MAX_BYTES:
+                with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = [f.readline().rstrip("\n")[:TIME_PREVIEW_LINE_CHARS] for _ in range(TIME_PREVIEW_LINES)]
+                while lines and not lines[-1]:
+                    lines.pop()
+            return size, type_name, lines
+        except Exception:
+            return None, "?", None
+        finally:
+            os.remove(tmp_path)
 
     def _historical_generation_for(self, label, cutoff):
         """The generation that was label's tip at `cutoff`, or None."""

@@ -6,20 +6,23 @@ the catalog and lineage together. Prompts are passed in as callbacks.
 
 import os
 import pickle
+import functools
 import hashlib
-from typing import Dict, Optional
+from contextlib import contextmanager
+from typing import Callable, Dict, List, Optional
 from cryptography.exceptions import InvalidTag
-from gearhash.master_key_store import create_new_vault_key, load_vault_key, WrongPassphraseError, MASTER_KEY_FILENAME
-from gearhash.pipeline import (StoragePipeline, MANIFEST_SUFFIX, TRAITS_SUFFIX,
+from gearhash.master_key_store import (create_new_vault_key, load_vault_key, change_passphrase,
+                                       WrongPassphraseError, MASTER_KEY_FILENAME)
+from gearhash.pipeline import (StoragePipeline, MANIFEST_SUFFIX, TRAITS_SUFFIX, SETTINGS_FILENAME,
                                read_similarity_fingerprint, similarity_fingerprint_count)
 from gearhash.crypto import CryptoEngine
 from gearhash.dedup_index import DB_FILENAME, GlobalBlockIndex
-from gearhash.keyring import KEYRING_FILENAME
+from gearhash.keyring import KeyRing, KEYRING_FILENAME
 from gearhash.fks_index import FKSLookupEngine
 from lineage import LineageStore, LINEAGE_FILENAME
 from reconstruct import reconstruct
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
-from vault_lock import VaultLock, VaultLockError
+from vault_lock import VaultBusyError, VaultLock, VaultLockError
 
 CATALOG_FILENAME = "catalog.enc"
 HISTORY_FILENAME = "history.enc"
@@ -45,7 +48,26 @@ class MutationConflictError(Exception):
         )
 
 
+def _changes_vault(method):
+    """Runs a VaultSession method under the vault's write lock, after
+    reloading whatever other processes changed (vault_lock.py)."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._changing():
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
+# Files whose change on disk means another process changed the vault.
+_SHARED_STATE_FILES = (CATALOG_FILENAME, LINEAGE_FILENAME, KEYRING_FILENAME, SETTINGS_FILENAME)
+
+
 class VaultSession:
+    """One process's view of a vault. Several processes may have a vault open:
+    every change runs under the write lock and first reloads what others
+    changed; refresh() picks up others' changes between operations.
+    """
+
     def __init__(self, storage_root: str):
         self.storage_root = storage_root
         os.makedirs(storage_root, exist_ok=True)
@@ -55,6 +77,8 @@ class VaultSession:
         self.lineage = None
         # Taken in unlock_or_create, released in close().
         self._lock = None
+        self._seen_state = None
+        self._change_listeners: List[Callable[[set, set], None]] = []
 
     def unlock_or_create(self, get_new_passphrase, get_existing_passphrase, confirm_reset) -> None:
         """Takes the vault lock first (vault_lock.py), then unlocks or creates.
@@ -70,7 +94,9 @@ class VaultSession:
         except VaultLockError as e:
             raise VaultUnlockError(str(e))
         try:
-            self._unlock_or_create_locked(get_new_passphrase, get_existing_passphrase, confirm_reset)
+            with self._lock.write():
+                self._unlock_or_create_locked(get_new_passphrase, get_existing_passphrase, confirm_reset)
+                self._seen_state = self._state_signature()
         except Exception:
             # Never opened: release the lock so this process can retry.
             self._lock.release()
@@ -84,7 +110,7 @@ class VaultSession:
             if pw1 != pw2:
                 raise VaultUnlockError("Passphrases didn't match.")
             kek = create_new_vault_key(self.storage_root, pw1)
-            self._wipe_stale_vault_files()
+            self._wipe_stale_vault_files_exclusively()
         else:
             pw = get_existing_passphrase()
             try:
@@ -101,7 +127,7 @@ class VaultSession:
                 raise VaultUnlockError(
                     "The vault's other files don't decrypt under this key, and reset wasn't confirmed."
                 )
-            self._wipe_stale_vault_files()
+            self._wipe_stale_vault_files_exclusively()
             self.pipeline = StoragePipeline(self.storage_root, crypto_engine=self.crypto)
 
         self._load_catalog()
@@ -124,6 +150,81 @@ class VaultSession:
             self.close()
         except Exception:
             pass
+
+    def _wipe_stale_vault_files_exclusively(self) -> list:
+        try:
+            with self._lock.exclusive():
+                return self._wipe_stale_vault_files()
+        except VaultBusyError as e:
+            raise VaultUnlockError(str(e))
+
+    # ---------- sharing a vault between processes ----------
+
+    def _state_signature(self):
+        sig = []
+        for name in _SHARED_STATE_FILES:
+            try:
+                st = os.stat(os.path.join(self.storage_root, name))
+                sig.append((st.st_mtime_ns, st.st_size, st.st_ino))
+            except FileNotFoundError:
+                sig.append(None)
+        return tuple(sig)
+
+    def add_change_listener(self, listener: Callable[[set, set], None]) -> None:
+        """listener(changed_labels, removed_labels) runs after a reload that
+        picked up another process's changes."""
+        self._change_listeners.append(listener)
+
+    def refresh(self) -> bool:
+        """Reloads catalog, history and keys if another process changed them.
+        True if anything was reloaded. Cheap when nothing changed (three stats).
+        """
+        if self._lock is None or self._state_signature() == self._seen_state:
+            return False
+        with self._lock.write():
+            return self._reload_if_changed()
+
+    def _reload_if_changed(self) -> bool:
+        """Under the write lock, so no file is read half-written."""
+        state = self._state_signature()
+        if state == self._seen_state:
+            return False
+        before = dict(self.catalog)
+        self._load_catalog()
+        self.lineage._load()
+        self.pipeline.keyring = KeyRing(self.storage_root, self.crypto.key)
+        self.pipeline.settings = self.pipeline.load_settings()
+        self._seen_state = state
+        removed = set(before) - set(self.catalog)
+        changed = {label for label, m in self.catalog.items() if before.get(label) != m}
+        if changed or removed:
+            for listener in list(self._change_listeners):
+                listener(changed, removed)
+        return True
+
+    @contextmanager
+    def _changing(self):
+        with self._lock.write():
+            self._reload_if_changed()
+            try:
+                yield
+            finally:
+                self._seen_state = self._state_signature()
+
+    def write_lock(self):
+        """The vault's write lock, for a change made outside these methods."""
+        return self._lock.write()
+
+    @contextmanager
+    def sole_use(self):
+        """For whole-vault rewrites: raises VaultBusyError if another process
+        has the vault open."""
+        with self._lock.exclusive():
+            self._reload_if_changed()
+            try:
+                yield
+            finally:
+                self._seen_state = self._state_signature()
 
     def _wipe_stale_vault_files(self) -> list:
         """Removes files a lost previous key encrypted (after creating a new key
@@ -155,9 +256,12 @@ class VaultSession:
             with open(path, "rb") as f:
                 encrypted = f.read()
             raw = self.crypto.decrypt_block(encrypted, associated_data=b"catalog")
-            self.catalog = pickle.loads(raw)
+            loaded = pickle.loads(raw)
         else:
-            self.catalog = {}
+            loaded = {}
+        # In place: front ends hold a reference to this dict.
+        self.catalog.clear()
+        self.catalog.update(loaded)
 
     def save_catalog(self) -> None:
         path = os.path.join(self.storage_root, CATALOG_FILENAME)
@@ -187,6 +291,7 @@ class VaultSession:
     def manifest_path_for(self, label: str) -> str:
         return os.path.join(self.storage_root, self.catalog[label])
 
+    @_changes_vault
     def commit_write(self, label: str, source_path: str, similarity_fingerprint=None,
                       lateral_parent_labels=None, fork_from_generation=None) -> str:
         """Stores a file as `label`: writes it, records a lineage generation and
@@ -235,6 +340,7 @@ class VaultSession:
         self.save_catalog()
         return manifest_path
 
+    @_changes_vault
     def lateral_gene_transfer(self, label_a: str, label_b: str, new_label: str) -> str:
         """Grafts two labels into new_label: label_a's content followed by
         label_b's, with both current tips recorded as parents. Content-agnostic;
@@ -285,6 +391,7 @@ class VaultSession:
             count += sum(1 for node in self.lineage.get_history(label) if node.manifest_filename == manifest_filename)
         return count
 
+    @_changes_vault
     def delete_label(self, label: str, force: bool = False) -> dict:
         """Removes a label: its catalog entry and its whole history. A manifest
         is deleted only once nothing else references it.
@@ -333,19 +440,68 @@ class VaultSession:
             )
         return names
 
+    def rename_label(self, old_label: str, new_label: str) -> None:
+        with self._changing():
+            if old_label not in self.catalog:
+                raise KeyError(f"No such label: '{old_label}'")
+            if new_label in self.catalog:
+                raise ValueError(f"'{new_label}' already exists")
+            self.catalog[new_label] = self.catalog.pop(old_label)
+            self.lineage.rename_label(old_label, new_label)
+            self.save_catalog()
+
+    def set_tag(self, label: str, key: str, value) -> None:
+        with self._changing():
+            self.lineage.set_tag(label, key, value)
+
+    def remove_tag(self, label: str, key: str) -> bool:
+        with self._changing():
+            return self.lineage.remove_tag(label, key)
+
+    def rotate_keys(self) -> int:
+        with self._changing():
+            return self.pipeline.rotate_keys()
+
+    def change_passphrase(self, old_passphrase: str, new_passphrase: str) -> None:
+        """Re-wraps the same key; other processes' sessions are unaffected."""
+        with self._changing():
+            change_passphrase(self.storage_root, old_passphrase, new_passphrase)
+
+    @property
+    def mirror_all(self) -> bool:
+        return bool(self.pipeline.settings.get("mirror_all"))
+
+    def set_mirror_all(self, enabled: bool) -> int:
+        """Spare copies for every chunk (True) or only chunks shared by 3+
+        manifests (False, the default). Turning it on mirrors existing chunks
+        now; returns how many. Turning it off keeps the spares already made.
+        """
+        with self._changing():
+            self.pipeline.settings["mirror_all"] = bool(enabled)
+            self.pipeline.save_settings()
+            return self.pipeline.mirror_existing_chunks() if enabled else 0
+
+    def fsck(self) -> dict:
+        """Verifies every chunk and repairs from mirrors; needs the vault to itself."""
+        with self.sole_use():
+            return self.pipeline.verify_and_repair()
+
     def vacuum(self) -> dict:
         """Repairs chunk ref counts from the catalog and lineage, then reclaims
-        unreferenced space.
+        unreferenced space. Needs the vault to itself (VaultBusyError if
+        another process has it open): it rewrites the container.
         """
-        live = self._live_manifest_filenames()
-        repair_report = self.pipeline.rebuild_ref_counts(live)
-        orphan_report = self.pipeline.sweep_orphaned_manifests(live)
-        vacuum_report = self.pipeline.vacuum()
+        with self.sole_use():
+            live = self._live_manifest_filenames()
+            repair_report = self.pipeline.rebuild_ref_counts(live)
+            orphan_report = self.pipeline.sweep_orphaned_manifests(live)
+            vacuum_report = self.pipeline.vacuum()
         vacuum_report["chunks_corrected"] = repair_report["chunks_corrected"]
         vacuum_report["orphaned_manifests_removed"] = orphan_report["removed"]
         vacuum_report["orphaned_tmp_files_removed"] = orphan_report["tmp_removed"]
         return vacuum_report
 
+    @_changes_vault
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> dict:
         """Frees one past generation's storage, keeping the label and its other
         generations. Refuses the current tip, and a "protected" generation
@@ -424,6 +580,7 @@ class VaultSession:
             )
         return self._manifest_chunk_list(node.manifest_filename)
 
+    @_changes_vault
     def merge_branches(self, label: str, generation_a: int, generation_b: int,
                        resolutions: Optional[Dict[int, str]] = None) -> str:
         """Merges two branches of `label` by a 3-way diff of chunk positions

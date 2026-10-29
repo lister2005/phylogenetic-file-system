@@ -91,6 +91,17 @@ class PythonEngineAdapter(_CladeTracking):
 
     def __init__(self, session):
         self._session = session
+        session.add_change_listener(self._on_external_change)
+
+    def _on_external_change(self, changed, removed) -> None:
+        for label in removed:
+            self._clade_event("removed", label)
+        for label in changed:
+            self._clade_event("changed", label)
+
+    def refresh(self) -> bool:
+        """Picks up other programs' changes to the vault; True if any."""
+        return self._session.refresh()
 
     @property
     def storage_root(self) -> str:
@@ -159,10 +170,10 @@ class PythonEngineAdapter(_CladeTracking):
         return self._session.lineage.get_tags(label)
 
     def set_tag(self, label: str, key: str, value) -> None:
-        self._session.lineage.set_tag(label, key, value)
+        self._session.set_tag(label, key, value)
 
     def remove_tag(self, label: str, key: str) -> None:
-        self._session.lineage.remove_tag(label, key)
+        self._session.remove_tag(label, key)
 
     def commit_write(self, label: str, path: str, fork_from_generation=None) -> None:
         # Fingerprinted synchronously, like the C++ engine's write path.
@@ -180,9 +191,7 @@ class PythonEngineAdapter(_CladeTracking):
         return report
 
     def rename_label(self, old_label: str, new_label: str) -> None:
-        self._session.catalog[new_label] = self._session.catalog.pop(old_label)
-        self._session.lineage.rename_label(old_label, new_label)
-        self._session.save_catalog()
+        self._session.rename_label(old_label, new_label)
         self._clade_event("renamed", old_label, new_label)
 
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
@@ -232,6 +241,10 @@ class CppEngineAdapter(_CladeTracking):
 
     def __init__(self, session):
         self._session = session
+
+    def refresh(self) -> bool:
+        """A C++-engine vault is held by one process, so nothing changes underneath."""
+        return False
 
     @property
     def storage_root(self) -> str:

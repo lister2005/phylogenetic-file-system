@@ -32,6 +32,7 @@ from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE, MIN_R
 from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
 from TreeConstructor import TreeConstructor
 from vault_session import VaultSession, VaultUnlockError, MutationConflictError, CATALOG_FILENAME, HISTORY_FILENAME
+from vault_lock import VaultBusyError
 from lineage import LINEAGE_FILENAME
 
 # Optional: only --engine cpp needs the compiled engine.
@@ -645,7 +646,11 @@ Example:
 (takes no arguments; safe to run any time, does nothing if nothing was deleted)"""
         if not self._require_reauth("vacuum the vault"):
             return
-        report = self._session.vacuum()
+        try:
+            report = self._session.vacuum()
+        except VaultBusyError as e:
+            print(e)
+            return
         print(f"Before:    {report['old_size']:,} bytes")
         print(f"After:     {report['new_size']:,} bytes")
         print(f"Reclaimed: {report['bytes_reclaimed']:,} bytes")
@@ -666,6 +671,34 @@ Example:
                   f"({report['mirror_bytes_reclaimed']:,} reclaimed, {report['live_mirrors']} live "
                   f"mirror(s) remaining).")
 
+    def do_spares(self, arg):
+        """spares [all|shared]  -- which chunks get a spare (mirror) copy for self-healing
+
+Example:
+  spares          (show the current setting)
+  spares all      (every chunk: any damaged chunk can be repaired; uses about
+                   twice the container space)
+  spares shared   (the default: only chunks used by 3+ versions or files)
+(turning 'all' on also makes spares for chunks already stored; turning it
+off keeps the spares that exist)"""
+        choice = arg.strip().lower()
+        if not choice:
+            mode = "all" if self._session.mirror_all else "shared"
+            print(f"Spare copies: {mode} -- " + ("every chunk has one." if mode == "all" else
+                  "only chunks used by 3 or more versions/files ('spares all' to cover every chunk)."))
+            return
+        if choice not in ("all", "shared"):
+            print("Usage: spares [all|shared]")
+            return
+        if not self._require_reauth(f"set spare copies to '{choice}'"):
+            return
+        added = self._session.set_mirror_all(choice == "all")
+        if choice == "all":
+            print(f"Spare copies: all. {added} existing chunk(s) got a spare now; new chunks get one as "
+                  f"they are written.")
+        else:
+            print("Spare copies: shared (the default). Spares already made are kept.")
+
     def do_fsck(self, arg):
         """fsck  -- scan every stored chunk for corruption, self-healing where possible
 
@@ -676,7 +709,11 @@ one without is reported -- use 'verify' to see which files it affects)"""
         if not self._require_reauth("scan the vault for corruption"):
             return
         print("Scanning every live chunk (this reads and verifies your entire vault -- may take a while)...")
-        report = self.pipeline.verify_and_repair()
+        try:
+            report = self._session.fsck()
+        except VaultBusyError as e:
+            print(e)
+            return
         print(f"Scanned:       {report['scanned']}")
         print(f"Healthy:       {report['healthy']}")
         print(f"Repaired:      {report['healed']} (recovered from their Ancestral Hardening mirror)")
@@ -697,7 +734,7 @@ Example:
 (takes no arguments)"""
         if not self._require_reauth("rotate keys"):
             return
-        new_epoch = self.pipeline.rotate_keys()
+        new_epoch = self._session.rotate_keys()
         print(f"Rotated to epoch {new_epoch}. New writes use the new key; existing files are unaffected.")
 
     def do_passwd(self, arg):
@@ -713,7 +750,7 @@ Example:
             print("New passphrases didn't match. Nothing changed.")
             return
         try:
-            change_passphrase(self.storage_root, old_pw, new_pw1)
+            self._session.change_passphrase(old_pw, new_pw1)
             print("Passphrase changed. The key itself (and all your data) is untouched -- "
                   "only what protects the key file on disk changed.")
         except WrongPassphraseError:
@@ -756,12 +793,17 @@ Example:
         if not self._require_reauth("run an attack test"):
             return
         choice = input("Run 'virtual attack' or 'real attack'? ").strip().lower()
-        if choice in ("real", "real attack", "realattack"):
-            self._attack_real()
-        elif choice in ("virtual", "virtual attack", "virtualattack"):
-            self._attack_virtual()
-        else:
+        if choice not in ("real", "real attack", "realattack", "virtual", "virtual attack", "virtualattack"):
             print(f"'{choice}' isn't 'virtual attack' or 'real attack'. Cancelled.")
+            return
+        try:
+            with self._session.sole_use():  # it corrupts and repairs stored data on purpose
+                if choice.startswith("real"):
+                    self._attack_real()
+                else:
+                    self._attack_virtual()
+        except VaultBusyError as e:
+            print(e)
 
     def _attack_virtual(self):
         print("Running security self-test against a throwaway test file (your real files are untouched)...\n")
@@ -982,8 +1024,12 @@ vault is then deleted best-effort; it is already unrecoverable by then."""
         print("\nDestroying key material...")
         key_path = os.path.join(self.storage_root, MASTER_KEY_FILENAME)
         keyring_path = os.path.join(self.storage_root, KEYRING_FILENAME)
-        for path in (key_path, keyring_path):
-            self._secure_erase_file(path)
+        # Never blocked by other programs; just not interleaved with a write.
+        with self._session.write_lock():
+            for path in (key_path, keyring_path):
+                self._secure_erase_file(path)
+        print("Note: any other program that still has this vault open keeps the key in its own "
+              "memory until it closes. Close them too.")
         print("Key material destroyed. This vault is now permanently unrecoverable, "
               "even with the correct passphrase.")
 
@@ -1339,7 +1385,7 @@ blocks use in 'graft'; other keys are informational.)"""
             return
         value = self._parse_tag_value(raw_value)
         try:
-            self._session.lineage.set_tag(label, key, value)
+            self._session.set_tag(label, key, value)
         except KeyError as e:
             print(f"Tag failed: {e}")
             return
@@ -1364,7 +1410,7 @@ Example:
         if not self._require_reauth(f"untag '{label}'"):
             return
         try:
-            removed = self._session.lineage.remove_tag(label, key)
+            removed = self._session.remove_tag(label, key)
         except KeyError as e:
             print(f"Untag failed: {e}")
             return
@@ -1692,9 +1738,11 @@ Example:
             return
         if not self._require_reauth(f"rename '{old_label}'"):
             return
-        self.catalog[new_label] = self.catalog.pop(old_label)
-        self._session.lineage.rename_label(old_label, new_label)
-        self._save_catalog()
+        try:
+            self._session.rename_label(old_label, new_label)
+        except (KeyError, ValueError) as e:  # another program renamed or added it meanwhile
+            print(f"Rename failed: {e}")
+            return
         print(f"Renamed '{old_label}' -> '{new_label}'")
 
     def do_test(self, arg):
@@ -1764,10 +1812,10 @@ label; see 'attack' for tampering tests)"""
             self._session.commit_write(label, work_v1, fork_from_generation=0)
             check("Fork creates a genuine second branch head",
                   lambda: len(self._session.lineage.get_heads(label)) == 2)
-            self._session.lineage.set_tag(label, "__post_test_tag__", True)
+            self._session.set_tag(label, "__post_test_tag__", True)
             check("Tag set/get round-trips correctly",
                   lambda: self._session.lineage.get_tags(label).get("__post_test_tag__") is True)
-            self._session.lineage.remove_tag(label, "__post_test_tag__")
+            self._session.remove_tag(label, "__post_test_tag__")
         finally:
             for p in (work_v1, work_v2, out_path):
                 if os.path.exists(p):
@@ -1888,6 +1936,7 @@ Example:
     def onecmd(self, line):
         stripped = line.strip() if isinstance(line, str) else ""
         try:
+            self._session.refresh()  # pick up changes other programs made to this vault
             result = super().onecmd(line)
         except Exception as e:
             print(f"Error: {type(e).__name__}: {e}")
