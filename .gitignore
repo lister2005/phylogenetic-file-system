@@ -40,7 +40,12 @@ gearhash/path/
 .DS_Store
 
 # Kept locally, not published: only what's needed to build and run PFS is
-# in the repository (plus manual.pdf and gui_manual.pdf).
+# in the repository, plus user_manual.pdf.
+user_manual.txt
+technical_manual.txt
+technical_manual.pdf
+gui_manual.pdf
+manual.pdf
 tests/
 cpp_engine/bench/
 cpp_engine/*_FORMAT.md
