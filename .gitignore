@@ -8,10 +8,8 @@ __pycache__/
 # C++ build artifacts (regenerate: cd cpp_engine/build && cmake .. && make)
 cpp_engine/build/
 
-# Kernel module build litter (regenerate: cd kernel_module && make)
-# The compiled pfs_lkm.ko itself is kept -- source, Makefile, README, and
-# the built module are all meant to be inspectable; only the intermediate
-# Kbuild litter is excluded.
+# Kernel module build output (regenerate: cd kernel_module && make)
+kernel_module/*.ko
 kernel_module/*.o
 kernel_module/*.mod
 kernel_module/*.mod.c
@@ -40,3 +38,34 @@ gearhash/path/
 
 # Editor/OS
 .DS_Store
+
+# Kept locally, not published: only what's needed to build and run PFS is
+# in the repository (plus manual.pdf and gui_manual.pdf).
+tests/
+cpp_engine/bench/
+cpp_engine/*_FORMAT.md
+judge_verification.py
+benchmark_compare.py
+compare.py
+demo_engine_race.py
+demo_self_healing.py
+make_demo_reel.py
+measure_storage_savings.py
+storage_savings_data.json
+pfs_cosmic_web.png
+pfs_demo_reel.mp4
+generate_manual_pdf.py
+generate_guides_pdf.py
+make_gui_screenshots.py
+doc_images/
+manual.txt
+gui_manual.txt
+manual_two.txt
+manual_two.pdf
+gui_ideas.txt
+cpp_port_plan.txt
+memory.md
+progress.md
+PORTFOLIO.md
+NEW_USER_ACCEPTANCE_REPORT.md
+Project_idea.txt

@@ -28,13 +28,6 @@ Run everything from this directory with `.venv/bin/python3`, and never with
 `sudo` — nothing needs root, and `sudo` silently switches to the system
 Python.
 
-## First things to run
-
-```sh
-.venv/bin/python3 judge_verification.py   # one-command pass/fail report over both engines
-.venv/bin/python3 demo_self_healing.py    # live corruption + self-healing demo
-```
-
 ## Using it
 
 ```sh
@@ -48,32 +41,12 @@ spaces in quotes: `write "/home/me/Q3 report.pdf" "q3 report"`. After you
 re-enter the passphrase once, vault commands run without asking again for
 5 minutes; `delete` and `panic` always ask.
 
-## Tests
-
-```sh
-.venv/bin/python3 -m unittest tests.test_lineage_shell_syntax -v   # one suite; see tests/
-for t in cpp_engine/build/*_test; do $t || echo "FAILED: $t"; done # C++ engine tests
-```
-
-(`migration_verify_test` is a tool that takes arguments, not a self-contained
-test, so it fails when run bare like this.)
-
 ## Documentation
 
 | Read | For |
 |---|---|
-| `manual_two.pdf` | A plain-language introduction: the idea, how it works, its history and limits |
+| `manual.pdf` | Every command, both engines, security posture, known limitations |
 | `gui_manual.pdf` | Using the desktop app, with screenshots and troubleshooting |
-| `PORTFOLIO.md` | What PFS is and why it's designed this way |
-| `manual.txt` / `manual.pdf` | Every CLI command, both engines, security posture, known limitations |
-| `NEW_USER_ACCEPTANCE_REPORT.md` | An adversarial first-time-user test of the whole system |
-| `cpp_engine/*_FORMAT.md` | The C++ engine's on-disk formats |
-| `kernel_module/README.md` | A toy kernel-module proof of concept — read before touching; never load it casually |
-
-The PDFs are generated from text sources: `manual.txt` by
-`generate_manual_pdf.py`; `gui_manual.txt` and `manual_two.txt` by
-`generate_guides_pdf.py` (screenshots in `doc_images/gui/` come from
-`make_gui_screenshots.py`). Edit the source, then rerun the script.
 
 Vault directories (`pfs_storage_vault*/`) hold real key material and are
 kept out of git.
