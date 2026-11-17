@@ -18,7 +18,9 @@ KEYRING_FILENAME = "keyring.enc"
 
 
 class KeyRing:
+    """Holds the vault's data keys, one per epoch, each stored wrapped (encrypted) by the passphrase-derived key."""
     def __init__(self, storage_root: str, kek: bytes):
+        """Loads and unwraps the existing keyring, if there is one."""
         self.storage_root = storage_root
         self.kek = kek
         self.path = os.path.join(storage_root, KEYRING_FILENAME)
@@ -29,12 +31,14 @@ class KeyRing:
         self._load()
 
     def _wrap(self, epoch_id: int, dek: bytes) -> bytes:
+        """Encrypts one data key with the passphrase-derived key, bound to its epoch number."""
         aead = AESGCM(self.kek)
         iv = os.urandom(12)
         aad = f"epoch:{epoch_id}".encode()
         return iv + aead.encrypt(iv, dek, aad)
 
     def _unwrap(self, epoch_id: int, wrapped: bytes) -> bytes:
+        """Decrypts one wrapped data key, checking its epoch number."""
         aead = AESGCM(self.kek)
         iv = wrapped[:12]
         ciphertext = wrapped[12:]
@@ -42,6 +46,7 @@ class KeyRing:
         return aead.decrypt(iv, ciphertext, aad)
 
     def _load(self) -> None:
+        """Reads the keyring file and unwraps every data key; the newest epoch becomes current."""
         if not os.path.exists(self.path):
             return
         with open(self.path, "rb") as f:
@@ -52,6 +57,7 @@ class KeyRing:
             self.current_epoch = max(wrapped_entries.keys())
 
     def _save(self) -> None:
+        """Wraps every data key and rewrites the keyring file (lifting and restoring its immutable flag)."""
         wrapped_entries = {
             epoch_id: self._wrap(epoch_id, dek) for epoch_id, dek in self.deks.items()
         }

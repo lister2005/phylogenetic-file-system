@@ -3,9 +3,8 @@
 ## What this is
 
 This is a **small, deliberately toy-scoped proof-of-concept**, built to
-answer one narrow question raised by this project's own design brief
-(`Project_idea.txt`, section 9, "The Linux Kernel Module (LKM) & Hybrid
-Architectures"): *is it actually feasible to intercept file operations at
+answer one narrow question raised by this project's original design brief
+(its section on a Linux kernel module and a hybrid architecture): *is it actually feasible to intercept file operations at
 the Linux VFS layer via a `struct file_operations` table, the way a real
 "Phase 3" PFS kernel driver eventually would?*
 
@@ -21,14 +20,14 @@ It is **NOT**:
   and generally must avoid the kind of blocking/allocation patterns
   userspace storage code uses freely). The real, working PFS engines are
   the Python engine, the C++ engine, and the existing FUSE mount
-  (`pfs_fuse.py`, `pfs_fuse_cpp.cpp`) documented in `PORTFOLIO.md` -- this
+  (`pfs_fuse.py`, `pfs_fuse_cpp.cpp`) described in `user_manual.pdf` -- this
   module does not touch or replace any of that.
 
 What it **does** demonstrate for real: a loadable kernel module that
 registers a character device (`/dev/pfs_lkm`), wires it to a real
 `struct file_operations` table with real `.open`/`.read`/`.write`/
-`.release` function pointers (exactly the mechanism shown in
-`Project_idea.txt`'s own C snippet), and logs via `printk` every single
+`.release` function pointers (exactly the mechanism the design brief
+proposed), and logs via `printk` every single
 time the kernel calls into one of those functions -- using this project's
 own "speciation event" / "delta synthesis" vocabulary in the log lines, so
 the tie-back to the rest of PFS's design language is explicit rather than
@@ -45,8 +44,9 @@ This module **was successfully compiled** on this machine. Kernel headers
 for the exact running kernel (`7.0.0-29-generic`) were already installed
 system-wide (`/lib/modules/7.0.0-29-generic/build` -> a valid
 `linux-headers-7.0.0-29-generic` tree), so the non-root
-`apt-get download` + `dpkg -x` vendoring workaround documented elsewhere in
-this project (`cpp_port_plan.txt`, for `libfuse3-dev`) was not needed here.
+`apt-get download` + `dpkg -x` vendoring workaround used for the C++
+engine's `libfuse3-dev` headers (see `cpp_engine/third_party/fuse3/README.md`)
+was not needed here.
 
 ```
 $ make
@@ -74,7 +74,7 @@ module:
 ```
 filename:       pfs_lkm.ko
 version:        0.1
-description:    PFS-LKM: toy character device demonstrating VFS file_operations interception as a feasibility proof for PFS's 'Phase 3' design, per Project_idea.txt section 9. NOT a production filesystem.
+description:    PFS-LKM: toy character device demonstrating VFS file_operations interception as a feasibility proof for PFS's 'Phase 3' design. NOT a production filesystem.
 license:        GPL
 name:           pfs_lkm
 vermagic:       7.0.0-29-generic SMP preempt mod_unload modversions

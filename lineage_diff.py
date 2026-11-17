@@ -16,6 +16,7 @@ DELETED = "deleted"      # position existed in the older generation only (file s
 
 @dataclass
 class ChunkDiffPosition:
+    """How one chunk position differs between two versions."""
     index: int
     status: str  # UNCHANGED / NEW / CHANGED / DELETED
     old_hash: Optional[bytes]
@@ -24,6 +25,7 @@ class ChunkDiffPosition:
 
 @dataclass
 class LineageDiffResult:
+    """The chunk-by-chunk comparison of two versions of one file."""
     label: str
     generation_old: int
     generation_new: int
@@ -32,26 +34,32 @@ class LineageDiffResult:
     total_new: int = 0
 
     def _count(self, status: str) -> int:
+        """Counts the positions with the given status."""
         return sum(1 for p in self.positions if p.status == status)
 
     @property
     def unchanged_count(self) -> int:
+        """Number of chunk positions that are the same in both versions."""
         return self._count(UNCHANGED)
 
     @property
     def changed_count(self) -> int:
+        """Number of chunk positions whose content changed."""
         return self._count(CHANGED)
 
     @property
     def new_count(self) -> int:
+        """Number of chunk positions that exist only in the newer version."""
         return self._count(NEW)
 
     @property
     def deleted_count(self) -> int:
+        """Number of chunk positions that exist only in the older version."""
         return self._count(DELETED)
 
     @property
     def identical(self) -> bool:
+        """True if the two versions have exactly the same chunks."""
         return self.changed_count == 0 and self.new_count == 0 and self.deleted_count == 0
 
 

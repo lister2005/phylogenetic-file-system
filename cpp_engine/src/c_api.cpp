@@ -24,6 +24,7 @@ thread_local std::string g_last_error;
 void set_error(const std::exception& e) { g_last_error = e.what(); }
 void set_error(const std::string& msg) { g_last_error = msg; }
 
+// Copies a string into a caller's buffer, truncating and always NUL-terminating.
 void copy_out(const std::string& value, char* out_buf, size_t out_buf_len) {
     if (out_buf && out_buf_len > 0) {
         strncpy(out_buf, value.c_str(), out_buf_len - 1);
@@ -31,6 +32,7 @@ void copy_out(const std::string& value, char* out_buf, size_t out_buf_len) {
     }
 }
 
+// Converts a version record into the C struct handed to Python.
 pfs_generation_info_t to_c_info(const LineageNode& node) {
     pfs_generation_info_t info{};
     info.generation_index = node.generation_index;
@@ -52,6 +54,7 @@ pfs_generation_info_t to_c_info(const LineageNode& node) {
 
 extern "C" {
 
+// Opens a vault with a 32-byte key; returns a session handle, or NULL with the error recorded.
 pfs_session_t* pfs_open(const char* storage_root, const uint8_t* kek32) {
     try {
         Bytes32 kek{};
@@ -65,6 +68,7 @@ pfs_session_t* pfs_open(const char* storage_root, const uint8_t* kek32) {
 
 void pfs_close(pfs_session_t* session) { delete reinterpret_cast<pfs_session*>(session); }
 
+// Stores a file as the next version of label; writes the recipe filename to out.
 int pfs_commit_write(pfs_session_t* session_h, const char* label, const char* source_path,
                       char* out_manifest_filename, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -82,6 +86,7 @@ int pfs_commit_write(pfs_session_t* session_h, const char* label, const char* so
     }
 }
 
+// Rebuilds the latest version of a file into output_path.
 int pfs_reconstruct_label(pfs_session_t* session_h, const char* label, const char* output_path) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -99,6 +104,7 @@ int pfs_reconstruct_label(pfs_session_t* session_h, const char* label, const cha
     }
 }
 
+// Deletes a file and its history.
 int pfs_delete_label(pfs_session_t* session_h, const char* label) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -110,6 +116,7 @@ int pfs_delete_label(pfs_session_t* session_h, const char* label) {
     }
 }
 
+// Calls cb once for each file name in the vault.
 int pfs_list_labels(pfs_session_t* session_h, pfs_label_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -122,6 +129,7 @@ int pfs_list_labels(pfs_session_t* session_h, pfs_label_callback cb, void* user_
     }
 }
 
+// Calls cb once for each version of a file, oldest first.
 int pfs_get_history(pfs_session_t* session_h, const char* label, pfs_generation_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -137,6 +145,7 @@ int pfs_get_history(pfs_session_t* session_h, const char* label, pfs_generation_
     }
 }
 
+// Fills out_info with a summary of a file's latest recipe.
 int pfs_get_manifest_info(pfs_session_t* session_h, const char* label, pfs_manifest_info_t* out_info) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -166,6 +175,7 @@ int pfs_get_manifest_info(pfs_session_t* session_h, const char* label, pfs_manif
     }
 }
 
+// Calls cb once for each similarity fingerprint of a file.
 int pfs_get_manifest_fingerprint(pfs_session_t* session_h, const char* label,
                                   pfs_raw_hash_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -186,6 +196,7 @@ int pfs_get_manifest_fingerprint(pfs_session_t* session_h, const char* label,
     }
 }
 
+// Finds a version by UUID; writes its file name and details.
 int pfs_find_node_by_uuid(pfs_session_t* session_h, const char* uuid_hex,
                            char* out_label_buf, size_t out_label_buf_len,
                            pfs_generation_info_t* out_info) {
@@ -206,6 +217,7 @@ int pfs_find_node_by_uuid(pfs_session_t* session_h, const char* uuid_hex,
     }
 }
 
+// Calls cb once for each chunk hash of one generation, in order.
 int pfs_get_generation_chunk_hashes(pfs_session_t* session_h, const char* label, uint64_t generation_index,
                                      pfs_raw_hash_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -240,6 +252,7 @@ int pfs_get_generation_chunk_hashes(pfs_session_t* session_h, const char* label,
     }
 }
 
+// Stores a file as a new version whose parent is an older generation (a branch).
 int pfs_fork_write(pfs_session_t* session_h, const char* label, const char* source_path,
                     uint64_t fork_from_generation, char* out_manifest_filename, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -253,6 +266,7 @@ int pfs_fork_write(pfs_session_t* session_h, const char* label, const char* sour
     }
 }
 
+// Makes a new file combining two files, recorded as descended from both.
 int pfs_graft(pfs_session_t* session_h, const char* label_a, const char* label_b, const char* new_label,
               char* out_manifest_filename, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -266,6 +280,7 @@ int pfs_graft(pfs_session_t* session_h, const char* label_a, const char* label_b
     }
 }
 
+// Stores a file as the next version of label, also recording another file as a parent.
 int pfs_commit_write_lateral(pfs_session_t* session_h, const char* label, const char* source_path,
                               const char* lateral_parent_label,
                               char* out_manifest_filename, size_t out_buf_len) {
@@ -280,6 +295,7 @@ int pfs_commit_write_lateral(pfs_session_t* session_h, const char* label, const 
     }
 }
 
+// Merges two branches with no choices given; fails if any parts clash.
 int pfs_merge_branches(pfs_session_t* session_h, const char* label, uint64_t generation_a, uint64_t generation_b,
                        char* out_manifest_filename, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -293,6 +309,7 @@ int pfs_merge_branches(pfs_session_t* session_h, const char* label, uint64_t gen
     }
 }
 
+// Merges two branches using the given choices; on clashes, reports their positions instead.
 int pfs_merge_branches_resolved(pfs_session_t* session_h, const char* label, uint64_t generation_a,
                                 uint64_t generation_b, const uint64_t* positions, const char* sides,
                                 size_t resolution_count, char* out_manifest_filename, size_t out_buf_len,
@@ -317,6 +334,7 @@ int pfs_merge_branches_resolved(pfs_session_t* session_h, const char* label, uin
     }
 }
 
+// Rebuilds one generation of a file into output_path.
 int pfs_checkout(pfs_session_t* session_h, const char* label, uint64_t generation_index, const char* output_path) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -339,6 +357,7 @@ int pfs_checkout(pfs_session_t* session_h, const char* label, uint64_t generatio
     }
 }
 
+// Renames a file; content and history are unchanged.
 int pfs_rename_label(pfs_session_t* session_h, const char* old_label, const char* new_label) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -361,6 +380,7 @@ int pfs_rename_label(pfs_session_t* session_h, const char* old_label, const char
     }
 }
 
+// Deletes a file; reports how much was freed and how much was kept as shared.
 int pfs_delete_label_ex(pfs_session_t* session_h, const char* label, int force,
                          uint64_t* out_freed, uint64_t* out_kept_shared) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -375,6 +395,7 @@ int pfs_delete_label_ex(pfs_session_t* session_h, const char* label, int force,
     }
 }
 
+// Frees one old generation's storage; reports whether anything was freed.
 int pfs_prune_generation(pfs_session_t* session_h, const char* label, uint64_t generation_index, int force,
                           int* out_freed) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -388,6 +409,7 @@ int pfs_prune_generation(pfs_session_t* session_h, const char* label, uint64_t g
     }
 }
 
+// Runs vacuum and fills out_report.
 int pfs_vacuum(pfs_session_t* session_h, pfs_vacuum_report_t* out_report) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -412,6 +434,7 @@ int pfs_vacuum(pfs_session_t* session_h, pfs_vacuum_report_t* out_report) {
     }
 }
 
+// Runs fsck, fills out_report, and calls cb for each chunk that couldn't be repaired.
 int pfs_fsck(pfs_session_t* session_h, pfs_fsck_report_t* out_report, pfs_hash_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -431,6 +454,7 @@ int pfs_fsck(pfs_session_t* session_h, pfs_fsck_report_t* out_report, pfs_hash_c
     }
 }
 
+// Sets a true/false tag on a file.
 int pfs_set_tag_bool(pfs_session_t* session_h, const char* label, const char* key, int value) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -442,6 +466,7 @@ int pfs_set_tag_bool(pfs_session_t* session_h, const char* label, const char* ke
     }
 }
 
+// Sets a text tag on a file.
 int pfs_set_tag_string(pfs_session_t* session_h, const char* label, const char* key, const char* value) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -453,6 +478,7 @@ int pfs_set_tag_string(pfs_session_t* session_h, const char* label, const char* 
     }
 }
 
+// Removes a tag; returns 1 if it was there, 0 if not, -1 on error.
 int pfs_remove_tag(pfs_session_t* session_h, const char* label, const char* key) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -463,6 +489,7 @@ int pfs_remove_tag(pfs_session_t* session_h, const char* label, const char* key)
     }
 }
 
+// Calls cb once for each of a file's current tags.
 int pfs_get_tags(pfs_session_t* session_h, const char* label, pfs_tag_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -479,6 +506,7 @@ int pfs_get_tags(pfs_session_t* session_h, const char* label, pfs_tag_callback c
     }
 }
 
+// Calls cb once for each tag on one version.
 int pfs_get_node_tags_by_uuid(pfs_session_t* session_h, const char* uuid_hex, pfs_tag_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -500,6 +528,7 @@ int pfs_get_node_tags_by_uuid(pfs_session_t* session_h, const char* uuid_hex, pf
     }
 }
 
+// Calls cb once for each lateral parent of one version.
 int pfs_get_lateral_parents_by_uuid(pfs_session_t* session_h, const char* uuid_hex,
                                      pfs_uuid_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -521,6 +550,7 @@ int pfs_get_lateral_parents_by_uuid(pfs_session_t* session_h, const char* uuid_h
     }
 }
 
+// Calls cb once for the latest version of each branch of a file.
 int pfs_get_heads(pfs_session_t* session_h, const char* label, pfs_generation_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -536,6 +566,7 @@ int pfs_get_heads(pfs_session_t* session_h, const char* label, pfs_generation_ca
     }
 }
 
+// Starts a new key epoch; returns its number, or UINT32_MAX on error.
 uint32_t pfs_rotate_key(pfs_session_t* session_h) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -547,6 +578,7 @@ uint32_t pfs_rotate_key(pfs_session_t* session_h) {
 }
 
 namespace {
+// Loads the similarity fingerprints of every file in the vault.
 std::map<std::string, TraitSet> gather_named_traits(pfs_session* s) {
     std::map<std::string, TraitSet> named_traits;
     for (const auto& label : s->session.catalog.labels()) {
@@ -563,6 +595,7 @@ std::map<std::string, TraitSet> gather_named_traits(pfs_session* s) {
 }
 }  // namespace
 
+// Builds a UPGMA or NJ tree of all files and passes its text rendering to cb.
 int pfs_build_tree(pfs_session_t* session_h, const char* algorithm, pfs_text_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -583,6 +616,7 @@ int pfs_build_tree(pfs_session_t* session_h, const char* algorithm, pfs_text_cal
     }
 }
 
+// Calls cb with every other file and its distance from label, closest first.
 int pfs_similar(pfs_session_t* session_h, const char* label, pfs_similar_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -606,6 +640,7 @@ int pfs_similar(pfs_session_t* session_h, const char* label, pfs_similar_callbac
     }
 }
 
+// Calls cb with each member of label's clade; writes the clade's representative name.
 int pfs_compute_clades(pfs_session_t* session_h, const char* label, double threshold,
                         pfs_text_callback cb, void* user_data,
                         char* out_representative, size_t out_buf_len) {
@@ -636,6 +671,7 @@ int pfs_compute_clades(pfs_session_t* session_h, const char* label, double thres
     }
 }
 
+// Calls cb for each file with too few fingerprints for reliable distances.
 int pfs_get_unreliable_fingerprint_labels(pfs_session_t* session_h, pfs_label_count_callback cb, void* user_data) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
@@ -654,6 +690,7 @@ int pfs_get_unreliable_fingerprint_labels(pfs_session_t* session_h, pfs_label_co
     }
 }
 
+// Test helper: writes the hash of one chunk of a file.
 int pfs_debug_get_block_hash(pfs_session_t* session_h, const char* label, uint64_t block_index,
                               uint8_t* out_hash32) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -678,6 +715,7 @@ int pfs_debug_get_block_hash(pfs_session_t* session_h, const char* label, uint64
     }
 }
 
+// Test helper: reports where a chunk is stored.
 int pfs_debug_lookup_chunk(pfs_session_t* session_h, const uint8_t* content_hash32,
                             uint64_t* out_offset, uint64_t* out_length, uint32_t* out_epoch_id) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -699,6 +737,7 @@ int pfs_debug_lookup_chunk(pfs_session_t* session_h, const uint8_t* content_hash
     }
 }
 
+// Test helper: reports where a chunk's spare copy is stored.
 int pfs_debug_get_mirror(pfs_session_t* session_h, const uint8_t* content_hash32,
                           uint64_t* out_offset, uint64_t* out_length) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -719,18 +758,21 @@ int pfs_debug_get_mirror(pfs_session_t* session_h, const uint8_t* content_hash32
     }
 }
 
+// Writes the path of the main chunk container.
 int pfs_get_container_path(pfs_session_t* session_h, char* out_path, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     copy_out(s->session.pipeline.container_path(), out_path, out_buf_len);
     return 0;
 }
 
+// Writes the path of the spare-copy container.
 int pfs_get_mirror_container_path(pfs_session_t* session_h, char* out_path, size_t out_buf_len) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     copy_out(s->session.pipeline.mirror_container_path(), out_path, out_buf_len);
     return 0;
 }
 
+// Fills out_stats with the vault's storage statistics.
 int pfs_get_stats(pfs_session_t* session_h, pfs_vault_stats_t* out_stats) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     if (!out_stats) {

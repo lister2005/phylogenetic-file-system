@@ -20,6 +20,7 @@ def pack(traits: Iterable[bytes]) -> bytes:
 
 
 def _is_packed(stored) -> bool:
+    """True if the fingerprints are stored as one packed byte string rather than a set."""
     return isinstance(stored, (bytes, bytearray, memoryview))
 
 

@@ -15,6 +15,7 @@ namespace pfs_engine {
 
 namespace {
 
+// Finds the last version the two branches have in common, following primary parents.
 std::optional<LineageNode> find_common_ancestor(const LineageStore& lineage, const LineageNode& node_a,
                                                   const LineageNode& node_b) {
     // Lowest common ancestor along primary parents (a linear walk: one label's history is small).
@@ -45,6 +46,7 @@ std::vector<Bytes32> manifest_chunk_list(const std::string& storage_root, const 
 
 }  // namespace
 
+// Merges two branches chunk by chunk against their common ancestor; clashes use the given choices.
 MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
                             uint64_t generation_a, uint64_t generation_b, const MergeResolutions& resolutions) {
     for (const auto& kv : resolutions) {

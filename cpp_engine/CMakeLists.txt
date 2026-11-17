@@ -29,8 +29,8 @@ include_directories(include)
 # require that, this vendors just the -dev package's CONTENTS (headers
 # + .pc file + the .so symlink, all under third_party/fuse3/, extracted
 # via `apt-get download` + `dpkg -x` -- no system changes, no root)
-# checked into this repo -- see third_party/fuse3/README (if present)
-# or cpp_port_plan.txt for how it got there. Falls back to a normal
+# checked into this repo -- see third_party/fuse3/README.md for how it
+# got there. Falls back to a normal
 # system find_package/pkg-config lookup first, in case the -dev package
 # genuinely is installed on whatever machine builds this next.
 set(FUSE3_VENDORED_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/third_party/fuse3/usr")
@@ -64,7 +64,7 @@ target_link_libraries(crypto_utils PUBLIC OpenSSL::Crypto)
 
 # Phase 1 prototype: chunk + hash + encrypt + persist, one native loop,
 # no per-chunk Python/FFI crossing. Deliberately does NOT yet integrate
-# the dedup index, manifest, or keyring -- see cpp_port_plan.txt for why
+# the dedup index, manifest, or keyring
 # (those need new portable formats; this benchmark isolates and measures
 # the specific per-chunk-interpreter-overhead hypothesis first, per the
 # plan's own "prototype and benchmark before building further" rule).

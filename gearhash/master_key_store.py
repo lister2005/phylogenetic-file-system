@@ -27,6 +27,7 @@ class WrongPassphraseError(Exception):
 
 
 def _derive_wrapping_key(passphrase: str, salt: bytes, n: int, r: int, p: int) -> bytes:
+    """Turns the passphrase into a 32-byte key with scrypt (deliberately slow, to resist guessing)."""
     kdf = Scrypt(salt=salt, length=32, n=n, r=r, p=p)
     return kdf.derive(passphrase.encode("utf-8"))
 

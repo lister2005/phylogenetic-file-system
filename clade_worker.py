@@ -42,6 +42,7 @@ class CladeSnapshot:
     __slots__ = ("clade_to_labels", "label_to_clade", "version", "pending", "fingerprints")
 
     def __init__(self, clade_to_labels, label_to_clade, version, pending, fingerprints=None):
+        """Stores one published grouping: clade -> labels, label -> clade, its version and whether work is pending."""
         self.clade_to_labels = clade_to_labels
         self.label_to_clade = label_to_clade
         self.version = version
@@ -70,6 +71,7 @@ def python_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
     import os
 
     def load(label: str):
+        """Returns the label's similarity fingerprints from the Python vault, or None if it has none."""
         manifest_filename = session.catalog.get(label)
         if manifest_filename is None:
             return None
@@ -84,6 +86,7 @@ def cpp_session_loader(session) -> Callable[[str], Optional[Set[bytes]]]:
     """
     def load(label: str):
         # Hold the session lock across both calls; close() takes it too.
+        """Returns the label's similarity fingerprints from the C++ vault, or None if unavailable."""
         with session._call_lock:
             if session._handle is None:
                 return None
@@ -100,14 +103,17 @@ class _DistanceAnalyzer:
     """Adapts a distance function to the analyzer TreeConstructor expects."""
 
     def __init__(self, distance):
+        """Wraps a bare distance function so TreeConstructor can use it as its analyzer."""
         self.calculate_distance = distance
 
 
 class CladeWorker:
+    """Background thread that keeps files grouped into clades, and similarity trees, up to date as files change."""
     def __init__(self, load_traits: Callable[[str], Optional[Set[bytes]]],
                  threshold: float = DEFAULT_CLADE_THRESHOLD,
                  distance: Optional[Callable[[set, set], float]] = None,
                  name: str = "clade-worker"):
+        """Sets up the worker; call start() to begin processing."""
         self._load_traits = load_traits
         self._threshold = threshold
         self._distance = distance or PhylogeneticAnalyzer(SIMILARITY_PROFILE).calculate_distance
@@ -138,15 +144,19 @@ class CladeWorker:
         return self
 
     def changed(self, label: str) -> None:
+        """Tells the worker a file was added or its content changed."""
         self._post(("changed", label))
 
     def removed(self, label: str) -> None:
+        """Tells the worker a file was deleted."""
         self._post(("removed", label))
 
     def renamed(self, old: str, new: str) -> None:
+        """Tells the worker a file was renamed."""
         self._post(("renamed", old, new))
 
     def snapshot(self) -> CladeSnapshot:
+        """Returns the latest grouping without waiting, marked pending if changes are still queued."""
         with self._cond:
             snap = self._snapshot
             pending = bool(self._events) or self._busy
@@ -172,6 +182,7 @@ class CladeWorker:
             self._cond.notify_all()
 
             def ready():
+                """True once the worker is idle and the tree for this algorithm matches the current grouping."""
                 entry = self._trees.get(algorithm)
                 idle = not self._events and not self._busy
                 return idle and entry is not None and entry[0] == self._snapshot.version
@@ -183,6 +194,7 @@ class CladeWorker:
             return entry[2]
 
     def stop(self, timeout: Optional[float] = None) -> None:
+        """Asks the worker thread to stop, and waits for it (up to timeout)."""
         with self._cond:
             self._stopping = True
             self._cond.notify_all()
@@ -190,6 +202,7 @@ class CladeWorker:
             self._thread.join(timeout)
 
     def _post(self, event: tuple) -> None:
+        """Queues an event for the worker thread and wakes it."""
         with self._cond:
             self._events.append(event)
             self._cond.notify_all()
@@ -203,6 +216,7 @@ class CladeWorker:
                 if a not in self._trees or self._trees[a][0] != version]
 
     def _run(self) -> None:
+        """Worker loop: waits for events, applies them, republishes the grouping and rebuilds stale trees."""
         while True:
             with self._cond:
                 self._cond.wait_for(lambda: self._events or self._stopping or self._stale_trees())
@@ -252,11 +266,13 @@ class CladeWorker:
                 self._cond.notify_all()
 
     def _drop(self, label: str) -> None:
+        """Forgets a file: its fingerprints and its links to neighbours."""
         self._traits.pop(label, None)
         for other in self._neighbors.pop(label, ()):
             self._neighbors[other].discard(label)
 
     def _process(self, events: List[tuple]) -> None:
+        """Applies a batch of changed/removed/renamed events, relinking only the files that changed."""
         dirty: Set[str] = set()
         for event in events:
             kind = event[0]
@@ -319,14 +335,17 @@ class CladeWorker:
         self._publish()
 
     def _maybe_link(self, a: str, traits_a: set, b: str, traits_b: set) -> None:
+        """Links two files as neighbours if their distance is within the clade threshold."""
         if self._distance(traits_a, traits_b) <= self._threshold:
             self._neighbors.setdefault(a, set()).add(b)
             self._neighbors.setdefault(b, set()).add(a)
 
     def _publish(self) -> None:
+        """Turns the neighbour links into clades (connected groups) and publishes a new snapshot."""
         parent = {label: label for label in self._traits}
 
         def find(x):
+            """Union-find: returns the group representative of x, shortening the path as it goes."""
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]

@@ -44,6 +44,7 @@ except OSError as e:
     PfsEngineError = Exception
 
     class PfsMergeConflictError(Exception):
+        """Stand-in used when the C++ engine isn't built, so 'except PfsMergeConflictError' still works."""
         conflicting_positions = []
     _CPP_ENGINE_IMPORT_ERROR = e
 
@@ -131,6 +132,7 @@ def _merge_resolving(merge, conflict_error, all_side, choices):
 
 
 def _print_merge_conflict(e) -> None:
+    """Explains a refused merge: which chunk positions clash, and how to merge again choosing a side."""
     positions = e.conflicting_positions
     preview = ", ".join(str(p) for p in positions[:20]) + (" ..." if len(positions) > 20 else "")
     print("MUTATION CONFLICT -- merge refused, nothing was committed.")
@@ -203,6 +205,7 @@ class _ReauthMixin:
     _reauth_ok_at = None
 
     def _current_kek(self) -> bytes:
+        """Returns the key that a re-entered passphrase must match (engine-specific)."""
         raise NotImplementedError
 
     def _require_reauth(self, action_description: str = "do this", always_ask: bool = False) -> bool:
@@ -227,6 +230,7 @@ class _ReauthMixin:
 
 
 class PFSShell(_ReauthMixin, cmd.Cmd):
+    """The interactive shell for a Python-engine vault: one do_<name> method per command."""
     intro = (
         "\nPhylogenetic File System -- interactive shell.\n"
         "Type 'help' for the full command list, 'help <command>' for details.\n\n"
@@ -240,6 +244,7 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
     prompt = "pfs> "
 
     def __init__(self, storage_root: str):
+        """Opens the vault (asking for the passphrase) and loads the command history."""
         super().__init__()
         self.storage_root = storage_root
         self._session = VaultSession(storage_root)
@@ -277,14 +282,17 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
 
     @property
     def pipeline(self):
+        """The vault's storage pipeline."""
         return self._session.pipeline
 
     @property
     def catalog(self):
+        """The vault's catalog: file name -> recipe filename."""
         return self._session.catalog
 
 
     def _unlock_or_create(self):
+        """Refuses C++-engine vaults, then unlocks or creates the vault, asking on the terminal."""
         if _existing_vault_engine(self.storage_root) == "cpp":
             print(f"'{self.storage_root}' is a C++-ENGINE vault (catalog.pfsc/keyring.pfsk present). "
                   f"It uses different, incompatible file formats -- opening it here would corrupt it. "
@@ -296,12 +304,15 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
             print(f"No vault found at '{self.storage_root}'.")
 
         def get_new_passphrase():
+            """Asks for a new passphrase twice."""
             return getpass.getpass("Set a new vault passphrase: "), getpass.getpass("Confirm passphrase: ")
 
         def get_existing_passphrase():
+            """Asks for the existing passphrase."""
             return getpass.getpass("Enter vault passphrase: ")
 
         def confirm_reset():
+            """Explains the key mismatch and asks whether to discard the unreadable files."""
             print("\nYour passphrase correctly unlocked master.key, but the vault's other files")
             print("(keyring.enc / index / manifests) don't decrypt with it -- they were encrypted")
             print("under a DIFFERENT key that no longer matches. This can happen after an")
@@ -346,6 +357,7 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
             self._readline = None  # no readline (e.g. Windows): no recall
 
     def _save_history(self):
+        """Encrypts and saves the shell's command history inside the vault."""
         path = os.path.join(self.storage_root, HISTORY_FILENAME)
         raw = pickle.dumps(self._command_history)
         encrypted = self.crypto.encrypt_block(raw, associated_data=b"history")
@@ -367,12 +379,15 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
             pass  # history is only a convenience
 
     def _read_manifest_metadata(self, manifest_path: str) -> dict:
+        """Decrypts a recipe file and returns its metadata."""
         return self._session.read_manifest_metadata(manifest_path)
 
     def _save_catalog(self) -> None:
+        """Saves the catalog."""
         self._session.save_catalog()
 
     def _current_kek(self) -> bytes:
+        """Returns the vault's current key, for passphrase re-checks."""
         return self.crypto.key
 
 
@@ -482,6 +497,7 @@ Example:
         of clustering.
         """
         def _job():
+            """Computes a new version's similarity fingerprints in the background and saves them."""
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(file_path)
                 self.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
@@ -657,8 +673,8 @@ Example:
         print(f"Live chunks remaining: {report['live_chunks']}")
         if report["chunks_corrected"]:
             print(f"Ref-count drift repaired: {report['chunks_corrected']} chunk(s) had a stale "
-                  f"reference count corrected before reclaiming (see 'manual.txt' for why this can "
-                  f"happen) -- rerun 'vacuum' once more to reclaim any of those that are now genuinely dead.")
+                  f"reference count corrected before reclaiming (a known effect of resaves in older "
+                  f"vaults) -- rerun 'vacuum' once more to reclaim any of those that are now genuinely dead.")
         if report["orphaned_manifests_removed"]:
             print(f"Orphaned manifests removed: {report['orphaned_manifests_removed']} (referenced by "
                   f"nothing in the vault, freed directly).")
@@ -806,6 +822,7 @@ Example:
             print(e)
 
     def _attack_virtual(self):
+        """Runs the security self-test on a throwaway file, leaving the user's files untouched."""
         print("Running security self-test against a throwaway test file (your real files are untouched)...\n")
 
         test_content = secrets.token_bytes(50_000)
@@ -891,6 +908,7 @@ Example:
         print("All checks passed." if all(r[1] for r in results) else "SOME CHECKS FAILED -- see above.")
 
     def _attack_real(self):
+        """Runs the security self-test against a copy of a real stored file, restoring everything afterwards."""
         if not self.catalog:
             print("Vault is empty -- nothing to run a real attack against. "
                   "Use 'write' first, or run 'virtual attack' instead.")
@@ -1762,27 +1780,32 @@ label; see 'attack' for tampering tests)"""
         out_path = os.path.join(self.storage_root, "__post_test_out__.bin")
 
         def check(name, fn):
+            """Runs one self-test step and records whether it passed."""
             try:
                 results.append((name, bool(fn())))
             except Exception as e:
                 results.append((f"{name} ({type(e).__name__}: {e})", False))
 
         def roundtrip_ok():
+            """True if the test file reads back byte-for-byte."""
             manifest_path = self._session.manifest_path_for(label)
             reconstruct(manifest_path, self.pipeline.container_path, out_path, self.crypto.key)
             with open(out_path, "rb") as f:
                 return f.read() == content_v1
 
         def second_generation_ok():
+            """True if the second save created generation 1 with generation 0 as its parent."""
             history = self._session.lineage.get_history(label)
             return (len(history) == 2 and history[1].parent_uuid == history[0].node_uuid)
 
         def delete_and_vacuum_ok():
+            """True if deleting the test file and running vacuum both work."""
             self._session.delete_label(label, force=True)
             report = self._session.vacuum()
             return isinstance(report, dict) and "bytes_reclaimed" in report
 
         def fsck_clean():
+            """True if fsck finds nothing it can't repair."""
             report = self.pipeline.verify_and_repair()
             return report["unrecoverable"] == []
 
@@ -1926,14 +1949,17 @@ Example:
 
     do_quit = do_exit
 
+    # Ctrl+D: leaves the shell like 'exit'.
     def do_EOF(self, arg):
         print()
         return self.do_exit(arg)
 
     def emptyline(self):
+        """An empty line does nothing (instead of repeating the last command)."""
         pass  # don't repeat the last command
 
     def onecmd(self, line):
+        """Runs one command after picking up other programs' changes, printing errors instead of crashing."""
         stripped = line.strip() if isinstance(line, str) else ""
         try:
             self._session.refresh()  # pick up changes other programs made to this vault
@@ -1975,6 +2001,7 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
     prompt = "pfs-cpp> "
 
     def __init__(self, storage_root: str):
+        """Opens a C++-engine vault, asking for the passphrase."""
         super().__init__()
         self.storage_root = storage_root
         self._nav_dir = None
@@ -2001,9 +2028,11 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
                                    name="cli-cpp-clade-worker").start(self._session.list_labels())
 
     def _current_kek(self) -> bytes:
+        """Returns the vault's current key, for passphrase re-checks."""
         return self._kek
 
     def _unlock_or_create(self) -> bytes:
+        """Creates a new C++-engine vault or unlocks an existing one; returns its key."""
         key_path = os.path.join(self.storage_root, MASTER_KEY_FILENAME)
         vault_existed = os.path.exists(key_path)
         if not vault_existed:
@@ -2025,6 +2054,7 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
         return kek
 
     def _resolve_path(self, path: str) -> str:
+        """Resolves a path against the folder chosen with 'cd', if any."""
         expanded = os.path.expanduser(path)
         if os.path.isabs(expanded) or self._nav_dir is None:
             return expanded
@@ -2390,6 +2420,7 @@ Example:
 
     @staticmethod
     def _parse_tag_value(raw: str):
+        """Turns 'true'/'yes'/'1' and 'false'/'no'/'0' into booleans; anything else stays text."""
         lowered = raw.lower()
         if lowered in ("true", "yes", "1"):
             return True
@@ -2611,6 +2642,7 @@ Example:
             print(f"'{choice}' isn't 'virtual attack' or 'real attack'. Cancelled.")
 
     def _attack_virtual(self):
+        """Runs the security self-test on a throwaway file, leaving the user's files untouched."""
         print("Running security self-test against a throwaway test file (your real files are untouched)...\n")
         test_content = secrets.token_bytes(50_000)
         test_src = os.path.join(self.storage_root, "__attack_test_src__.bin")
@@ -2631,6 +2663,7 @@ Example:
                 pass
 
     def _attack_real(self):
+        """Runs the security self-test against a real stored file, restoring everything afterwards."""
         labels = self._session.list_labels()
         if not labels:
             print("Vault is empty -- nothing to run a real attack against. "
@@ -2658,6 +2691,7 @@ Example:
                 os.remove(out_ok)
 
     def _run_attack_checks(self, label, expected_content, out_ok, restore):
+        """Runs the attack checks on one file (right key, wrong key, blinded lookups, tampering) and prints the results."""
         results = []
         out_bad = os.path.join(self.storage_root, "__attack_test_out_bad__.bin")
 
@@ -2749,17 +2783,20 @@ throwaway label; see 'attack' for tampering tests)"""
         out_path = os.path.join(self.storage_root, "__post_test_out__.bin")
 
         def check(name, fn):
+            """Runs one self-test step and records whether it passed."""
             try:
                 results.append((name, bool(fn())))
             except Exception as e:
                 results.append((f"{name} ({type(e).__name__}: {e})", False))
 
         def roundtrip_ok():
+            """True if the test file reads back byte-for-byte."""
             self._session.reconstruct_label(label, out_path)
             with open(out_path, "rb") as f:
                 return f.read() == content_v1
 
         def second_generation_ok():
+            """True if the second save created generation 1 with generation 0 as its parent."""
             history = self._session.get_history(label)
             return len(history) == 2 and history[1].parent_uuid_hex == history[0].node_uuid_hex
 
@@ -2794,11 +2831,13 @@ throwaway label; see 'attack' for tampering tests)"""
                     os.remove(p)
 
         def delete_and_vacuum_ok():
+            """True if deleting the test file and running vacuum both work."""
             self._session.delete_label(label, force=True)
             report = self._session.vacuum()
             return "bytes_reclaimed" in report
 
         def fsck_clean():
+            """True if fsck finds nothing it can't repair."""
             report = self._session.fsck()
             return report["unrecoverable"] == []
 
@@ -3039,9 +3078,10 @@ not a lineage and has no root. Sets the shell's focus to <label>.)"""
               f"without repeating the label.")
 
     def default(self, line):
+        """Called for commands the C++ shell doesn't have; says so."""
         cmd_name = line.split()[0] if line.split() else line
-        print(f"'{cmd_name}' isn't wired up in C++-engine mode "
-              f"(see cpp_port_plan.txt). Run pfs_cli.py without --engine cpp for the full Python "
+        print(f"'{cmd_name}' isn't wired up in C++-engine mode. "
+              f"Run pfs_cli.py without --engine cpp for the full Python "
               f"feature set.")
 
     def do_exit(self, arg):
@@ -3053,14 +3093,17 @@ not a lineage and has no root. Sets the shell's focus to <label>.)"""
 
     do_quit = do_exit
 
+    # Ctrl+D: leaves the shell like 'exit'.
     def do_EOF(self, arg):
         print()
         return self.do_exit(arg)
 
     def emptyline(self):
+        """An empty line does nothing (instead of repeating the last command)."""
         pass
 
     def onecmd(self, line):
+        """Runs one command, printing errors instead of crashing."""
         try:
             return super().onecmd(line)
         except Exception as e:
@@ -3077,14 +3120,14 @@ if __name__ == "__main__":
     parser.add_argument("--engine", choices=["python", "cpp"], default="python",
                          help="'python' (default) or 'cpp' (the compiled engine: the same shell "
                               "commands except 'panic' and 'verify', and 'list' without type/size "
-                              "filters -- see manual.txt PART 9.10). A vault belongs to the engine "
+                              "filters -- see user_manual.pdf). A vault belongs to the engine "
                               "that created it; the other engine refuses to open it.")
     args = parser.parse_args()
 
     if args.engine == "cpp":
         if CppVaultSession is None:
             print(f"Couldn't load the C++ engine library: {_CPP_ENGINE_IMPORT_ERROR}")
-            print("Build it first -- see cpp_engine/CMakeLists.txt / cpp_port_plan.txt.")
+            print("Build it first -- see 'Installing PFS' in user_manual.pdf.")
             sys.exit(1)
         storage_root = args.storage_root or "./pfs_storage_vault_cpp"
         CppPFSShell(storage_root).cmdloop()

@@ -56,6 +56,7 @@ _libc_handle = None
 
 
 def _libc():
+    """Loads the C library once and returns it (used for posix_fadvise / malloc_trim)."""
     global _libc_handle
     if _libc_handle is None:
         _libc_handle = ctypes.CDLL("libc.so.6")
@@ -70,6 +71,7 @@ def traits_path_for(manifest_path: str) -> str:
 
 
 def _read_manifest_metadata(manifest_path: str, crypto) -> dict:
+    """Decrypts a manifest file and returns its metadata dictionary."""
     with open(manifest_path, "rb") as f:
         encrypted = f.read()
     raw = crypto.decrypt_block(encrypted, associated_data=os.path.basename(manifest_path).encode())
@@ -131,7 +133,9 @@ def _atomic_write(path: str, data: bytes) -> None:
 
 
 class StoragePipeline:
+    """Stores files in the vault: chunks them, deduplicates, encrypts, and writes recipes and spare copies."""
     def __init__(self, storage_root: str, crypto_engine: Any):
+        """Sets up the container paths and the index for a vault; encryption is required."""
         if crypto_engine is None:
             raise ValueError("Encryption is mandatory.")
 
@@ -148,6 +152,7 @@ class StoragePipeline:
         self.settings = self.load_settings()
 
     def load_settings(self) -> dict:
+        """Reads the vault's encrypted settings (such as mirror_all), with defaults if there are none."""
         path = os.path.join(self.storage_root, SETTINGS_FILENAME)
         if not os.path.exists(path):
             return {"mirror_all": False}
@@ -155,6 +160,7 @@ class StoragePipeline:
             return pickle.loads(self.crypto.decrypt_block(f.read(), associated_data=b"settings"))
 
     def save_settings(self) -> None:
+        """Encrypts and saves the vault's settings."""
         path = os.path.join(self.storage_root, SETTINGS_FILENAME)
         _atomic_write(path, self.crypto.encrypt_block(pickle.dumps(self.settings), associated_data=b"settings"))
 
@@ -230,6 +236,7 @@ class StoragePipeline:
         self.keyring = KeyRing(self.storage_root, self.crypto.key)
 
     def secure_and_persist_file(self, file_path: str, chunk_mask: int = 0x1FFF, similarity_fingerprint: Optional[set] = None) -> str:
+        """Chunks a file, stores only the chunks not already in the vault, and writes its recipe; returns the recipe path."""
         if not os.path.exists(file_path):
             raise FileNotFoundError(f"The source file '{file_path}' does not exist.")
 
@@ -268,6 +275,7 @@ class StoragePipeline:
                 mirror_all = bool(self.settings.get("mirror_all"))
 
                 def open_mirror_writer():
+                    """Opens the spare-copy container for appending and returns it with its current size."""
                     if os.path.exists(self.mirror_container_path):
                         set_immutable(self.mirror_container_path, False)
                     offset = os.path.getsize(self.mirror_container_path) \
@@ -275,6 +283,7 @@ class StoragePipeline:
                     return open(self.mirror_container_path, "ab"), offset
 
                 def flush_window():
+                    """Processes a batch of chunks: stores new ones, counts references to existing ones, and writes spares."""
                     nonlocal current_offset, mirror_offset, primary_reader, mirror_writer
                     nonlocal new_chunks_written, duplicate_chunks_found
                     if not window:
@@ -429,6 +438,7 @@ class StoragePipeline:
         return manifest_path
 
     def _write_traits(self, manifest_path: str, similarity_fingerprint) -> None:
+        """Encrypts and saves a file's similarity fingerprints next to its recipe."""
         traits_path = traits_path_for(manifest_path)
         encrypted = self.crypto.encrypt_block(
             stored_fingerprint.pack(similarity_fingerprint),
@@ -440,6 +450,7 @@ class StoragePipeline:
         set_immutable(traits_path, True)
 
     def read_similarity_fingerprint(self, manifest_path: str, metadata: Optional[dict] = None) -> Optional[set]:
+        """Returns the similarity fingerprints stored for a recipe, or None."""
         return read_similarity_fingerprint(manifest_path, self.crypto, metadata)
 
     def attach_similarity_fingerprint(self, manifest_path: str, similarity_fingerprint: set) -> None:

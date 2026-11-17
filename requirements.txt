@@ -1,5 +1,5 @@
 # Python dependencies for PFS, pinned to the versions in the project venv
-# that the test suite and judge_verification.py pass against.
+# that PFS has been tested with.
 #   python3 -m venv .venv && .venv/bin/python3 -m pip install -r requirements.txt
 # (Python 3.12. The C++ engine has its own, non-Python build -- see README.md.)
 

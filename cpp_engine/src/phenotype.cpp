@@ -55,6 +55,7 @@ bool is_valid_utf8(const uint8_t* data, size_t len) {
     return true;
 }
 
+// True if the sample is valid UTF-8 and almost all printable characters.
 bool looks_like_text(const uint8_t* sample, size_t len) {
     if (len == 0) return false;
     if (!is_valid_utf8(sample, len)) return false;
@@ -68,6 +69,7 @@ bool looks_like_text(const uint8_t* sample, size_t len) {
 
 }  // namespace
 
+// Detects a file's type from its first bytes (known signatures, then a text check).
 Phenotype detect_phenotype(const uint8_t* data, size_t size) {
     for (const auto& sig : kSignatures) {
         size_t end = sig.offset + sig.magic_len;

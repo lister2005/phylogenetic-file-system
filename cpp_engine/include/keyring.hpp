@@ -1,6 +1,6 @@
 #pragma once
 // Envelope encryption with rotating DEKs: keyring.py's scheme exactly,
-// in a portable binary file instead of pickle (KEYRING_FORMAT.md). The KEK
+// in a portable binary file instead of pickle. The KEK
 // only wraps DEKs; content uses the current epoch's DEK, and rotation
 // re-encrypts nothing.
 #include <cstdint>

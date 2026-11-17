@@ -12,6 +12,7 @@ namespace pfs_engine {
 namespace {
 bool g_warned = false;
 
+// Prints, once per process, that deletion protection isn't available here.
 void warn_once() {
     if (g_warned) return;
     fprintf(stderr,
@@ -26,6 +27,7 @@ void warn_once() {
 }
 }  // namespace
 
+// Sets or clears a file's immutable attribute; returns whether it worked.
 bool set_immutable(const std::string& path, bool immutable) {
     int fd = open(path.c_str(), O_RDONLY);
     if (fd < 0) {

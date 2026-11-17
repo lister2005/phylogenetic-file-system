@@ -1,6 +1,6 @@
 /*
  * pfs_lkm: proof of concept for intercepting file operations in the kernel
- * through a struct file_operations table, as Project_idea.txt section 9
+ * through a struct file_operations table, as PFS's original design brief
  * proposes for a kernel-level PFS.
  *
  * A character device, /dev/pfs_lkm, whose open/read/write/release log each
@@ -28,8 +28,8 @@ MODULE_LICENSE("GPL");
 MODULE_AUTHOR("PFS project (Phylogenetic File System) -- proof-of-concept");
 MODULE_DESCRIPTION(
 	"PFS-LKM: toy character device demonstrating VFS file_operations "
-	"interception as a feasibility proof for PFS's 'Phase 3' design, "
-	"per Project_idea.txt section 9. NOT a production filesystem.");
+	"interception as a feasibility proof for PFS's 'Phase 3' design. "
+	"NOT a production filesystem.");
 MODULE_VERSION("0.1");
 
 /*

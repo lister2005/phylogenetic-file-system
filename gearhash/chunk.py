@@ -15,6 +15,7 @@ MAX_SIZE = 16384
 
 @dataclass(eq=True)
 class Chunk:
+    """One chunk found in an in-memory buffer: its rolling hash, offset and length."""
     hash: int
     offset: int
     len: int
@@ -58,7 +59,9 @@ else:
 
 
 class Iter(Iterator[Chunk]):
+    """Iterates over the chunks of an in-memory buffer using the Gear rolling hash."""
     def __init__(self, hasher: "Hasher", mask: int, data: bytes, min_size: int = None, max_size: int = None) -> None:
+        """Prepares to chunk data; min_size/max_size default to the module's 4 KB / 16 KB."""
         self.hasher = hasher
         self.mask = mask
         self.data = data
@@ -67,9 +70,11 @@ class Iter(Iterator[Chunk]):
         self.max_size = max_size if max_size is not None else MAX_SIZE
 
     def __iter__(self) -> "Iter":
+        """Returns itself, so the object can be used in a for loop."""
         return self
 
     def __next__(self) -> Chunk:
+        """Finds the next cut point (in C if available, else Python) and returns the chunk."""
         if self.cursor >= len(self.data):
             raise StopIteration
 
@@ -123,6 +128,7 @@ class StreamingIter(Iterator[StreamedChunk]):
         max_size: int = None,
         read_ahead: int = 8 * 1024 * 1024,
     ) -> None:
+        """Prepares to chunk a file object while reading it in read_ahead-sized blocks."""
         self.hasher = hasher
         self.mask = mask
         self.file_obj = file_obj
@@ -135,9 +141,11 @@ class StreamingIter(Iterator[StreamedChunk]):
         self.eof = False
 
     def __iter__(self) -> "StreamingIter":
+        """Returns itself, so the object can be used in a for loop."""
         return self
 
     def _fill_buffer(self) -> None:
+        """Reads more of the file until the buffer holds at least one maximum-size chunk, or the file ends."""
         while len(self.buffer) < self.max_size and not self.eof:
             block = self.file_obj.read(self.read_ahead)
             if not block:
@@ -146,6 +154,7 @@ class StreamingIter(Iterator[StreamedChunk]):
             self.buffer.extend(block)
 
     def __next__(self) -> StreamedChunk:
+        """Finds the next cut point in the buffer and returns that chunk's bytes, removing them from the buffer."""
         self._fill_buffer()
 
         if not self.buffer:

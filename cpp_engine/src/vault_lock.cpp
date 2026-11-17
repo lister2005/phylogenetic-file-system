@@ -27,6 +27,7 @@ std::map<std::string, LockEntry> g_registry;
 
 }  // namespace
 
+// Takes the vault's lock exclusively, failing at once if another program has it open.
 VaultLock::VaultLock(const std::string& storage_root) {
     std::filesystem::create_directories(storage_root);
     std::filesystem::path lock_path = std::filesystem::path(storage_root) / kLockFilename;
@@ -56,8 +57,8 @@ VaultLock::VaultLock(const std::string& storage_root) {
         ::close(fd);
         throw std::runtime_error(
             "Vault '" + storage_root + "' is already open by another process. Only one process "
-            "may use a PFS vault at a time -- this is a known, deliberate limitation (see "
-            "manual.txt PART 6), not a bug.");
+            "may use a PFS vault at a time -- this is a known, deliberate limitation of the C++ "
+            "engine (see 'Known limitations' in user_manual.pdf), not a bug.");
     }
 
     LockEntry entry;

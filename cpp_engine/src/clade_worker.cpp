@@ -6,6 +6,7 @@
 
 namespace pfs_engine {
 
+// Jaccard distance between two sorted lists of fingerprints, in one pass.
 double sorted_jaccard_distance(const SortedTraits& a, const SortedTraits& b) {
     size_t i = 0, j = 0, common = 0;
     while (i < a.size() && j < b.size()) {
@@ -42,11 +43,13 @@ filtered_clades(const CladePartition& partition, const std::function<bool(const 
     return {std::move(clade_to_labels), std::move(label_to_clade)};
 }
 
+// Sets up the worker with a fingerprint loader and the clade threshold; start() begins work.
 CladeWorker::CladeWorker(Loader loader, double threshold)
     : loader_(std::move(loader)), threshold_(threshold), snapshot_(std::make_shared<CladePartition>()) {}
 
 CladeWorker::~CladeWorker() { stop(); }
 
+// Queues every existing file and starts the background thread.
 void CladeWorker::start(const std::vector<std::pair<std::string, std::string>>& labels) {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -55,34 +58,40 @@ void CladeWorker::start(const std::vector<std::pair<std::string, std::string>>& 
     thread_ = std::thread([this] { run(); });
 }
 
+// Tells the worker a file was added or changed.
 void CladeWorker::changed(const std::string& label, const std::string& source) {
     std::lock_guard<std::mutex> lock(mutex_);
     events_.push_back({Event::kChanged, label, source});
     cond_.notify_all();
 }
 
+// Tells the worker a file was deleted.
 void CladeWorker::removed(const std::string& label) {
     std::lock_guard<std::mutex> lock(mutex_);
     events_.push_back({Event::kRemoved, label, ""});
     cond_.notify_all();
 }
 
+// Tells the worker a file was renamed.
 void CladeWorker::renamed(const std::string& old_label, const std::string& new_label) {
     std::lock_guard<std::mutex> lock(mutex_);
     events_.push_back({Event::kRenamed, old_label, new_label});
     cond_.notify_all();
 }
 
+// Returns the latest published grouping.
 std::shared_ptr<const CladePartition> CladeWorker::snapshot() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return snapshot_;
 }
 
+// Waits until no events are queued or being processed; returns false on timeout.
 bool CladeWorker::wait_idle(std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(mutex_);
     return cond_.wait_for(lock, timeout, [this] { return events_.empty() && !busy_; });
 }
 
+// Stops the background thread and waits for it.
 void CladeWorker::stop() {
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -92,6 +101,7 @@ void CladeWorker::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
+// Worker loop: waits for events, applies them and publishes a new grouping.
 void CladeWorker::run() {
     for (;;) {
         std::vector<Event> events;
@@ -113,6 +123,7 @@ void CladeWorker::run() {
     }
 }
 
+// Forgets a file: its fingerprints and its links to neighbours.
 void CladeWorker::drop(const std::string& label) {
     traits_.erase(label);
     auto it = neighbors_.find(label);
@@ -121,6 +132,7 @@ void CladeWorker::drop(const std::string& label) {
     neighbors_.erase(it);
 }
 
+// Links two files as neighbours if their distance is within the threshold.
 void CladeWorker::maybe_link(const std::string& a, const SortedTraits& ta, const std::string& b,
                              const SortedTraits& tb) {
     distance_calls_++;
@@ -130,6 +142,7 @@ void CladeWorker::maybe_link(const std::string& a, const SortedTraits& ta, const
     }
 }
 
+// Applies a batch of events, relinking only the files that changed.
 void CladeWorker::process(const std::vector<Event>& events) {
     std::map<std::string, std::string> dirty;  // label -> source
     for (const auto& ev : events) {
@@ -194,6 +207,7 @@ void CladeWorker::process(const std::vector<Event>& events) {
     publish();
 }
 
+// Turns the neighbour links into clades (connected groups) and publishes them.
 void CladeWorker::publish() {
     std::map<std::string, std::string> parent;
     for (const auto& kv : traits_) parent[kv.first] = kv.first;

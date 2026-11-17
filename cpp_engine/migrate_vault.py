@@ -3,7 +3,7 @@
 One-time, non-destructive migration of a Python-engine vault to the C++
 engine's formats: .manifest.fks -> .manifest.pfsm, keyring.enc ->
 keyring.pfsk, lineage.enc -> lineage.pfsl, catalog.enc -> catalog.pfsc
-(see the *_FORMAT.md files; catalog.pfsc is documented in catalog.hpp).
+(each format is described in its header under cpp_engine/include/).
 New files are written alongside the originals, which are never touched.
 
 Python, because the old formats are pickle. Lineage is loaded with
@@ -31,6 +31,7 @@ KEYRING_WRAPPED_ENTRY_SIZE = 12 + 32 + 16  # IV + ciphertext + GCM tag
 
 
 def _atomic_write(path: str, data: bytes) -> None:
+    """Writes data to a temporary file, syncs it, then renames it over path, so a crash never leaves half a file."""
     tmp = path + ".tmp"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -99,6 +100,7 @@ def migrate_manifest(old_path: str, crypto: CryptoEngine) -> str:
 
 
 def migrate_keyring(old_path: str) -> str:
+    """Converts a Python-engine keyring (pickled) into the C++ engine's PFSK format and returns the new path."""
     with open(old_path, "rb") as f:
         wrapped_entries = pickle.load(f)  # Dict[int, bytes]
 
@@ -220,6 +222,7 @@ def migrate_catalog(storage_root: str, crypto: CryptoEngine) -> str:
 
 
 def main():
+    """Command-line entry point: converts the Python vault at storage_root to the C++ engine's format."""
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("storage_root", help="Path to the vault's storage root")
     args = parser.parse_args()

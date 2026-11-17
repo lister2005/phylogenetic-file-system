@@ -19,6 +19,7 @@ class ReconstructionError(Exception):
 
 
 def _open_manifest(manifest_path: str, crypto: CryptoEngine) -> FKSLookupEngine:
+    """Decrypts a recipe (manifest) file, checking it belongs to this filename, and opens its lookup table."""
     manifest_filename = os.path.basename(manifest_path)
     with open(manifest_path, "rb") as f:
         encrypted_manifest = f.read()
@@ -34,6 +35,7 @@ def _open_manifest(manifest_path: str, crypto: CryptoEngine) -> FKSLookupEngine:
 
 
 def _manifest_block_hashes(engine: FKSLookupEngine) -> list:
+    """Returns the recipe's chunk hashes in order, refusing a recipe with any chunk missing."""
     expected_blocks = engine.metadata["total_blocks"]
     hashes = []
     for idx in range(expected_blocks):
@@ -49,6 +51,7 @@ def _manifest_block_hashes(engine: FKSLookupEngine) -> list:
 
 
 def _missing_from_index(idx: int, content_hash: bytes) -> ReconstructionError:
+    """Builds the error for a chunk the recipe needs but the index doesn't know."""
     return ReconstructionError(
         f"Block {idx} (hash {content_hash.hex()[:16]}...) is "
         f"referenced by this file's manifest but missing from "
@@ -63,6 +66,7 @@ class _BlockFetcher:
 
     def __init__(self, storage_root: str, container_path: str, crypto: CryptoEngine,
                  keyring: KeyRing, global_index: GlobalBlockIndex):
+        """Opens the main container (and later the spare container) for reading chunks."""
         self._crypto = crypto
         self._keyring = keyring
         self._global_index = global_index
@@ -71,6 +75,7 @@ class _BlockFetcher:
         self._mirror_container = None
 
     def fetch(self, idx: int, content_hash: bytes, location) -> bytes:
+        """Reads, decrypts and checks one chunk; falls back to its spare copy if the main copy is damaged."""
         offset, length, _ref_count, epoch_id = location
         dek = self._keyring.get_dek(epoch_id)
 
@@ -118,12 +123,14 @@ class _BlockFetcher:
         return plaintext
 
     def close(self) -> None:
+        """Closes the container files."""
         self._container.close()
         if self._mirror_container is not None:
             self._mirror_container.close()
 
 
 def reconstruct(manifest_path: str, container_path: str, output_path: str, master_key: bytes):
+    """Rebuilds a whole file from its recipe into output_path, checking it against the original's hash."""
     if not os.path.exists(manifest_path) or not os.path.exists(container_path):
         raise FileNotFoundError("Manifest or Container missing. Did the pipeline finish?")
 
@@ -193,6 +200,7 @@ class ManifestReader:
     CACHE_CHUNKS = 8  # recent chunks, for small sequential reads
 
     def __init__(self, manifest_path: str, container_path: str, master_key: bytes):
+        """Opens a recipe for random-access reads, as the mounted folder needs."""
         if not os.path.exists(manifest_path) or not os.path.exists(container_path):
             raise FileNotFoundError("Manifest or Container missing. Did the pipeline finish?")
         storage_root = os.path.dirname(container_path)
@@ -228,6 +236,7 @@ class ManifestReader:
         self._cache = OrderedDict()
 
     def _chunk(self, idx: int) -> bytes:
+        """Returns one decrypted chunk, from a small cache when possible."""
         plaintext = self._cache.get(idx)
         if plaintext is not None:
             self._cache.move_to_end(idx)
@@ -242,6 +251,7 @@ class ManifestReader:
         return plaintext
 
     def read(self, offset: int, size: int) -> bytes:
+        """Returns size bytes starting at offset, decrypting only the chunks that range touches."""
         if offset < 0 or size < 0:
             raise ValueError("offset and size must be non-negative")
         end = min(offset + size, self.size)
@@ -261,6 +271,7 @@ class ManifestReader:
         return b"".join(parts)
 
     def close(self) -> None:
+        """Closes the files and the index, and empties the cache."""
         self._fetcher.close()
         self._global_index.close()
         self._cache.clear()

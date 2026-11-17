@@ -21,6 +21,7 @@ constexpr char kMagic[8] = {'P', 'F', 'S', 'L', 'I', 'N', '0', '1'};
 constexpr uint8_t kRecordSnapshot = 'S';
 constexpr uint8_t kRecordNode = 'N';
 
+// True if a file exists and can be opened.
 bool file_exists(const std::string& path) {
     std::ifstream f(path);
     return f.good();
@@ -54,6 +55,7 @@ void write_node(BinaryWriter& w, const LineageNode& node) {
     }
 }
 
+// Decodes one version record from the binary format.
 LineageNode read_node(BinaryReader& r) {
     LineageNode node;
     node.node_uuid = r.fixed_bytes<16>();
@@ -87,6 +89,7 @@ LineageNode read_node(BinaryReader& r) {
 
 }  // namespace
 
+// Makes a random 16-byte version UUID.
 NodeUuid generate_node_uuid() {
     static std::mt19937_64 rng(
         static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
@@ -95,6 +98,7 @@ NodeUuid generate_node_uuid() {
     return id;
 }
 
+// Formats a version UUID as 32 hex characters.
 std::string node_uuid_to_hex(const NodeUuid& id) {
     static const char* hex = "0123456789abcdef";
     std::string out;
@@ -106,6 +110,7 @@ std::string node_uuid_to_hex(const NodeUuid& id) {
     return out;
 }
 
+// Parses a version UUID from 32 hex characters.
 NodeUuid node_uuid_from_hex(const std::string& hex) {
     if (hex.size() != 32) throw std::runtime_error("node_uuid hex string must be exactly 32 chars");
     NodeUuid id{};
@@ -115,12 +120,14 @@ NodeUuid node_uuid_from_hex(const std::string& hex) {
     return id;
 }
 
+// Opens the history file of a vault and loads it.
 LineageStore::LineageStore(std::string storage_root, const Bytes32& kek)
     : storage_root_(std::move(storage_root)), kek_(kek) {
     path_ = storage_root_ + "/lineage.pfsl";
     load();
 }
 
+// Reads and decrypts the history file: a snapshot record, then any appended version records.
 void LineageStore::load() {
     history_.clear();
     by_uuid_.clear();
@@ -166,6 +173,7 @@ void LineageStore::load() {
     rebuild_by_uuid();
 }
 
+// Rebuilds the UUID -> version lookup table.
 void LineageStore::rebuild_by_uuid() {
     by_uuid_.clear();
     for (auto& [label, nodes] : history_) {
@@ -173,6 +181,7 @@ void LineageStore::rebuild_by_uuid() {
     }
 }
 
+// Rewrites the whole history as one snapshot (used only by the rare operations that edit it).
 void LineageStore::save() {
     // Full snapshot, O(N): only the rare mutating operations use this.
     BinaryWriter body;
@@ -210,6 +219,7 @@ void LineageStore::save() {
     }
 }
 
+// Appends one encrypted version record to the history file (the normal, fast path).
 void LineageStore::append_node(const LineageNode& node) {
     // Appends one framed record, O(1): the per-write path.
     BinaryWriter body;
@@ -240,6 +250,7 @@ void LineageStore::append_node(const LineageNode& node) {
 
 void LineageStore::compact() { save(); }
 
+// Records a new version of a file (the next one, or a branch from fork_from) and saves it.
 LineageNode LineageStore::record_version(const std::string& label, const std::optional<std::string>& manifest_filename,
                                           uint64_t new_chunks, uint64_t total_chunks,
                                           const std::vector<NodeUuid>& lateral_parent_uuids,
@@ -272,6 +283,7 @@ LineageNode LineageStore::record_version(const std::string& label, const std::op
     return node;
 }
 
+// Returns the latest version of each branch: versions that no other version names as its parent.
 std::vector<LineageNode> LineageStore::get_heads(const std::string& label) const {
     auto it = history_.find(label);
     if (it == history_.end()) return {};
@@ -286,12 +298,14 @@ std::vector<LineageNode> LineageStore::get_heads(const std::string& label) const
     return heads;
 }
 
+// Returns every version of a file, oldest first.
 std::vector<LineageNode> LineageStore::get_history(const std::string& label) const {
     auto it = history_.find(label);
     if (it == history_.end()) return {};
     return std::vector<LineageNode>(it->second.begin(), it->second.end());
 }
 
+// Returns one generation of a file, if it exists.
 std::optional<LineageNode> LineageStore::get_generation(const std::string& label, uint64_t generation_index) const {
     auto it = history_.find(label);
     if (it == history_.end() || it->second.empty()) return std::nullopt;
@@ -305,18 +319,21 @@ std::optional<LineageNode> LineageStore::get_generation(const std::string& label
     return std::nullopt;
 }
 
+// Returns the latest version of a file, if it has one.
 std::optional<LineageNode> LineageStore::get_tip(const std::string& label) const {
     auto it = history_.find(label);
     if (it == history_.end() || it->second.empty()) return std::nullopt;
     return it->second.back();
 }
 
+// Returns the version with this UUID, if it exists.
 std::optional<LineageNode> LineageStore::find_node_by_uuid(const NodeUuid& node_uuid) const {
     auto it = by_uuid_.find(node_uuid);
     if (it == by_uuid_.end()) return std::nullopt;
     return *it->second;
 }
 
+// Returns the names of all files that have a history.
 std::vector<std::string> LineageStore::all_labels() const {
     std::vector<std::string> labels;
     labels.reserve(history_.size());
@@ -324,6 +341,7 @@ std::vector<std::string> LineageStore::all_labels() const {
     return labels;
 }
 
+// Removes a file's whole history.
 void LineageStore::delete_label(const std::string& label) {
     auto it = history_.find(label);
     if (it == history_.end()) return;
@@ -332,6 +350,7 @@ void LineageStore::delete_label(const std::string& label) {
     save();
 }
 
+// Marks one generation as pruned; returns its recipe filename so the caller can free it.
 std::optional<std::string> LineageStore::mark_pruned(const std::string& label, uint64_t generation_index) {
     auto it = history_.find(label);
     if (it == history_.end()) return std::nullopt;
@@ -348,6 +367,7 @@ std::optional<std::string> LineageStore::mark_pruned(const std::string& label, u
     return std::nullopt;
 }
 
+// Moves a file's history to a new name.
 void LineageStore::rename_label(const std::string& old_label, const std::string& new_label) {
     auto it = history_.find(old_label);
     if (it == history_.end()) return;
@@ -360,11 +380,13 @@ void LineageStore::rename_label(const std::string& old_label, const std::string&
     save();
 }
 
+// Returns a file's current tags (those on its latest version).
 Tags LineageStore::get_tags(const std::string& label) const {
     auto tip = get_tip(label);
     return tip ? tip->epigenetic_tags : Tags{};
 }
 
+// Sets a tag on a file's latest version and saves.
 void LineageStore::set_tag(const std::string& label, const std::string& key, const TagValue& value) {
     auto it = history_.find(label);
     if (it == history_.end() || it->second.empty()) {
@@ -374,6 +396,7 @@ void LineageStore::set_tag(const std::string& label, const std::string& key, con
     save();
 }
 
+// Removes a tag from a file's latest version; returns whether it was there.
 bool LineageStore::remove_tag(const std::string& label, const std::string& key) {
     auto it = history_.find(label);
     if (it == history_.end() || it->second.empty()) {

@@ -40,6 +40,7 @@ class VaultBusyError(VaultLockError):
 
 
 def _flock_with_timeout(fd, mode, timeout):
+    """Tries to take a flock until timeout seconds pass; returns whether it succeeded."""
     deadline = time.monotonic() + timeout
     while True:
         try:
@@ -56,6 +57,7 @@ class _WriteLock:
     lock and a depth count, so the flock is taken on the outermost write()."""
 
     def __init__(self, path):
+        """Opens the write-lock file and sets up the in-process re-entrant lock."""
         self.fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
         self.thread_lock = threading.RLock()
         self.depth = 0
@@ -67,6 +69,7 @@ class VaultLock:
     """
 
     def __init__(self, storage_root: str):
+        """Takes a shared lock on the vault for this session, reusing the process's descriptor if already open."""
         os.makedirs(storage_root, exist_ok=True)
         lock_path = os.path.join(storage_root, LOCK_FILENAME)
         write_path = os.path.join(storage_root, WRITE_LOCK_FILENAME)
@@ -94,6 +97,7 @@ class VaultLock:
             self._active = True
 
     def _entry(self):
+        """Returns this vault's shared entry in the process-wide lock registry."""
         with _registry_lock:
             return _registry[self._key]
 
@@ -157,6 +161,7 @@ class VaultLock:
                 del _registry[self._key]
 
     def __del__(self):
+        """Releases the lock if the object is garbage-collected without release()."""
         try:
             self.release()
         except Exception:

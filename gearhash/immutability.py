@@ -12,6 +12,7 @@ _warned = False
 
 
 def _warn_once():
+    """Prints, once per process, that deletion protection (chattr +i) isn't available here."""
     global _warned
     if _warned:
         return
@@ -46,11 +47,14 @@ def set_immutable(path: str, immutable: bool) -> bool:
 def with_mutable(path: str):
     """Context manager: clears +i (if set) around a write or delete, then restores it."""
     class _Ctx:
+        """Context manager that lifts a file's immutable flag on entry and restores it on exit."""
         def __enter__(self):
+            """Makes the file writable for the duration of the block."""
             set_immutable(path, False)
             return self
 
         def __exit__(self, exc_type, exc, tb):
+            """Makes the file immutable again."""
             set_immutable(path, True)
             return False
 

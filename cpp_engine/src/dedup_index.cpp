@@ -11,6 +11,7 @@ constexpr const char* kMirrorAadSuffix = "|mirror";  // _MIRROR_AAD_SUFFIX
 // _VALUE_FORMAT "32sQQII": content_hash, offset, length, ref_count, epoch_id; little-endian, unpadded.
 constexpr size_t kValueSize = 32 + 8 + 8 + 4 + 4;
 
+// Packs one index entry (hash, offset, length, reference count, key epoch) into bytes.
 std::vector<uint8_t> pack_value(const Bytes32& content_hash, uint64_t offset, uint64_t length,
                                  uint32_t ref_count, uint32_t epoch_id) {
     std::vector<uint8_t> buf(kValueSize);
@@ -22,6 +23,7 @@ std::vector<uint8_t> pack_value(const Bytes32& content_hash, uint64_t offset, ui
     return buf;
 }
 
+// Unpacks an index entry's location, count and epoch.
 void unpack_value(const std::vector<uint8_t>& raw, BlockEntry& out) {
     if (raw.size() != kValueSize) throw std::runtime_error("bad block value size");
     memcpy(&out.offset, raw.data() + 32, 8);
@@ -30,6 +32,7 @@ void unpack_value(const std::vector<uint8_t>& raw, BlockEntry& out) {
     memcpy(&out.epoch_id, raw.data() + 52, 4);
 }
 
+// Unpacks a whole index entry, including its content hash.
 void unpack_full(const std::vector<uint8_t>& raw, FullBlockEntry& out) {
     if (raw.size() != kValueSize) throw std::runtime_error("bad block value size");
     memcpy(out.content_hash.data(), raw.data(), 32);
@@ -41,6 +44,7 @@ void unpack_full(const std::vector<uint8_t>& raw, FullBlockEntry& out) {
 
 constexpr size_t kMirrorValueSize = 16;
 
+// Packs a spare copy's location into bytes.
 std::vector<uint8_t> pack_mirror(uint64_t offset, uint64_t length) {
     std::vector<uint8_t> buf(kMirrorValueSize);
     memcpy(buf.data(), &offset, 8);
@@ -48,12 +52,14 @@ std::vector<uint8_t> pack_mirror(uint64_t offset, uint64_t length) {
     return buf;
 }
 
+// Unpacks a spare copy's location.
 void unpack_mirror(const std::vector<uint8_t>& raw, MirrorEntry& out) {
     if (raw.size() != kMirrorValueSize) throw std::runtime_error("bad mirror value size");
     memcpy(&out.offset, raw.data(), 8);
     memcpy(&out.length, raw.data() + 8, 8);
 }
 
+// Runs an SQL statement, throwing with SQLite's message if it fails.
 void exec_or_throw(sqlite3* db, const char* sql) {
     char* errmsg = nullptr;
     if (sqlite3_exec(db, sql, nullptr, nullptr, &errmsg) != SQLITE_OK) {
@@ -65,6 +71,7 @@ void exec_or_throw(sqlite3* db, const char* sql) {
 
 }  // namespace
 
+// Opens (or creates) the index database, derives its keys and prepares its statements.
 DedupIndex::DedupIndex(const std::string& db_path, const Bytes32& kek) {
     if (sqlite3_open_v2(db_path.c_str(), &db_, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nullptr) != SQLITE_OK) {
         throw std::runtime_error("failed to open dedup index db: " + db_path);
@@ -100,6 +107,7 @@ DedupIndex::~DedupIndex() {
     if (db_) sqlite3_close(db_);
 }
 
+// Starts a transaction if one isn't already open.
 void DedupIndex::begin() {
     if (!in_transaction_) {
         exec_or_throw(db_, "BEGIN");
@@ -107,6 +115,7 @@ void DedupIndex::begin() {
     }
 }
 
+// Commits the open transaction, if any.
 void DedupIndex::commit() {
     if (in_transaction_) {
         exec_or_throw(db_, "COMMIT");
@@ -114,6 +123,7 @@ void DedupIndex::commit() {
     }
 }
 
+// Discards the open transaction, if any.
 void DedupIndex::rollback() {
     if (in_transaction_) {
         exec_or_throw(db_, "ROLLBACK");
@@ -121,10 +131,12 @@ void DedupIndex::rollback() {
     }
 }
 
+// Blinds a content hash with HMAC, so the index can't be searched for a known file.
 Bytes32 DedupIndex::lookup_key_for(const Bytes32& content_hash) const {
     return hmac_sha256(hmac_key_, content_hash.data(), content_hash.size());
 }
 
+// Returns a chunk's entry, if it is in the index.
 std::optional<BlockEntry> DedupIndex::lookup(const Bytes32& content_hash) {
     Bytes32 key = lookup_key_for(content_hash);
 
@@ -148,6 +160,7 @@ std::optional<BlockEntry> DedupIndex::lookup(const Bytes32& content_hash) {
     return result;
 }
 
+// Looks up many chunks in one query; returns the ones found, keyed by content hash.
 std::map<Bytes32, BlockEntry> DedupIndex::lookup_many(const std::vector<Bytes32>& content_hashes) {
     std::map<Bytes32, BlockEntry> result;
     if (content_hashes.empty()) return result;
@@ -195,6 +208,7 @@ std::map<Bytes32, BlockEntry> DedupIndex::lookup_many(const std::vector<Bytes32>
     return result;
 }
 
+// Inserts or replaces many entries in one statement.
 void DedupIndex::upsert_many(const std::vector<std::tuple<Bytes32, uint64_t, uint64_t, uint32_t, uint32_t>>& entries) {
     if (entries.empty()) return;
     begin();
@@ -231,12 +245,14 @@ void DedupIndex::upsert_many(const std::vector<std::tuple<Bytes32, uint64_t, uin
     sqlite3_finalize(stmt);
 }
 
+// Returns a chunk's entry, throwing if it isn't in the index.
 BlockEntry DedupIndex::require(const Bytes32& content_hash) {
     auto existing = lookup(content_hash);
     if (!existing) throw std::runtime_error("no index entry for this content hash");
     return *existing;
 }
 
+// Encrypts an entry and inserts or replaces its row.
 void DedupIndex::upsert(const Bytes32& content_hash, uint64_t offset, uint64_t length,
                          uint32_t ref_count, uint32_t epoch_id) {
     Bytes32 key = lookup_key_for(content_hash);
@@ -254,15 +270,18 @@ void DedupIndex::upsert(const Bytes32& content_hash, uint64_t offset, uint64_t l
     }
 }
 
+// Records a newly stored chunk with a reference count of 1.
 void DedupIndex::register_new(const Bytes32& content_hash, uint64_t offset, uint64_t length, uint32_t epoch_id) {
     upsert(content_hash, offset, length, 1, epoch_id);
 }
 
+// Adds one to a chunk's reference count.
 void DedupIndex::increment_ref(const Bytes32& content_hash) {
     BlockEntry e = require(content_hash);
     upsert(content_hash, e.offset, e.length, e.ref_count + 1, e.epoch_id);
 }
 
+// Subtracts one from a chunk's reference count (not below zero) and returns the new count.
 uint32_t DedupIndex::decrement_ref(const Bytes32& content_hash) {
     BlockEntry e = require(content_hash);
     uint32_t new_ref = e.ref_count > 0 ? e.ref_count - 1 : 0;
@@ -270,6 +289,7 @@ uint32_t DedupIndex::decrement_ref(const Bytes32& content_hash) {
     return new_ref;
 }
 
+// Returns where a chunk's spare copy is, if it has one.
 std::optional<MirrorEntry> DedupIndex::get_mirror(const Bytes32& content_hash) {
     Bytes32 key = lookup_key_for(content_hash);
     std::vector<uint8_t> aad(key.begin(), key.end());
@@ -295,16 +315,19 @@ std::optional<MirrorEntry> DedupIndex::get_mirror(const Bytes32& content_hash) {
     return result;
 }
 
+// Sets a chunk's reference count directly (used when vacuum recounts).
 void DedupIndex::set_ref_count(const Bytes32& content_hash, uint32_t ref_count) {
     BlockEntry e = require(content_hash);
     upsert(content_hash, e.offset, e.length, ref_count, e.epoch_id);
 }
 
+// Records a chunk's new position after the container is rewritten.
 void DedupIndex::update_offset(const Bytes32& content_hash, uint64_t new_offset) {
     BlockEntry e = require(content_hash);
     upsert(content_hash, new_offset, e.length, e.ref_count, e.epoch_id);
 }
 
+// Removes a chunk's entry and its spare-copy entry; returns whether it existed.
 bool DedupIndex::remove(const Bytes32& content_hash) {
     Bytes32 key = lookup_key_for(content_hash);
     begin();
@@ -329,6 +352,7 @@ bool DedupIndex::remove(const Bytes32& content_hash) {
     return sqlite3_changes(db_) > 0;
 }
 
+// Returns every entry in the index, decrypted.
 std::vector<FullBlockEntry> DedupIndex::iter_all() {
     std::vector<FullBlockEntry> out;
     sqlite3_stmt* stmt = nullptr;
@@ -349,6 +373,7 @@ std::vector<FullBlockEntry> DedupIndex::iter_all() {
     return out;
 }
 
+// Returns every spare-copy entry, with its chunk's content hash.
 std::vector<FullMirrorEntry> DedupIndex::iter_all_mirrors() {
     std::vector<FullMirrorEntry> out;
     sqlite3_stmt* stmt = nullptr;
@@ -388,11 +413,13 @@ std::vector<FullMirrorEntry> DedupIndex::iter_all_mirrors() {
     return out;
 }
 
+// Shrinks the database file (SQLite VACUUM).
 void DedupIndex::compact() {
     if (in_transaction_) throw std::runtime_error("cannot VACUUM the index from inside a transaction");
     exec_or_throw(db_, "VACUUM");
 }
 
+// Re-prepares the cached SQL statements (needed after the database is compacted).
 void DedupIndex::refresh_prepared_statements() {
     sqlite3_finalize(stmt_lookup_block_);
     sqlite3_finalize(stmt_upsert_block_);
@@ -410,6 +437,7 @@ void DedupIndex::refresh_prepared_statements() {
         -1, &stmt_upsert_mirror_, nullptr);
 }
 
+// Records where a chunk's spare copy is stored.
 void DedupIndex::set_mirror(const Bytes32& content_hash, uint64_t offset, uint64_t length) {
     Bytes32 key = lookup_key_for(content_hash);
     std::vector<uint8_t> aad(key.begin(), key.end());

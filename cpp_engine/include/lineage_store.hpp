@@ -4,7 +4,7 @@
 //
 // Same append-only framing as Python (magic header, then length-framed
 // encrypted SNAPSHOT or NODE records), with a portable binary node
-// encoding instead of pickle (LINEAGE_FORMAT.md). record_version() appends
+// encoding instead of pickle. record_version() appends
 // one record (O(1)); the rare mutating methods rewrite a snapshot (O(N)).
 #include <array>
 #include <cstdint>

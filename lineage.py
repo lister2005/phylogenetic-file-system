@@ -36,6 +36,7 @@ _RECORD_NODE = b"N"
 
 
 class LineageNode:
+    """One saved version of a file: its recipe, parents, generation number, chunk counts and tags."""
     __slots__ = ("node_uuid", "parent_uuid", "lateral_parent_uuids", "label", "manifest_filename",
                  "generation_index", "birth_timestamp", "new_chunks", "total_chunks", "pruned",
                  "epigenetic_tags")
@@ -45,6 +46,7 @@ class LineageNode:
                  node_uuid: Optional[str] = None, birth_timestamp: Optional[float] = None,
                  lateral_parent_uuids: Optional[List[str]] = None, pruned: bool = False,
                  epigenetic_tags: Optional[Dict[str, object]] = None):
+        """Creates a version record; a new UUID and timestamp are made if not given."""
         self.node_uuid = node_uuid or uuid.uuid4().hex
         self.parent_uuid = parent_uuid
         self.lateral_parent_uuids = list(lateral_parent_uuids) if lateral_parent_uuids else []
@@ -60,10 +62,12 @@ class LineageNode:
         self.epigenetic_tags = dict(epigenetic_tags) if epigenetic_tags else {}
 
     def to_dict(self) -> dict:
+        """Converts the record to a plain dictionary for saving."""
         return {slot: getattr(self, slot) for slot in self.__slots__}
 
     @classmethod
     def from_dict(cls, d: dict) -> "LineageNode":
+        """Rebuilds a record from a dictionary, filling in fields that older records lack."""
         return cls(d["label"], d["manifest_filename"], d["parent_uuid"], d["generation_index"],
                     d["new_chunks"], d["total_chunks"],
                     node_uuid=d["node_uuid"], birth_timestamp=d["birth_timestamp"],
@@ -74,7 +78,9 @@ class LineageNode:
 
 
 class LineageStore:
+    """The vault's history: every version of every file, kept in an encrypted, append-only file."""
     def __init__(self, storage_root: str, crypto):
+        """Opens the history file of a vault and loads it."""
         self.storage_root = storage_root
         self.crypto = crypto
         self.path = os.path.join(storage_root, LINEAGE_FILENAME)
@@ -84,6 +90,7 @@ class LineageStore:
         self._load()
 
     def _load(self) -> None:
+        """Reads and decrypts the history file, record by record, into memory."""
         self._history = {}
         self._by_uuid = {}
         if not os.path.exists(self.path):
@@ -127,6 +134,7 @@ class LineageStore:
         self._rebuild_by_uuid()
 
     def _rebuild_by_uuid(self) -> None:
+        """Rebuilds the UUID -> version lookup table from the loaded history."""
         self._by_uuid = {
             node.node_uuid: node
             for nodes in self._history.values()
@@ -213,13 +221,16 @@ class LineageStore:
         return None
 
     def get_tip(self, label: str) -> Optional[LineageNode]:
+        """Returns the latest version of a file, or None if it has none."""
         history = self._history.get(label, [])
         return history[-1] if history else None
 
     def find_node_by_uuid(self, node_uuid: str) -> Optional[LineageNode]:
+        """Returns the version with this UUID, or None."""
         return self._by_uuid.get(node_uuid)
 
     def all_labels(self) -> List[str]:
+        """Returns the names of all files that have a history."""
         return list(self._history.keys())
 
     def delete_label(self, label: str) -> None:

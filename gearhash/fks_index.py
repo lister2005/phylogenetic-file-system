@@ -5,7 +5,9 @@ from typing import List, Tuple, Any, Optional
 FKS_PRIME = 18446744073709551629
 
 class FKSIndexBuilder:
+    """Builds an FKS perfect-hash table (two levels, no collisions) from integer keys to values."""
     def __init__(self, key_value_pairs: List[Tuple[int, Any]], metadata: dict = None):
+        """Keeps the unique key/value pairs and sizes the first-level table; call build() next."""
         unique_mappings = {}
         for k, v in key_value_pairs:
             unique_mappings[int(k)] = v
@@ -22,9 +24,11 @@ class FKSIndexBuilder:
         self.metadata = metadata or {}
 
     def _hash(self, key: int, a: int, m: int) -> int:
+        """Universal hash: ((a * key) mod prime) mod m."""
         return ((a * key) % FKS_PRIME) % m
 
     def build(self) -> None:
+        """Picks random hash multipliers until both levels place every key without a collision."""
         rng = random.Random()  # OS entropy: not deterministic
         
         while True:
@@ -93,7 +97,9 @@ class FKSIndexBuilder:
 
 
 class FKSLookupEngine:
+    """Answers lookups from a saved FKS perfect-hash table in constant time."""
     def __init__(self, filepath: str = None, raw_bytes: bytes = None) -> None:
+        """Loads a table saved by FKSIndexBuilder, from a file or from bytes."""
         if raw_bytes is None:
             with open(filepath, "rb") as f:
                 raw_bytes = f.read()
@@ -108,9 +114,11 @@ class FKSLookupEngine:
         self.metadata = state.get("metadata", {})
 
     def _hash(self, key: int, a: int, m: int) -> int:
+        """Universal hash: ((a * key) mod prime) mod m."""
         return ((a * key) % FKS_PRIME) % m
 
     def lookup(self, key: int) -> Optional[Any]:
+        """Returns the value stored for key, or None if the key isn't in the table."""
         int_key = int(key)
         idx1 = self._hash(int_key, self.a1, self.m1)
         m2 = self.m2_sizes[idx1]

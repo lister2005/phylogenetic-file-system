@@ -62,11 +62,13 @@ struct MappedFile {
     ~MappedFile() { if (data) munmap(data, size); if (fd >= 0) close(fd); }
 };
 
+// True if a file exists.
 bool file_exists(const std::string& path) {
     struct stat st{};
     return stat(path.c_str(), &st) == 0;
 }
 
+// Returns a file's size, or 0 if it can't be read.
 uint64_t file_size(const std::string& path) {
     struct stat st{};
     if (stat(path.c_str(), &st) != 0) return 0;
@@ -75,6 +77,7 @@ uint64_t file_size(const std::string& path) {
 
 }  // namespace
 
+// Opens a vault's storage: containers, keyring, index and settings.
 StoragePipeline::StoragePipeline(std::string storage_root, const Bytes32& kek)
     : storage_root_(std::move(storage_root)),
       kek_(kek),
@@ -83,6 +86,7 @@ StoragePipeline::StoragePipeline(std::string storage_root, const Bytes32& kek)
       index_(storage_root_ + "/global_index.db", kek),
       keyring_(storage_root_, kek) {}
 
+// Chunks a file, stores only the chunks not already in the vault, writes spares and the recipe.
 WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_path,
                                                        const std::string& original_filename) {
     MappedFile src(file_path);
@@ -246,6 +250,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
     return result;
 }
 
+// Reads, decrypts and checks one chunk; falls back to its spare copy if the main copy is damaged.
 std::vector<uint8_t> StoragePipeline::fetch_verified_block(uint64_t idx, const Bytes32& content_hash,
                                                             const BlockEntry& loc, int primary_fd, int& mirror_fd) {
     Bytes32 dek = keyring_.get_dek(loc.epoch_id);
@@ -304,6 +309,7 @@ std::vector<uint8_t> StoragePipeline::fetch_verified_block(uint64_t idx, const B
     return plaintext;
 }
 
+// Rebuilds a whole file from its recipe and checks it against the original's hash.
 void StoragePipeline::reconstruct(const std::string& manifest_path, const std::string& output_path) {
     std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
     Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
@@ -361,6 +367,7 @@ void StoragePipeline::reconstruct(const std::string& manifest_path, const std::s
     }
 }
 
+// Opens a recipe for random-access reads, as the mounted folder needs.
 ManifestReader::ManifestReader(StoragePipeline& pipeline, const std::string& manifest_path)
     : pipeline_(pipeline) {
     std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
@@ -409,6 +416,7 @@ ManifestReader::~ManifestReader() {
     if (mirror_fd_ >= 0) close(mirror_fd_);
 }
 
+// Returns one decrypted chunk, from a small cache when possible.
 const std::vector<uint8_t>& ManifestReader::chunk(uint64_t idx) {
     auto it = cache_.find(idx);
     if (it != cache_.end()) return it->second;
@@ -425,6 +433,7 @@ const std::vector<uint8_t>& ManifestReader::chunk(uint64_t idx) {
     return cache_.emplace(idx, std::move(plaintext)).first->second;
 }
 
+// Copies size bytes from offset into out, decrypting only the chunks that range touches.
 size_t ManifestReader::read(uint64_t offset, size_t size, uint8_t* out) {
     if (offset >= size_ || size == 0) return 0;
     uint64_t end = std::min<uint64_t>(offset + size, size_);
@@ -445,6 +454,7 @@ size_t ManifestReader::read(uint64_t offset, size_t size, uint8_t* out) {
     return copied;
 }
 
+// Removes a recipe and lowers the reference counts of its chunks.
 void StoragePipeline::delete_file(const std::string& manifest_path) {
     if (!file_exists(manifest_path)) {
         throw std::runtime_error("manifest not found: " + manifest_path);
@@ -470,6 +480,7 @@ void StoragePipeline::delete_file(const std::string& manifest_path) {
     }
 }
 
+// Recounts every chunk's references from the recipes still in use, correcting wrong counts.
 RefCountRepairReport StoragePipeline::rebuild_ref_counts(const std::vector<std::string>& live_manifest_filenames) {
     std::map<Bytes32, uint64_t> true_counts;
     for (const auto& manifest_filename : live_manifest_filenames) {
@@ -502,6 +513,7 @@ RefCountRepairReport StoragePipeline::rebuild_ref_counts(const std::vector<std::
     return report;
 }
 
+// Deletes recipe files that nothing refers to any more.
 OrphanSweepReport StoragePipeline::sweep_orphaned_manifests(const std::vector<std::string>& live_manifest_filenames) {
     OrphanSweepReport report;
     if (!file_exists(storage_root_)) return report;
@@ -525,6 +537,7 @@ OrphanSweepReport StoragePipeline::sweep_orphaned_manifests(const std::vector<st
     return report;
 }
 
+// Rewrites the containers without unused chunks, after repairing counts and orphans.
 VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manifest_filenames) {
     RefCountRepairReport repair = rebuild_ref_counts(live_manifest_filenames);
     OrphanSweepReport orphans = sweep_orphaned_manifests(live_manifest_filenames);
@@ -657,6 +670,7 @@ VacuumReport StoragePipeline::vacuum(const std::vector<std::string>& live_manife
     return report;
 }
 
+// Checks every stored chunk, repairs damaged ones from spares, and reports what can't be repaired.
 FsckReport StoragePipeline::verify_and_repair() {
     FsckReport report;
     for (const auto& entry : index_.iter_all()) {

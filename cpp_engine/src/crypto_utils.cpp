@@ -13,6 +13,7 @@
 
 namespace pfs_engine {
 
+// SHA-256 of a buffer.
 Bytes32 sha256(const uint8_t* data, size_t len) {
     Bytes32 out{};
     unsigned int out_len = 0;
@@ -24,6 +25,7 @@ Bytes32 sha256(const uint8_t* data, size_t len) {
     return out;
 }
 
+// HMAC-SHA-256 of a buffer under a key.
 Bytes32 hmac_sha256(const Bytes32& key, const uint8_t* data, size_t len) {
     Bytes32 out{};
     unsigned int out_len = 0;
@@ -31,6 +33,7 @@ Bytes32 hmac_sha256(const Bytes32& key, const uint8_t* data, size_t len) {
     return out;
 }
 
+// Derives a 32-byte subkey from a key and a purpose label (HKDF-SHA-256).
 Bytes32 hkdf_sha256(const Bytes32& ikm, const std::string& info) {
     Bytes32 out{};
     uint8_t zero_salt[32] = {0};
@@ -53,6 +56,7 @@ Bytes32 hkdf_sha256(const Bytes32& ikm, const std::string& info) {
     return out;
 }
 
+// AES-256-GCM encrypts under a fresh random IV; returns IV + ciphertext + tag.
 std::vector<uint8_t> aead_encrypt(const Bytes32& key, const uint8_t* plaintext, size_t len,
                                    const uint8_t* aad, size_t aad_len) {
     std::vector<uint8_t> out(12 + len + 16);
@@ -77,6 +81,7 @@ std::vector<uint8_t> aead_encrypt(const Bytes32& key, const uint8_t* plaintext, 
     return out;
 }
 
+// Decrypts IV + ciphertext + tag, throwing if anything was tampered with.
 std::vector<uint8_t> aead_decrypt(const Bytes32& key, const uint8_t* payload, size_t payload_len,
                                    const uint8_t* aad, size_t aad_len) {
     if (payload_len < 12 + 16) throw std::runtime_error("ciphertext too short");

@@ -14,7 +14,9 @@ _TRAIT_HASH_SIZE = 32  # SHA-256 digest
 
 
 class PhylogeneticNode:
+    """One node of a tree: a saved version in a lineage, or a file/grouping in a clade tree."""
     def __init__(self, parent_uuid: Optional[bytes] = None):
+        """Creates a node with a fresh UUID, an optional parent and empty traits."""
         self.node_uuid: bytes = uuid.uuid4().bytes  # 16 raw bytes, matches uint8_t[16]
         self.parent_uuid: Optional[bytes] = parent_uuid
         self.generation_index = 0
@@ -79,6 +81,7 @@ class PhylogeneticNode:
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "PhylogeneticNode":
+        """Rebuilds a node from the bytes written by to_bytes()."""
         node_uuid, parent_uuid, generation_index, branch_signature, birth_timestamp, delta_size = \
             struct.unpack(_HEADER_FORMAT, data[:_HEADER_SIZE])
 

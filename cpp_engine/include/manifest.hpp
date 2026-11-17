@@ -2,7 +2,7 @@
 // The C++ engine's manifest: a metadata header and a flat array of 32-byte
 // chunk hashes indexed by block_index. Not Python's pickled FKS table: a
 // manifest is only ever read by dense block index, where a plain array is
-// already O(1). Layout in MANIFEST_FORMAT.md.
+// already O(1).
 
 #include <cstdint>
 #include <optional>

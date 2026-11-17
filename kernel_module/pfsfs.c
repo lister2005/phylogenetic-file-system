@@ -85,11 +85,13 @@ struct pfs_sb {
 
 static struct kmem_cache *pfs_inode_cachep;
 
+/* Returns the PFS inode that contains this VFS inode. */
 static inline struct pfs_inode *PFS_I(struct inode *inode)
 {
 	return container_of(inode, struct pfs_inode, vfs_inode);
 }
 
+/* Returns the mount's PFS state. */
 static inline struct pfs_sb *PFS_SB(struct super_block *sb)
 {
 	return sb->s_fs_info;
@@ -126,6 +128,7 @@ static struct pfs_chunk *pfs_chunk_get(struct pfs_sb *sbi, const u8 *data, u32 l
 	return c;
 }
 
+/* Drops one reference to a chunk, freeing it when nothing uses it. */
 static void pfs_chunk_put(struct pfs_sb *sbi, struct pfs_chunk *c)
 {
 	if (--c->refs)
@@ -136,6 +139,7 @@ static void pfs_chunk_put(struct pfs_sb *sbi, struct pfs_chunk *c)
 	kfree(c);
 }
 
+/* Frees a generation and drops its references to its chunks. */
 static void pfs_generation_free(struct pfs_sb *sbi, struct pfs_generation *gen)
 {
 	u32 i;
@@ -159,6 +163,7 @@ struct pfs_chunker {
 	u32 new_chunks;
 };
 
+/* Ends the current chunk: stores it (or reuses an identical one) and adds it to the list. */
 static int pfs_chunker_emit(struct pfs_chunker *ck)
 {
 	struct pfs_chunk *c;
@@ -206,6 +211,7 @@ static int pfs_chunker_feed(struct pfs_chunker *ck, const u8 *data, size_t n)
 	return 0;
 }
 
+/* Gives up a half-built chunk list, dropping its chunk references. */
 static void pfs_chunker_abort(struct pfs_chunker *ck)
 {
 	u32 i;
@@ -215,6 +221,7 @@ static void pfs_chunker_abort(struct pfs_chunker *ck)
 	kvfree(ck->chunks);
 }
 
+/* True if the chunk list is exactly the same as an existing generation's. */
 static bool pfs_same_chunks(const struct pfs_generation *gen, const struct pfs_chunker *ck)
 {
 	return gen->nchunks == ck->nchunks &&
@@ -320,6 +327,7 @@ static int pfs_file_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* Changes attributes; a truncate with no writer open records a new generation. */
 static int pfs_setattr(struct mnt_idmap *idmap, struct dentry *dentry, struct iattr *attr)
 {
 	struct inode *inode = d_inode(dentry);
@@ -355,6 +363,7 @@ struct pfs_text {
 	size_t len;
 };
 
+/* Opens .pfs_lineage: builds the text listing every file's generations and the dedup totals. */
 static int pfs_lineage_open(struct inode *inode, struct file *file)
 {
 	struct pfs_sb *sbi = PFS_SB(inode->i_sb);
@@ -399,6 +408,7 @@ static int pfs_lineage_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
+/* Reads from a control file's prepared text. */
 static ssize_t pfs_text_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct pfs_text *text = file->private_data;
@@ -406,6 +416,7 @@ static ssize_t pfs_text_read(struct file *file, char __user *buf, size_t count, 
 	return simple_read_from_buffer(buf, count, ppos, text->data, text->len);
 }
 
+/* Frees a control file's prepared text on close. */
 static int pfs_text_release(struct inode *inode, struct file *file)
 {
 	struct pfs_text *text = file->private_data;
@@ -461,6 +472,7 @@ static int pfs_rebuild(const struct pfs_generation *gen, struct pfs_text *out)
 	return pos == gen->size ? 0 : -EIO;
 }
 
+/* Handles a write of '<name> <generation>' to .pfs_checkout: rebuilds that generation for reading. */
 static ssize_t pfs_checkout_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
 {
 	struct pfs_sb *sbi = PFS_SB(file_inode(file)->i_sb);
@@ -505,6 +517,7 @@ static ssize_t pfs_checkout_write(struct file *file, const char __user *buf, siz
 	return err ? err : count;
 }
 
+/* Reads back the generation rebuilt by the last .pfs_checkout request. */
 static ssize_t pfs_checkout_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
 {
 	struct pfs_text *text = file->private_data;
@@ -526,6 +539,7 @@ static const struct file_operations pfs_checkout_operations = {
 
 static const struct inode_operations pfs_dir_inode_operations;
 
+/* Makes a new inode: a regular file, the root folder, or one of the control files. */
 static struct inode *pfs_new_inode(struct super_block *sb, struct inode *dir, umode_t mode,
 				   enum pfs_kind kind)
 {
@@ -560,11 +574,13 @@ static struct inode *pfs_new_inode(struct super_block *sb, struct inode *dir, um
 	return inode;
 }
 
+/* True if the name starts with the reserved '.pfs_' prefix. */
 static bool pfs_reserved_name(const struct dentry *dentry)
 {
 	return !strncmp(dentry->d_name.name, PFS_RESERVED_PREFIX, strlen(PFS_RESERVED_PREFIX));
 }
 
+/* Creates a new, empty file (reserved names are refused). */
 static int pfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry *dentry,
 		      umode_t mode, bool excl)
 {
@@ -591,6 +607,7 @@ static int pfs_create(struct mnt_idmap *idmap, struct inode *dir, struct dentry 
 	return 0;
 }
 
+/* Deletes a file and its whole history (control files can't be deleted). */
 static int pfs_unlink(struct inode *dir, struct dentry *dentry)
 {
 	if (PFS_I(d_inode(dentry))->kind != PFS_FILE)
@@ -598,6 +615,7 @@ static int pfs_unlink(struct inode *dir, struct dentry *dentry)
 	return simple_unlink(dir, dentry);
 }
 
+/* Sets a file's label (its name in the lineage listing). */
 static int pfs_set_label(struct pfs_sb *sbi, struct inode *inode, const struct qstr *name)
 {
 	char *label = kstrndup(name->name, name->len, GFP_KERNEL);
@@ -611,6 +629,7 @@ static int pfs_set_label(struct pfs_sb *sbi, struct inode *inode, const struct q
 	return 0;
 }
 
+/* Renames a file and updates its label. */
 static int pfs_rename(struct mnt_idmap *idmap, struct inode *old_dir, struct dentry *old_dentry,
 		      struct inode *new_dir, struct dentry *new_dentry, unsigned int flags)
 {
@@ -662,6 +681,7 @@ static struct inode *pfs_alloc_inode(struct super_block *sb)
 	return &pi->vfs_inode;
 }
 
+/* Frees a PFS inode. */
 static void pfs_free_inode(struct inode *inode)
 {
 	kmem_cache_free(pfs_inode_cachep, PFS_I(inode));
@@ -697,6 +717,7 @@ static const struct super_operations pfs_super_operations = {
 	.statfs = simple_statfs,
 };
 
+/* Creates one of the two control files (.pfs_lineage or .pfs_checkout) in the root folder. */
 static int pfs_add_control_file(struct super_block *sb, const char *name, umode_t mode, enum pfs_kind kind)
 {
 	struct inode *inode = pfs_new_inode(sb, d_inode(sb->s_root), S_IFREG | mode, kind);
@@ -714,6 +735,7 @@ static int pfs_add_control_file(struct super_block *sb, const char *name, umode_
 	return 0;
 }
 
+/* Sets up a new mount: its state, the root folder and the control files. */
 static int pfs_fill_super(struct super_block *sb, struct fs_context *fc)
 {
 	struct pfs_sb *sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
@@ -743,6 +765,7 @@ static int pfs_fill_super(struct super_block *sb, struct fs_context *fc)
 	return err;
 }
 
+/* Creates a mount with no backing device. */
 static int pfs_get_tree(struct fs_context *fc)
 {
 	return get_tree_nodev(fc, pfs_fill_super);
@@ -752,12 +775,14 @@ static const struct fs_context_operations pfs_context_operations = {
 	.get_tree = pfs_get_tree,
 };
 
+/* Sets the mount's filesystem-context operations. */
 static int pfs_init_fs_context(struct fs_context *fc)
 {
 	fc->ops = &pfs_context_operations;
 	return 0;
 }
 
+/* Unmounts: frees every generation and chunk, then the mount's state. */
 static void pfs_kill_sb(struct super_block *sb)
 {
 	struct pfs_sb *sbi = PFS_SB(sb);
@@ -776,11 +801,13 @@ static struct file_system_type pfs_fs_type = {
 	.kill_sb = pfs_kill_sb,
 };
 
+/* Initialises a PFS inode when the inode cache allocates it. */
 static void pfs_inode_init_once(void *obj)
 {
 	inode_init_once(&((struct pfs_inode *)obj)->vfs_inode);
 }
 
+/* Module load: creates the inode cache and registers the pfsfs filesystem type. */
 static int __init pfsfs_init(void)
 {
 	int err;
@@ -795,6 +822,7 @@ static int __init pfsfs_init(void)
 	return err;
 }
 
+/* Module unload: unregisters the filesystem and frees the inode cache. */
 static void __exit pfsfs_exit(void)
 {
 	unregister_filesystem(&pfs_fs_type);

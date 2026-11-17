@@ -16,12 +16,15 @@ from PhylogeneticNode import PhylogeneticNode
 
 
 class TreeConstructor:
+    """Builds similarity trees (UPGMA or Neighbour-Joining) and flat clades from files' chunk fingerprints."""
     def __init__(self, analyzer):
+        """Keeps the analyzer used to fingerprint files and measure distances."""
         self.analyzer = analyzer
 
     # ---------- leaf construction (two front-ends, same downstream core) ----------
 
     def _make_leaves_from_files(self, file_paths: List[str]) -> List[PhylogeneticNode]:
+        """Makes one leaf node per file on disk, fingerprinted with the analyzer."""
         leaves = []
         for path in file_paths:
             node = PhylogeneticNode()
@@ -43,11 +46,13 @@ class TreeConstructor:
     def _assign_branch_signatures(self, leaves: List[PhylogeneticNode]) -> List[PhylogeneticNode]:
         # branch_signature: one bit per original leaf, OR'd on merge. 32 bits, so
         # leaves past the 32nd get 0.
+        """Gives each leaf its own bit in branch_signature, so merged nodes record which leaves they hold."""
         for i, leaf in enumerate(leaves):
             leaf.branch_signature = (1 << i) if i < 32 else 0
         return leaves
 
     def _initial_distances(self, leaves: List[PhylogeneticNode]) -> Dict:
+        """Computes the starting distance between every pair of leaves."""
         distances = {leaf: {} for leaf in leaves}
         for i in range(len(leaves)):
             for j in range(i + 1, len(leaves)):
@@ -237,12 +242,14 @@ class TreeConstructor:
         parent = {label: label for label in labels}
 
         def find(x):
+            """Union-find: returns the group representative of x, shortening the path as it goes."""
             while parent[x] != x:
                 parent[x] = parent[parent[x]]
                 x = parent[x]
             return x
 
         def union(a, b):
+            """Union-find: puts a and b in the same group."""
             ra, rb = find(a), find(b)
             if ra != rb:
                 parent[ra] = rb
@@ -279,6 +286,7 @@ class TreeConstructor:
                 roots.append(n)
 
         def _print(node: PhylogeneticNode, prefix: str, is_last: bool):
+            """Prints one node and, recursively, its children as an indented text tree."""
             connector = "└── " if is_last else "├── "
             label = node.metadata_name or f"internal({node.uuid_hex()[:8]})"
             print(f"{prefix}{connector}{label}  "

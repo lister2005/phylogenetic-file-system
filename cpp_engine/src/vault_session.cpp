@@ -7,9 +7,11 @@
 
 namespace pfs_engine {
 
+// Opens a vault: takes its lock, then loads the pipeline, history and catalog.
 VaultSession::VaultSession(std::string storage_root, const Bytes32& kek)
     : lock_(storage_root), pipeline(storage_root, kek), lineage(storage_root, kek), catalog(storage_root, kek) {}
 
+// Stores a file as the next version of label (or a branch), recording any extra parents.
 std::string VaultSession::commit_write(const std::string& label, const std::string& source_path,
                                         const std::vector<std::string>& lateral_parent_labels,
                                         std::optional<uint64_t> fork_from_generation) {
@@ -57,6 +59,7 @@ std::string VaultSession::commit_write(const std::string& label, const std::stri
     return write_result.manifest_path;
 }
 
+// Merges two branches of a file and points the catalog at the result.
 MergeResult VaultSession::merge(const std::string& label, uint64_t generation_a, uint64_t generation_b,
                                 const MergeResolutions& resolutions) {
     MergeResult result = merge_branches(pipeline, lineage, label, generation_a, generation_b, resolutions);
@@ -65,6 +68,7 @@ MergeResult VaultSession::merge(const std::string& label, uint64_t generation_a,
     return result;
 }
 
+// Returns every recipe filename still used by the catalog or the history.
 std::vector<std::string> VaultSession::live_manifest_filenames() const {
     std::set<std::string> names;
     for (const auto& label : catalog.labels()) {
@@ -81,6 +85,7 @@ std::vector<std::string> VaultSession::live_manifest_filenames() const {
 
 VacuumReport VaultSession::vacuum() { return pipeline.vacuum(live_manifest_filenames()); }
 
+// Counts how many files and versions use a recipe.
 uint64_t VaultSession::manifest_reference_count(const std::string& manifest_filename) const {
     uint64_t count = 0;
     for (const auto& other_label : catalog.labels()) {
@@ -94,6 +99,7 @@ uint64_t VaultSession::manifest_reference_count(const std::string& manifest_file
     return count;
 }
 
+// Deletes a file and its history, freeing a recipe only when nothing else uses it.
 DeleteLabelResult VaultSession::delete_label(const std::string& label, bool force) {
     if (!catalog.contains(label)) throw std::out_of_range("No such label: '" + label + "'");
 
@@ -130,6 +136,7 @@ DeleteLabelResult VaultSession::delete_label(const std::string& label, bool forc
     return result;
 }
 
+// Frees one old generation's storage, keeping its history record.
 PruneResult VaultSession::prune_generation(const std::string& label, uint64_t generation_index, bool force) {
     if (!catalog.contains(label)) throw std::out_of_range("No such label: '" + label + "'");
 
@@ -166,6 +173,7 @@ PruneResult VaultSession::prune_generation(const std::string& label, uint64_t ge
     return result;
 }
 
+// Makes a new file combining two files, recorded as descended from both.
 std::string VaultSession::graft(const std::string& label_a, const std::string& label_b, const std::string& new_label) {
     if (label_a == label_b) throw std::invalid_argument("Can't graft a label onto itself.");
     if (!catalog.contains(label_a)) throw std::out_of_range("No such label: '" + label_a + "'");

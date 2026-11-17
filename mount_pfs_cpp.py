@@ -76,6 +76,7 @@ def unlock_or_create(storage_root: str) -> bytes:
 
 
 def main():
+    """Asks for the passphrase, derives the key and starts the C++ mount driver in the foreground."""
     if len(sys.argv) < 3:
         print(f"usage: {sys.argv[0]} <storage_root> <mountpoint> [fuse options...]")
         print("(prompts for the vault passphrase, derives the real KEK the same way "

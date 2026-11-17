@@ -17,6 +17,7 @@ constexpr char kMagic[4] = {'P', 'F', 'S', 'M'};
 constexpr uint16_t kVersion = 1;
 }  // namespace
 
+// Builds a recipe from its metadata and the ordered list of chunk hashes.
 Manifest::Manifest(ManifestMetadata metadata, std::vector<Bytes32> block_hashes)
     : metadata_(std::move(metadata)), block_hashes_(std::move(block_hashes)) {
     if (block_hashes_.size() != metadata_.total_blocks) {
@@ -28,6 +29,7 @@ Manifest::Manifest(ManifestMetadata metadata, std::vector<Bytes32> block_hashes)
     }
 }
 
+// Encodes the recipe in the binary PFSM format.
 std::vector<uint8_t> Manifest::serialize() const {
     BinaryWriter w;
     w.raw_bytes(reinterpret_cast<const uint8_t*>(kMagic), 4);
@@ -55,6 +57,7 @@ std::vector<uint8_t> Manifest::serialize() const {
     return w.data();
 }
 
+// Decodes a recipe from the binary PFSM format, checking its header.
 Manifest Manifest::deserialize(const std::vector<uint8_t>& raw) {
     BinaryReader r(raw.data(), raw.size());
     r.need(4);
@@ -92,11 +95,13 @@ Manifest Manifest::deserialize(const std::vector<uint8_t>& raw) {
     return m;
 }
 
+// Returns the hash of the chunk at this position, if there is one.
 std::optional<Bytes32> Manifest::lookup(uint64_t block_index) const {
     if (block_index >= block_hashes_.size()) return std::nullopt;
     return block_hashes_[block_index];
 }
 
+// Returns the recipe filename for a file's content hash (its hex form).
 std::string manifest_filename_for(const Bytes32& content_sha256) {
     static const char hex_chars[] = "0123456789abcdef";
     std::string out;
@@ -109,6 +114,7 @@ std::string manifest_filename_for(const Bytes32& content_sha256) {
     return out;
 }
 
+// Encrypts a recipe, bound to its filename, and writes it atomically.
 void write_manifest_file(const std::string& path, const std::string& manifest_filename,
                           const Manifest& manifest, const Bytes32& kek) {
     std::vector<uint8_t> raw = manifest.serialize();
@@ -132,6 +138,7 @@ void write_manifest_file(const std::string& path, const std::string& manifest_fi
     }
 }
 
+// Reads and decrypts a recipe file, checking it belongs to this filename.
 Manifest read_manifest_file(const std::string& path, const std::string& manifest_filename,
                              const Bytes32& kek) {
     std::ifstream in(path, std::ios::binary);

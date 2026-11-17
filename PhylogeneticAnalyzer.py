@@ -14,8 +14,10 @@ MIN_RELIABLE_TRAIT_COUNT = 8
 
 
 class PhylogeneticAnalyzer:
+    """Turns files into sets of chunk fingerprints and measures how far apart two such sets are."""
     def __init__(self, profile: dict = None):
         # Defaults to the similarity profile.
+        """Uses the given chunking profile, or the fine-grained similarity profile by default."""
         self.profile = profile or SIMILARITY_PROFILE
 
     def extract_traits(self, file_path: str) -> set:

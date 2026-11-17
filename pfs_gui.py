@@ -80,6 +80,7 @@ _PHENOTYPE_EXTENSION_RULES = [
 
 
 def _extension_for_phenotype(name: str) -> str:
+    """Returns a file extension (such as '.pdf') matching a detected file type, or '' if unknown."""
     for keyword, ext in _PHENOTYPE_EXTENSION_RULES:
         if keyword.lower() in name.lower():
             return ext
@@ -98,6 +99,7 @@ _UNKNOWN_GLYPH = "◆"
 
 
 def _glyph_for_phenotype(name: str) -> str:
+    """Returns the small symbol drawn on a node for its file type."""
     for keyword, glyph in _PHENOTYPE_GLYPH_RULES:
         if keyword.lower() in name.lower():
             return glyph
@@ -111,10 +113,12 @@ _INAPP_IMAGE_PHENOTYPES = {"PNG Image", "JPEG Image", "GIF Image", "BMP Image"}
 
 
 def _is_inapp_text_phenotype(name: str) -> bool:
+    """True if files of this type can be edited in the app's text editor."""
     return name in _INAPP_TEXT_PHENOTYPES
 
 
 def _is_inapp_image_phenotype(name: str) -> bool:
+    """True if files of this type can be shown in the app's image viewer."""
     return name in _INAPP_IMAGE_PHENOTYPES
 
 
@@ -135,6 +139,7 @@ EDGE_REST_OPACITY = 0.94
 
 
 def _color_for_phenotype(name: str) -> QColor:
+    """Returns the node colour for a file type."""
     for keyword, color in _COLOR_RULES:
         if keyword.lower() in name.lower():
             return QColor(color)
@@ -142,6 +147,7 @@ def _color_for_phenotype(name: str) -> QColor:
 
 
 def _heatmap_color(dedup_fraction: float) -> QColor:
+    """Blends from the 'mostly unique' to the 'mostly shared' colour for Dedup Heat."""
     dedup_fraction = max(0.0, min(1.0, dedup_fraction))
     low, high = QColor(_HEATMAP_LOW), QColor(_HEATMAP_HIGH)
     r = low.red() + (high.red() - low.red()) * dedup_fraction
@@ -187,6 +193,7 @@ LIGHT_TEXT_DIM = "#5b6270"
 
 
 def _build_stylesheet(accent, accent_dim, bg, panel_bg, input_bg, border, text, text_dim, hover_bg):
+    """Builds the Qt stylesheet for a theme from its colours."""
     return f"""
 QMainWindow, QWidget {{ background: {bg}; color: {text}; }}
 QToolBar {{ background: {panel_bg}; border: none; padding: 8px; spacing: 6px; }}
@@ -242,6 +249,7 @@ class NodeItem(QGraphicsEllipseItem):
     """
 
     def __init__(self, radius: float, display_text: str, base_color: QColor, glyph: str = ""):
+        """Creates a node: its circle, hover halo and name label, ready for the physics simulation."""
         super().__init__(QRectF(-radius, -radius, radius * 2, radius * 2))
         self.radius = radius
         self.edges = []
@@ -293,6 +301,7 @@ class NodeItem(QGraphicsEllipseItem):
         self.label_text.setVisible(False)
 
     def _apply_color(self, base_color: QColor):
+        """Fills the node with a soft radial gradient of its colour."""
         gradient = QRadialGradient(0, 0, self.radius)
         gradient.setColorAt(0.0, base_color.lighter(150))
         gradient.setColorAt(1.0, base_color.darker(115))
@@ -322,12 +331,14 @@ class NodeItem(QGraphicsEllipseItem):
             self.halo.setOpacity(1.0)
 
     def itemChange(self, change, value):
+        """Keeps attached lines following the node when it moves."""
         if change == QGraphicsItem.ItemPositionHasChanged:
             for edge in self.edges:
                 edge.sync_position()
         return super().itemChange(change, value)
 
     def hoverEnterEvent(self, event):
+        """Hover: highlights the node and shows its name."""
         self._hovering = True
         self.setPen(self._pen_hover)
         self.halo.setVisible(True)
@@ -337,6 +348,7 @@ class NodeItem(QGraphicsEllipseItem):
         super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event):
+        """Hover ends: hides the name and highlight."""
         self._hovering = False
         self.setPen(self._pen_normal)
         self.label_bg.setVisible(False)
@@ -346,15 +358,18 @@ class NodeItem(QGraphicsEllipseItem):
         super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event):
+        """Pins the node while it is being dragged, so the simulation doesn't move it."""
         self.pinned = True
         self.vx = self.vy = 0.0
         super().mousePressEvent(event)
 
     def mouseReleaseEvent(self, event):
+        """Releases the node back to the simulation after a drag."""
         self.pinned = False
         super().mouseReleaseEvent(event)
 
     def set_radius_live(self, radius: float):
+        """Resizes the node and its halo while it is animating."""
         self.setRect(QRectF(-radius, -radius, radius * 2, radius * 2))
         self.halo.setRect(QRectF(-radius * 1.6, -radius * 1.6, radius * 3.2, radius * 3.2))
 
@@ -369,6 +384,7 @@ class EdgeItem(QGraphicsLineItem):
 
     def __init__(self, node_a: NodeItem, node_b: NodeItem, dashed: bool, color: QColor,
                  rest_length: float = WEB_EDGE_REST_LENGTH, vertical_bias: bool = False):
+        """Creates a line between two nodes, with the spring length the simulation should keep."""
         super().__init__()
         self.node_a = node_a
         self.node_b = node_b
@@ -392,6 +408,7 @@ class EdgeItem(QGraphicsLineItem):
         self.sync_position()
 
     def sync_position(self):
+        """Moves the line to follow its two nodes."""
         self.setLine(QLineF(self.node_a.scenePos(), self.node_b.scenePos()))
 
     def set_flow_active(self, active: bool):
@@ -410,6 +427,7 @@ class EdgeItem(QGraphicsLineItem):
         self.setPen(pen)
 
     def advance_flow(self, delta: float):
+        """Moves the dash pattern along, so dashed lines appear to flow."""
         if not self.flow_active:
             return
         pen = self.pen()
@@ -417,6 +435,7 @@ class EdgeItem(QGraphicsLineItem):
         self.setPen(pen)
 
     def paint(self, painter, option, widget=None):
+        """Draws the line plus an arrowhead pointing from parent to child."""
         super().paint(painter, option, widget)
         p1, p2 = self.line().p1(), self.line().p2()
         dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
@@ -446,6 +465,7 @@ class BraidEdgeItem(EdgeItem):
     """
 
     def __init__(self, node_a, node_b, color, curve_offset, rest_length, vertical_bias):
+        """Creates a curved line, used for branches in the Tree view."""
         super().__init__(node_a, node_b, dashed=False, color=color,
                           rest_length=rest_length, vertical_bias=vertical_bias)
         self.curve_offset = curve_offset
@@ -454,6 +474,7 @@ class BraidEdgeItem(EdgeItem):
         self.setPen(pen)
 
     def _control_point(self):
+        """Returns the control point that bends the curve to one side."""
         p1, p2 = self.line().p1(), self.line().p2()
         mx, my = (p1.x() + p2.x()) / 2, (p1.y() + p2.y()) / 2
         dx, dy = p2.x() - p1.x(), p2.y() - p1.y()
@@ -462,6 +483,7 @@ class BraidEdgeItem(EdgeItem):
         return QPointF(mx + px * self.curve_offset, my + py * self.curve_offset)
 
     def boundingRect(self):
+        """Returns the area the curve and its arrowhead cover, for redrawing."""
         p1, p2 = self.line().p1(), self.line().p2()
         cp = self._control_point()
         xs, ys = (p1.x(), p2.x(), cp.x()), (p1.y(), p2.y(), cp.y())
@@ -470,6 +492,7 @@ class BraidEdgeItem(EdgeItem):
 
     def paint(self, painter, option, widget=None):
         # Draws its own curve and arrowhead instead of EdgeItem's straight line.
+        """Draws the curved line and its arrowhead."""
         p1, p2 = self.line().p1(), self.line().p2()
         cp = self._control_point()
         path = QPainterPath()
@@ -514,6 +537,7 @@ class CanvasView(QGraphicsView):
     nodeDoubleClicked = Signal(object)
 
     def __init__(self, scene, parent=None):
+        """Sets up the map view: smooth drawing, zoom under the mouse, drag and drop."""
         super().__init__(scene, parent)
         self.setRenderHint(QPainter.Antialiasing)
         self.setDragMode(QGraphicsView.NoDrag)
@@ -533,12 +557,14 @@ class CanvasView(QGraphicsView):
         self.verticalScrollBar().valueChanged.connect(lambda _v: self.viewChanged.emit())
 
     def apply_theme(self, bg_hex: str, grid_dot_rgba: tuple):
+        """Applies a theme's background and grid-dot colours."""
         self.bg_color = QColor(bg_hex)
         self.grid_dot_color = QColor(*grid_dot_rgba)
         self.setBackgroundBrush(QBrush(self.bg_color))
         self.viewport().update()
 
     def drawBackground(self, painter, rect):
+        """Draws the background: the dot grid and a soft vignette."""
         super().drawBackground(painter, rect)
 
         # Vignette over the current viewport, so it stays fixed to the window.
@@ -565,6 +591,7 @@ class CanvasView(QGraphicsView):
             y += spacing
 
     def drawForeground(self, painter, rect):
+        """Draws the bright border shown while files are dragged over the map."""
         super().drawForeground(painter, rect)
         if self._drag_active:
             # Drop-zone highlight: shows the drag reached Qt at all.
@@ -575,6 +602,7 @@ class CanvasView(QGraphicsView):
             painter.drawRect(rect.adjusted(4, 4, -4, -4))
 
     def wheelEvent(self, event):
+        """Zooms with the mouse wheel or a two-finger scroll."""
         pixel_delta = event.pixelDelta()
         delta = pixel_delta.y() if not pixel_delta.isNull() else event.angleDelta().y()
         if delta == 0:
@@ -590,6 +618,7 @@ class CanvasView(QGraphicsView):
         self.viewChanged.emit()
 
     def _apply_zoom_factor(self, factor: float):
+        """Zooms by a factor, within the minimum and maximum zoom."""
         current = self.transform().m11()
         target = max(self.MIN_SCALE, min(self.MAX_SCALE, current * factor))
         applied = target / current
@@ -601,12 +630,14 @@ class CanvasView(QGraphicsView):
 
     def event(self, evt):
         # Trackpad pinch arrives as a NativeGesture, which wheelEvent never sees.
+        """Handles touchpad pinch-to-zoom, which arrives as a separate gesture event."""
         if evt.type() == QEvent.NativeGesture and evt.gestureType() == Qt.ZoomNativeGesture:
             self._apply_zoom_factor(1.0 + evt.value())
             return True
         return super().event(evt)
 
     def mouseDoubleClickEvent(self, event):
+        """Double-click on a node zooms in on it and its neighbours."""
         if event.button() == Qt.LeftButton:
             item = self.itemAt(event.pos())
             node = item
@@ -619,6 +650,7 @@ class CanvasView(QGraphicsView):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
+        """Right-click opens a node's menu; left-click on empty space starts moving the view."""
         if event.button() == Qt.RightButton:
             item = self.itemAt(event.pos())
             node = item
@@ -639,6 +671,7 @@ class CanvasView(QGraphicsView):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        """Moves the view while dragging empty space."""
         if self._panning:
             pos = event.position()
             delta = pos - self._pan_last
@@ -650,6 +683,7 @@ class CanvasView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        """Stops moving the view when the mouse is released."""
         if self._panning and event.button() == Qt.LeftButton:
             self._panning = False
             self.setCursor(Qt.ArrowCursor)
@@ -658,6 +692,7 @@ class CanvasView(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event):
+        """Accepts files dragged in from a file manager and shows the drop border."""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             self._drag_active = True
@@ -666,17 +701,20 @@ class CanvasView(QGraphicsView):
             super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event):
+        """Keeps accepting the drag while it moves over the map."""
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
         else:
             super().dragMoveEvent(event)
 
     def dragLeaveEvent(self, event):
+        """Hides the drop border when the drag leaves the map."""
         self._drag_active = False
         self.viewport().update()
         super().dragLeaveEvent(event)
 
     def dropEvent(self, event):
+        """Adds the dropped files to the vault."""
         self._drag_active = False
         self.viewport().update()
         if event.mimeData().hasUrls():
@@ -692,6 +730,7 @@ class MinimapView(QGraphicsView):
     """Overview sharing the main scene; drawForeground marks the visible region."""
 
     def __init__(self, scene, main_view: CanvasView, parent=None):
+        """Sets up the small overview map in the corner."""
         super().__init__(scene, parent)
         self.main_view = main_view
         self.setRenderHint(QPainter.Antialiasing)
@@ -703,12 +742,14 @@ class MinimapView(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
     def refresh_extent(self):
+        """Fits the whole map into the overview."""
         rect = self.scene().itemsBoundingRect()
         if not rect.isEmpty():
             self.fitInView(rect.adjusted(-60, -60, 60, 60), Qt.KeepAspectRatio)
         self.viewport().update()
 
     def drawForeground(self, painter, rect):
+        """Draws the rectangle showing which part of the map is on screen."""
         super().drawForeground(painter, rect)
         visible = self.main_view.mapToScene(self.main_view.viewport().rect()).boundingRect()
         pen = QPen(QColor(ACCENT))
@@ -723,6 +764,7 @@ class MinimapView(QGraphicsView):
 # wrong argument count shows a usage hint.
 
 def _cmd_write(window, label=None):
+    """Palette 'write': asks for a file and adds it, optionally under a given name."""
     path, _ = QFileDialog.getOpenFileName(window, "Choose a file to add")
     if not path:
         return
@@ -732,26 +774,32 @@ def _cmd_write(window, label=None):
 
 
 def _cmd_delete(window, label):
+    """Palette 'delete': deletes a file (asks first)."""
     window._delete_label(label)
 
 
 def _cmd_rename(window, old, new):
+    """Palette 'rename'."""
     window._rename_label_direct(old, new)
 
 
 def _cmd_duplicate(window, label, new_label):
+    """Palette 'duplicate'."""
     window._duplicate_label_direct(label, new_label)
 
 
 def _cmd_fork(window, label, generation):
+    """Palette 'fork': starts a branch from an older generation."""
     window._fork_from_generation_action(label, int(generation))
 
 
 def _cmd_merge(window, label):
+    """Palette 'merge': merges two branches of a file."""
     window._merge_action_for_label(label)
 
 
 def _cmd_graft(window, label_a, label_b, new_label):
+    """Palette 'graft': makes a new file descended from two files."""
     window._perform_write_and_animate(
         lambda: window.engine.graft(label_a, label_b, new_label)
     )
@@ -773,78 +821,96 @@ def _parse_tag_value(raw):
 
 
 def _cmd_tag(window, label, key, value="true"):
+    """Palette 'tag': sets a tag (the value defaults to true)."""
     window.engine.set_tag(label, key, _parse_tag_value(value))
     window._toast(f"Tagged '{label}': {key}={value}")
     window._rebuild()
 
 
 def _cmd_untag(window, label, key):
+    """Palette 'untag': removes a tag."""
     window.engine.remove_tag(label, key)
     window._toast(f"Untagged '{label}': {key}")
     window._rebuild()
 
 
 def _cmd_prune(window, label, generation):
+    """Palette 'prune': frees an old generation's storage (asks first)."""
     window._prune_generation_action(label, int(generation))
 
 
 def _cmd_checkout(window, label, generation):
+    """Palette 'checkout': saves an old generation to a file."""
     window._checkout_generation(label, int(generation))
 
 
 def _cmd_edit(window, label):
+    """Palette 'edit': edits the file in the user's own program."""
     window._edit_label(label)
 
 
 def _cmd_view(window, label):
+    """Palette 'view': opens a read-only copy in the user's own program."""
     window._view_label(label)
 
 
 def _cmd_view_generation(window, label, generation):
+    """Palette 'viewgen': shows an old generation read-only."""
     window._view_generation(label, int(generation))
 
 
 def _cmd_edit_inapp(window, label):
+    """Palette 'editinapp': edits text inside the app."""
     window._edit_label_inapp(label)
 
 
 def _cmd_view_image(window, label):
+    """Palette 'viewimage': shows an image inside the app."""
     window._view_image_inapp(label)
 
 
 def _cmd_search(window, *text_parts):
+    """Palette 'search': fills in the search box."""
     window.search_box.setText(" ".join(text_parts))
 
 
 def _cmd_focus(window):
+    """Palette 'focus': fits everything on screen."""
     window._fit_to_view()
 
 
 def _cmd_web(window):
+    """Palette 'web': switches to the Web view."""
     window._set_mode("web")
 
 
 def _cmd_tree(window):
+    """Palette 'tree': switches to the Tree view."""
     window._set_mode("tree")
 
 
 def _cmd_cladetree(window):
+    """Palette 'cladetree': switches to the Clade Tree view."""
     window._set_mode("cladetree")
 
 
 def _cmd_upgma(window):
+    """Palette 'upgma': builds the Clade Tree with UPGMA."""
     window._set_clade_algorithm("upgma")
 
 
 def _cmd_nj(window):
+    """Palette 'nj': builds the Clade Tree with Neighbour-Joining."""
     window._set_clade_algorithm("nj")
 
 
 def _cmd_export(window):
+    """Palette 'export': saves the map as a PNG."""
     window._export_canvas()
 
 
 def _cmd_sort(window, *_args):
+    """Palette 'sort': opens the Sort/List table."""
     window.list_action.setChecked(True)
     window.list_table.setFocus()
 
@@ -882,6 +948,7 @@ class CommandPalette(QDialog):
     """Ctrl+K command box: filters as you type, Enter runs the top match."""
 
     def __init__(self, window):
+        """Builds the palette popup: a text box and a list of matching commands."""
         super().__init__(window, Qt.Popup)
         self.window = window
         self.setStyleSheet(
@@ -905,6 +972,7 @@ class CommandPalette(QDialog):
         self._update_suggestions("")
 
     def _update_suggestions(self, text):
+        """Shows the commands that match what has been typed so far."""
         self.suggestions.clear()
         cmd = text.split()[0].lower() if text.split() else ""
         for name, (usage, _fn) in sorted(COMMAND_REGISTRY.items()):
@@ -912,6 +980,7 @@ class CommandPalette(QDialog):
                 self.suggestions.addItem(f"{name}  {usage}".strip())
 
     def _execute(self):
+        """Runs the typed command, explaining mistakes (unknown command, wrong arguments, bad quotes)."""
         text = self.input.text().strip()
         self.close()
         if not text:
@@ -945,6 +1014,7 @@ class InAppTextEditorDialog(QDialog):
     """
 
     def __init__(self, parent, label: str, initial_text: str, on_save_callback):
+        """Builds the in-app text editor; on_save_callback stores each save as a new version."""
         super().__init__(parent)
         self.setWindowTitle(f"Edit -- {label}")
         self.resize(760, 600)
@@ -975,6 +1045,7 @@ class InAppTextEditorDialog(QDialog):
         QShortcut(QKeySequence("Ctrl+S"), self).activated.connect(self._save)
 
     def _save(self):
+        """Saves the text as a new version and shows the result."""
         text = self.editor.toPlainText()
         try:
             self._on_save_callback(text)
@@ -990,6 +1061,7 @@ class ConflictResolutionDialog(QDialog):
     """
 
     def __init__(self, parent, label, generation_a, generation_b, positions, describe):
+        """Builds the window that lists each clashing piece with a choice of branch A or B."""
         super().__init__(parent)
         self.setWindowTitle(f"Resolve merge conflicts -- {label}")
         self.resize(640, 460)
@@ -1036,6 +1108,7 @@ class ConflictResolutionDialog(QDialog):
         self._update_merge_button()
 
     def choose_all(self, side):
+        """Chooses the same branch for every clash."""
         for combo in self.combos:
             combo.setCurrentIndex(combo.findData(side))
 
@@ -1045,6 +1118,7 @@ class ConflictResolutionDialog(QDialog):
                 if combo.currentData() is not None}
 
     def _update_merge_button(self, *_):
+        """Enables Merge only once every clash has a choice."""
         self.merge_button.setEnabled(len(self.resolutions()) == len(self.positions))
 
 
@@ -1052,6 +1126,7 @@ class TextViewerDialog(QDialog):
     """Read-only in-app text viewer (past generations)."""
 
     def __init__(self, parent, title: str, text: str):
+        """A read-only window showing text."""
         super().__init__(parent)
         self.setWindowTitle(title)
         self.resize(760, 600)
@@ -1073,6 +1148,7 @@ class ImageViewerDialog(QDialog):
     """Read-only in-app viewer."""
 
     def __init__(self, parent, label: str, image_bytes: bytes):
+        """A window showing an image, scaled to fit."""
         super().__init__(parent)
         self.setWindowTitle(f"View -- {label}")
         self.resize(820, 640)
@@ -1099,6 +1175,7 @@ class ChunkMapWidget(QWidget):
     """
 
     def __init__(self, positions, parent=None):
+        """A strip of coloured cells, one per chunk, showing how two versions differ."""
         super().__init__(parent)
         self.positions = positions
         self.setMinimumHeight(46)
@@ -1106,6 +1183,7 @@ class ChunkMapWidget(QWidget):
         self._last_hover_index = None
 
     def _color_for(self, status):
+        """Returns the cell colour for a chunk's status."""
         return {
             lineage_diff.UNCHANGED: _DIFF_UNCHANGED_COLOR,
             lineage_diff.CHANGED: _DIFF_CHANGED_COLOR,
@@ -1114,6 +1192,7 @@ class ChunkMapWidget(QWidget):
         }[status]
 
     def paintEvent(self, event):
+        """Draws one coloured cell per chunk."""
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
         w, h = self.width(), self.height()
@@ -1130,6 +1209,7 @@ class ChunkMapWidget(QWidget):
         painter.end()
 
     def mouseMoveEvent(self, event):
+        """Shows a tooltip describing the chunk under the mouse."""
         n = len(self.positions)
         if n == 0 or self.width() <= 0:
             return
@@ -1144,6 +1224,7 @@ class ChunkMapWidget(QWidget):
                                f"chunk {index}: {pos.status}\nold: {old_hex}\nnew: {new_hex}", self)
 
     def leaveEvent(self, event):
+        """Hides the tooltip when the mouse leaves."""
         self._last_hover_index = None
         QToolTip.hideText()
 
@@ -1156,6 +1237,7 @@ class LineageDiffDialog(QDialog):
 
     def __init__(self, parent, result: "lineage_diff.LineageDiffResult", theme_colors: dict,
                  text_diff_lines=None):
+        """Builds the version-comparison window: the chunk strip, counts and, for text, the changed lines."""
         super().__init__(parent)
         self.result = result  # the structured result, for tests and callers
         self.setWindowTitle(f"Lineage diff -- '{result.label}' gen {result.generation_old} -> "
@@ -1218,7 +1300,9 @@ class LineageDiffDialog(QDialog):
 # ---------- main window ----------
 
 class VaultGraphWindow(QMainWindow):
+    """The main window: the map of the vault, its three views, toolbars, panels and every action."""
     def __init__(self, engine):
+        """Builds the window for an open engine and draws the first view."""
         super().__init__()
         self.engine = engine
         self.engine.start_clade_worker()
@@ -1303,6 +1387,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- chrome ----------
 
     def _build_toolbar(self):
+        """Builds the top toolbar: views, visual tools, adding files, export, list, palette and theme."""
         toolbar = QToolBar("View", self)
         toolbar.setMovable(False)
 
@@ -1400,6 +1485,7 @@ class VaultGraphWindow(QMainWindow):
         self.addToolBar(toolbar)
 
     def _build_dock(self):
+        """Builds the Details panel on the right."""
         self.info_panel = QTextEdit(self)
         self.info_panel.setReadOnly(True)
         self.info_panel.setFixedWidth(340)
@@ -1409,6 +1495,7 @@ class VaultGraphWindow(QMainWindow):
         self.addDockWidget(Qt.RightDockWidgetArea, dock)
 
     def _build_list_dock(self):
+        """Builds the Sort/List table panel."""
         container = QWidget(self)  # background from the app-wide stylesheet, so it re-themes
         layout = QVBoxLayout(container)
         layout.setContentsMargins(8, 8, 8, 8)
@@ -1442,6 +1529,7 @@ class VaultGraphWindow(QMainWindow):
         self.list_dock.setVisible(False)
 
     def _build_statusbar(self):
+        """Builds the status bar: vault summary, speed readout, zoom slider, lock and pause."""
         self.status = QStatusBar(self)
         self.setStatusBar(self.status)
 
@@ -1479,6 +1567,7 @@ class VaultGraphWindow(QMainWindow):
         self.status.addPermanentWidget(self.physics_pause_button)
 
     def _build_time_bar(self):
+        """Builds the Time Machine slider bar at the bottom."""
         time_bar = QToolBar("Time Machine", self)
         time_bar.setMovable(False)
         time_bar.addWidget(QLabel("⏱  Time Machine:", self))
@@ -1494,11 +1583,13 @@ class VaultGraphWindow(QMainWindow):
         self.addToolBar(Qt.BottomToolBarArea, time_bar)
 
     def _build_minimap(self):
+        """Places the overview map in the top-left corner of the map."""
         self.minimap = MinimapView(self.scene, self.view, self.view)
         self.minimap.move(12, 12)
         self.minimap.raise_()
 
     def _build_toast(self):
+        """Builds the short message label shown near the bottom of the map."""
         self.toast_label = QLabel("", self.view)
         self.toast_label.setStyleSheet(
             f"background: {INPUT_BG}; color: {TEXT}; border: 1px solid {ACCENT}; "
@@ -1510,6 +1601,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast_timer.timeout.connect(self.toast_label.hide)
 
     def _toast(self, message: str):
+        """Shows a short message near the bottom of the map that fades after a few seconds."""
         self.toast_label.setText(message)
         self.toast_label.adjustSize()
         x = max(8, (self.view.width() - self.toast_label.width()) // 2)
@@ -1520,6 +1612,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast_timer.start(3000)
 
     def resizeEvent(self, event):
+        """Keeps the message centred when the window is resized."""
         super().resizeEvent(event)
         if hasattr(self, "toast_label") and self.toast_label.isVisible():
             x = max(8, (self.view.width() - self.toast_label.width()) // 2)
@@ -1565,6 +1658,7 @@ class VaultGraphWindow(QMainWindow):
         button.setFixedHeight(30)
 
         def dismiss():
+            """Closes the welcome panel and remembers, in the vault folder, that it was seen."""
             try:
                 with open(marker_path, "w") as f:
                     f.write("seen")
@@ -1583,26 +1677,31 @@ class VaultGraphWindow(QMainWindow):
         overlay.raise_()
 
     def _on_main_view_changed(self):
+        """Redraws the overview map's 'you are here' rectangle when the view moves."""
         if hasattr(self, "minimap"):
             self.minimap.viewport().update()
 
     # ---------- zoom slider <-> view sync ----------
 
     def _scale_to_slider(self, scale: float) -> int:
+        """Converts a zoom level to a position on the zoom slider (logarithmic)."""
         scale = max(CanvasView.MIN_SCALE, min(CanvasView.MAX_SCALE, scale))
         ratio = math.log(scale / CanvasView.MIN_SCALE) / math.log(CanvasView.MAX_SCALE / CanvasView.MIN_SCALE)
         return int(ratio * 1000)
 
     def _slider_to_scale(self, value: int) -> float:
+        """Converts a zoom slider position to a zoom level."""
         ratio = value / 1000
         return CanvasView.MIN_SCALE * (CanvasView.MAX_SCALE / CanvasView.MIN_SCALE) ** ratio
 
     def _on_view_zoom_changed(self, scale: float):
+        """Moves the zoom slider to match the current zoom."""
         self._syncing_zoom = True
         self.zoom_slider.setValue(self._scale_to_slider(scale))
         self._syncing_zoom = False
 
     def _on_slider_changed(self, value: int):
+        """Zooms the map to match the zoom slider."""
         if self._syncing_zoom:
             return
         current = self.view.transform().m11()
@@ -1613,16 +1712,19 @@ class VaultGraphWindow(QMainWindow):
         self.view.viewChanged.emit()
 
     def _on_lock_toggled(self, checked: bool):
+        """Locks or unlocks the layout (when locked, dragging moves the view, not nodes)."""
         self.view.locked = checked
         self.lock_button.setText("🔒" if checked else "🔓")
 
     def _on_physics_pause_toggled(self, checked: bool):
+        """Pauses or resumes all movement."""
         self._physics_paused = checked
         self.physics_pause_button.setText("▶" if checked else "⏸")
         if checked:
             self.perf_label.setText("physics paused")
 
     def _on_theme_toggled(self, checked: bool):
+        """Switches between the dark and light themes."""
         app = QApplication.instance()
         self._light_theme = checked
         if checked:
@@ -1637,6 +1739,7 @@ class VaultGraphWindow(QMainWindow):
         self._refresh_details_panel_theme()
 
     def _theme_colors(self):
+        """Returns the current theme's colours for dialogs and the Details panel."""
         if getattr(self, "_light_theme", False):
             return {"panel": LIGHT_INPUT_BG, "border": LIGHT_BORDER, "text": LIGHT_TEXT,
                      "dim": LIGHT_TEXT_DIM, "accent": LIGHT_ACCENT}
@@ -1711,6 +1814,7 @@ class VaultGraphWindow(QMainWindow):
         anim.setEasingCurve(QEasingCurve.InOutCubic)
 
         def step(t):
+            """Moves and zooms the view part of the way through the animation (t from 0 to 1)."""
             t = float(t)
             scale = start_scale + (end_scale - start_scale) * t
             cx = start_center.x() + (end_center.x() - start_center.x()) * t
@@ -1743,6 +1847,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- mode switching ----------
 
     def _set_mode(self, mode: str):
+        """Switches to the Web, Tree or Clade Tree view and redraws."""
         if mode == self._mode:
             return
         self._mode = mode
@@ -1756,6 +1861,7 @@ class VaultGraphWindow(QMainWindow):
         self._rebuild()
 
     def _set_clade_algorithm(self, algo: str):
+        """Chooses UPGMA or Neighbour-Joining and shows the Clade Tree."""
         self._clade_algorithm = algo
         if self._mode != "cladetree":
             self.cladetree_action.setChecked(True)
@@ -1767,6 +1873,7 @@ class VaultGraphWindow(QMainWindow):
     REMEMBERED_LAYOUT_MODES = ("web", "tree")
 
     def _rebuild(self):
+        """Redraws the current view from the vault, keeping nodes where the user left them."""
         for anim in list(self._active_animations):
             anim.stop()
         self._active_animations = []
@@ -1815,6 +1922,7 @@ class VaultGraphWindow(QMainWindow):
 
     def _update_pulsing_nodes(self):
         # Wall-clock time, not the vault's newest timestamp.
+        """Starts a pulse on nodes saved in the last few seconds."""
         now = time.time()
         recent_nodes = set()
         for node in self._node_items.values():
@@ -1827,6 +1935,7 @@ class VaultGraphWindow(QMainWindow):
             edge.set_flow_active(edge.node_a in recent_nodes or edge.node_b in recent_nodes)
 
     def _start_node_pulse(self, node):
+        """Animates a soft pulse around a node."""
         node.halo.setVisible(True)
         node.mark_pulsing(True)
         anim = QVariantAnimation(self)
@@ -1843,6 +1952,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- shared node/edge creation ----------
 
     def _make_node(self, key, x, y, radius, color, display_text, owner_label=None, birth_ts=None, glyph=""):
+        """Creates a node on the map and registers it under its key."""
         node = NodeItem(radius, display_text, color, glyph=glyph)
         node.setPos(x, y)
         node.setData(0, key)
@@ -1855,6 +1965,7 @@ class VaultGraphWindow(QMainWindow):
 
     def _make_edge(self, node_a, node_b, dashed, color_override=None, rest_length=None,
                     vertical_bias=False, curve_offset=None):
+        """Creates a line between two nodes (curved if curve_offset is given)."""
         if rest_length is None:
             rest_length = LATERAL_EDGE_REST_LENGTH if dashed else WEB_EDGE_REST_LENGTH
         if curve_offset is not None:
@@ -1869,11 +1980,13 @@ class VaultGraphWindow(QMainWindow):
         return edge
 
     def _node_fill_color(self, phenotype_name, shared_count, total_count):
+        """Returns a node's colour: by file type, or by shared content when Dedup Heat is on."""
         if self.heatmap_action.isChecked():
             return _heatmap_color((shared_count or 0) / (total_count or 1))
         return _color_for_phenotype(phenotype_name)
 
     def _show_empty_state(self, message: str):
+        """Shows the 'your vault is empty' message."""
         text = self.scene.addText("Your vault is empty.\nDrop a file here, or click ＋ New File(s).")
         text.setDefaultTextColor(QColor(TEXT_DIM))
         font = QFont("Sans", 14)
@@ -1888,6 +2001,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- data gathering ----------
 
     def _gather(self):
+        """Collects every file's summary, fingerprints and history, for drawing."""
         meta_by_label = {}
         fingerprints = {}
         for label in self.engine.labels():
@@ -1902,6 +2016,7 @@ class VaultGraphWindow(QMainWindow):
         return list(meta_by_label.keys()), meta_by_label, fingerprints, histories
 
     def _update_stats_hud(self, meta_by_label):
+        """Updates the vault summary in the status bar (sizes, sharing, unmerged branches)."""
         total_size = sum(m.get("original_size", 0) for m in meta_by_label.values())
         total_blocks = sum(m.get("total_blocks", 0) for m in meta_by_label.values())
         total_dup = sum(m.get("duplicate_chunks_found", 0) for m in meta_by_label.values())
@@ -1919,6 +2034,7 @@ class VaultGraphWindow(QMainWindow):
         )
 
     def _refresh_list_table(self):
+        """Fills the Sort/List table with one row per file."""
         _labels, meta_by_label, _fp, histories = self._gather()
         self.list_table.setSortingEnabled(False)
         self.list_table.setRowCount(len(meta_by_label))
@@ -1974,6 +2090,7 @@ class VaultGraphWindow(QMainWindow):
                                           target_node.scenePos().y() - 160, 320, 320))
 
     def _layout(self, labels, fingerprints):
+        """Places files for the Web view: a spring layout where similar files are pulled together."""
         graph = nx.Graph()
         graph.add_nodes_from(labels)
         analyzer = PhylogeneticAnalyzer()
@@ -1992,6 +2109,7 @@ class VaultGraphWindow(QMainWindow):
         return {label: (float(x) * LAYOUT_SCALE, float(y) * LAYOUT_SCALE) for label, (x, y) in pos.items()}
 
     def _lineage_forest_layout(self, histories):
+        """Places every version for the Tree view: each file's history as a tree, side by side."""
         all_nodes = {}
         for label, history in histories.items():
             for node in history:
@@ -2009,6 +2127,7 @@ class VaultGraphWindow(QMainWindow):
         next_x = [0.0]
 
         def layout_subtree(uuid, depth):
+            """Places one version and, recursively, the versions made from it."""
             kids = children[uuid]
             if not kids:
                 x = next_x[0]
@@ -2029,6 +2148,7 @@ class VaultGraphWindow(QMainWindow):
         return positions, all_nodes
 
     def _clade_tree_layout(self, all_nodes):
+        """Places the nodes of a similarity tree, with branch lengths as vertical distances."""
         by_uuid = {n.node_uuid: n for n in all_nodes}
         children = {n.node_uuid: [] for n in all_nodes}
         roots = []
@@ -2041,6 +2161,7 @@ class VaultGraphWindow(QMainWindow):
         depth = {}
 
         def compute_depth(uid, accumulated):
+            """Records how far each node is from the root, adding up branch lengths."""
             depth[uid] = accumulated
             for child_uuid in children[uid]:
                 compute_depth(child_uuid, accumulated + by_uuid[child_uuid].branch_length)
@@ -2052,6 +2173,7 @@ class VaultGraphWindow(QMainWindow):
         next_x = [0.0]
 
         def layout_subtree(uid):
+            """Places one tree node and, recursively, its children."""
             kids = children[uid]
             if not kids:
                 x = next_x[0]
@@ -2094,6 +2216,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- web mode ----------
 
     def _build_web_graph(self):
+        """Draws the Web view: one node per file, and lines for duplicates and grafts."""
         labels, meta_by_label, fingerprints, histories = self._gather()
         self._update_stats_hud(meta_by_label)
         self._time_machine_histories = histories
@@ -2145,6 +2268,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- lineage tree mode ----------
 
     def _build_tree_graph(self):
+        """Draws the Tree view: one node per version, lines from each version to the next, branches curved."""
         _labels, meta_by_label, _fp, histories = self._gather()
         self._update_stats_hud(meta_by_label)
 
@@ -2194,6 +2318,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- clade tree mode (UPGMA / NJ) ----------
 
     def _build_clade_tree_graph(self):
+        """Draws the Clade Tree view from the background worker's UPGMA or NJ tree."""
         _labels, meta_by_label, fingerprints, _hist = self._gather()
         self._update_stats_hud(meta_by_label)
         if len(fingerprints) < 2:
@@ -2252,6 +2377,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- clade outline overlay (web mode) ----------
 
     def _clear_clade_blobs(self):
+        """Removes the Outline circles."""
         for item in self._clade_blob_items:
             if item.scene() is not None:
                 self.scene.removeItem(item)
@@ -2261,6 +2387,7 @@ class VaultGraphWindow(QMainWindow):
         self._clade_blob_by_key = {}
 
     def _draw_clade_blobs(self):
+        """Draws an Outline circle around each group of similar files."""
         self._clear_clade_blobs()
         if self._mode != "web":
             return
@@ -2331,11 +2458,13 @@ class VaultGraphWindow(QMainWindow):
         self._render_cards("Clades", clade_cards)
 
     def closeEvent(self, event):
+        """Stops the timers when the window closes."""
         self._clade_poll_timer.stop()
         self._vault_refresh_timer.stop()
         super().closeEvent(event)
 
     def _poll_vault_changes(self):
+        """Checks for changes other programs made to the vault, and redraws if there were any."""
         try:
             changed = self.engine.refresh()
         except Exception as e:  # e.g. the write lock timed out; try again next tick
@@ -2346,12 +2475,14 @@ class VaultGraphWindow(QMainWindow):
             self._toast("Updated with changes made by another program")
 
     def _poll_clade_updates(self):
+        """Redraws the Outline circles when the background grouping changes."""
         if self._mode != "web" or not self.clade_action.isChecked():
             return
         if self.engine.clade_version() != self._clade_version_drawn:
             self._draw_clade_blobs()
 
     def _on_clade_toggle(self, checked: bool):
+        """Turns Outline on or off."""
         if checked:
             self._draw_clade_blobs()
         else:
@@ -2360,6 +2491,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- search ----------
 
     def _apply_search_filter(self, text: str):
+        """Fades nodes whose names don't match the search text."""
         text = text.strip().lower()
         for node in self._node_items.values():
             owner = node.data(1) or ""
@@ -2372,6 +2504,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- time machine ----------
 
     def _configure_time_bar(self):
+        """Enables the Time Machine slider when there is history, and resets it to 'now'."""
         has_bounds = self._time_bounds is not None
         self.time_slider.setEnabled(has_bounds)
         self.time_slider.blockSignals(True)
@@ -2380,6 +2513,7 @@ class VaultGraphWindow(QMainWindow):
         self._on_time_slider_changed(1000)
 
     def _on_time_slider_changed(self, value: int):
+        """Shows the vault as it was at the slider's moment."""
         if self._time_bounds is None:
             self.time_label.setText("(no data)")
             return
@@ -2502,6 +2636,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- selection / details ----------
 
     def _on_selection_changed(self):
+        """Updates the Details panel for the selection: one file, one version, or a comparison of two."""
         selected = self.scene.selectedItems()
         if not selected:
             return
@@ -2524,6 +2659,7 @@ class VaultGraphWindow(QMainWindow):
             self._show_details_for_clade_node(key)
 
     def _show_details_for_label(self, label):
+        """Shows a file's cards in the Details panel: file facts, history and tags."""
         meta = self.engine.get_metadata(label)
         if meta is None:
             return
@@ -2562,6 +2698,7 @@ class VaultGraphWindow(QMainWindow):
         self._render_cards(label, cards)
 
     def _show_details_for_generation(self, node_uuid):
+        """Shows one version's details: when it was saved, its chunks, and whether it was pruned."""
         found = self.engine.find_node_by_uuid(node_uuid)
         if found is None:
             return
@@ -2581,6 +2718,7 @@ class VaultGraphWindow(QMainWindow):
         self._render_cards(f"{owning_label} · gen {node.generation_index}", cards)
 
     def _show_details_for_clade_node(self, node_uuid):
+        """Shows details for a Clade Tree node: the file it stands for, or the group it joins."""
         owner = self._node_items[node_uuid].data(1)
         if owner:
             self._show_details_for_label(owner)
@@ -2590,6 +2728,7 @@ class VaultGraphWindow(QMainWindow):
             ])
 
     def _show_diff_between(self, label_a, label_b):
+        """Compares two files: how similar they are, and what they share and don't."""
         _labels, meta_by_label, fingerprints, _hist = self._gather()
         fp_a, fp_b = fingerprints.get(label_a), fingerprints.get(label_b)
         if fp_a is None or fp_b is None:
@@ -2680,6 +2819,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- write actions ----------
 
     def _show_node_context_menu(self, node: NodeItem, local_pos: QPoint):
+        """Builds and shows the right-click menu for a node, depending on the view."""
         global_pos = self.view.viewport().mapToGlobal(local_pos)
         menu = QMenu(self)
         if self._mode == "web":
@@ -2747,6 +2887,7 @@ class VaultGraphWindow(QMainWindow):
         self._rebuild()
 
     def _rename_label(self, label):
+        """Asks for a new name and renames the file."""
         new_label, ok = QInputDialog.getText(self, "Rename", f"New name for '{label}':", text=label)
         if not ok or not new_label.strip() or new_label.strip() == label:
             return
@@ -2769,6 +2910,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Duplicated '{label}' -> '{new_label}' (zero-cost content alias, linked back to '{label}')")
 
     def _duplicate_label(self, label):
+        """Asks for a name and makes a zero-cost duplicate."""
         new_label, ok = QInputDialog.getText(self, "Duplicate", f"New label for a copy of '{label}':")
         if not ok or not new_label.strip():
             return
@@ -2778,6 +2920,7 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "Duplicate", str(e))
 
     def _delete_label(self, label):
+        """Asks for confirmation, then deletes the file and its history."""
         confirm = QMessageBox.question(
             self, "Delete", f"Delete '{label}' and its full history? This cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
@@ -2793,6 +2936,7 @@ class VaultGraphWindow(QMainWindow):
         self._rebuild()
 
     def _trace_ancestry(self, label):
+        """Fades everything except the file and the chain of files it was made from."""
         _labels, _meta, _fp, histories = self._gather()
         uuid_to_label = {}
         for lbl, hist in histories.items():
@@ -2824,6 +2968,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Highlighting ancestry of '{label}' ({len(chain)} label(s)) -- clear the search box to reset")
 
     def _reveal_in_tree(self, label):
+        """Switches to the Tree view and centres on the file's latest version."""
         self._set_mode("tree")
         history = self.engine.get_history(label)
         if not history:
@@ -2836,6 +2981,7 @@ class VaultGraphWindow(QMainWindow):
             self._animate_view_to(QRectF(node.scenePos().x() - 160, node.scenePos().y() - 160, 320, 320))
 
     def _checkout_generation(self, label, generation_index):
+        """Asks where to save, then writes an old generation there as an ordinary file."""
         path, _ = QFileDialog.getSaveFileName(self, f"Checkout {label} gen {generation_index} to...")
         if not path:
             return
@@ -2847,6 +2993,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Saved {label} gen {generation_index} to {path}")
 
     def _prune_generation_action(self, label, generation_index):
+        """Asks for confirmation, then frees an old generation's storage."""
         confirm = QMessageBox.question(
             self, "Prune",
             f"Prune '{label}' generation {generation_index}? This frees its storage (if nothing else "
@@ -2863,6 +3010,7 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "Prune failed", str(e))
 
     def _fork_from_generation_action(self, label, generation_index):
+        """Asks for a file and stores it as a branch from an older generation."""
         path, _ = QFileDialog.getOpenFileName(self, f"Fork '{label}' generation {generation_index} with...")
         if not path:
             return
@@ -2872,6 +3020,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Forked '{label}' from generation {generation_index}")
 
     def _merge_action_for_label(self, label):
+        """Merges two branches, asking which ones, and opens the conflict window if parts clash."""
         heads = self.engine.get_heads(label)
         if len(heads) < 2:
             return
@@ -2900,25 +3049,30 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "Merge failed", str(e))
 
     def _merge_with_resolutions(self, label, gen_a, gen_b, resolutions):
+        """Runs the merge with the user's choices and reports the result."""
         self._perform_write_and_animate(
             lambda: self.engine.merge_branches(label, gen_a, gen_b, resolutions or None))
         extra = f" ({len(resolutions)} conflict(s) resolved)" if resolutions else ""
         self._toast(f"Merged '{label}' generations {gen_a} and {gen_b}{extra}")
 
     def _conflict_dialog(self, label, gen_a, gen_b, positions):
+        """Opens the conflict window for a merge, with a description of each side's piece."""
         chunks = {"a": self.engine.get_chunk_hashes(label, gen_a),
                   "b": self.engine.get_chunk_hashes(label, gen_b)}
 
         def describe(side, pos):
+            """Describes one side's piece at a clashing position, or notes that its file ends earlier."""
             return "its version" if pos < len(chunks[side]) else "the file ends before here"
         return ConflictResolutionDialog(self, label, gen_a, gen_b, positions, describe)
 
     def _new_file_dialog(self):
+        """Asks for one or more files and adds them."""
         paths, _ = QFileDialog.getOpenFileNames(self, "Choose one or more files to add to the vault")
         if paths:
             self._add_files(paths)
 
     def _on_files_dropped(self, paths):
+        """Adds the files dropped on the map, ignoring anything that isn't a file."""
         real_paths = [p for p in paths if os.path.isfile(p)]
         if real_paths:
             self._add_files(real_paths)
@@ -2926,6 +3080,7 @@ class VaultGraphWindow(QMainWindow):
             self._toast("Drop didn't include any readable file path -- try + New File(s) instead")
 
     def _unique_label_from_path(self, path: str) -> str:
+        """Returns the file's name, with a number added if that name is already taken."""
         base = os.path.basename(path)
         if not self.engine.has_label(base):
             return base
@@ -2950,6 +3105,7 @@ class VaultGraphWindow(QMainWindow):
             self._toast(f"Added {len(added)} file(s): {', '.join(added)}")
 
     def _add_file(self, path):
+        """Adds a single file."""
         self._add_files([path])
 
     # ---------- edit-in-place (open in the OS default app, auto-sync back) ----------
@@ -3052,6 +3208,7 @@ class VaultGraphWindow(QMainWindow):
             initial_text = f.read()
 
         def on_save(new_text):
+            """Stores the editor's text as a new version and switches to the Tree view."""
             with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(new_text)
             self._perform_write_and_animate(lambda: self.engine.commit_write(label, tmp_path))
@@ -3062,6 +3219,7 @@ class VaultGraphWindow(QMainWindow):
         self._active_dialogs.append(dlg)
 
         def cleanup(_result=None):
+            """Deletes the editor's temporary file when the editor closes."""
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
             if dlg in self._active_dialogs:
@@ -3088,6 +3246,7 @@ class VaultGraphWindow(QMainWindow):
         dlg.show()
 
     def _on_edited_file_changed(self, label, path):
+        """Called when an externally edited file changes on disk: stores it, and re-watches it if needed."""
         self._check_and_commit_edit(label, path)
         for session in self._edit_sessions.get(label, []):
             if session["path"] == path:
@@ -3097,6 +3256,7 @@ class VaultGraphWindow(QMainWindow):
                 break
 
     def _check_and_commit_edit(self, label, path):
+        """Stores an externally edited file as a new version, if its content really changed."""
         session = next((s for s in self._edit_sessions.get(label, []) if s["path"] == path), None)
         if session is None or not os.path.exists(path):
             return  # editors may briefly remove the file mid-save
@@ -3126,6 +3286,7 @@ class VaultGraphWindow(QMainWindow):
                     watcher.addPath(path)
 
     def _export_canvas(self):
+        """Asks where to save, then exports the whole map as a PNG."""
         path, _ = QFileDialog.getSaveFileName(self, "Export canvas", "pfs_cosmic_web.png", "PNG Images (*.png)")
         if not path:
             return
@@ -3142,6 +3303,7 @@ class VaultGraphWindow(QMainWindow):
         self._toast(f"Exported canvas to {path}")
 
     def _cycle_selection(self, direction: int):
+        """Selects the next (or previous) node and centres the view on it, for Tab/Shift+Tab."""
         keys = list(self._node_items.keys())
         if not keys:
             return
@@ -3158,6 +3320,7 @@ class VaultGraphWindow(QMainWindow):
         self.view.centerOn(target)
 
     def _open_command_palette(self):
+        """Opens the command palette over the map."""
         dlg = CommandPalette(self)
         center = self.view.mapToGlobal(self.view.rect().center())
         dlg.move(center.x() - dlg.width() // 2, max(40, center.y() - 200))
@@ -3165,6 +3328,7 @@ class VaultGraphWindow(QMainWindow):
         dlg.input.setFocus()
 
     def keyPressEvent(self, event):
+        """Keyboard shortcuts: Tab/Shift+Tab, Home, Delete and Ctrl+K."""
         if event.key() == Qt.Key_Tab:
             self._cycle_selection(1)
             return
@@ -3183,6 +3347,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- speciation-on-write animation ----------
 
     def _snapshot_keys(self):
+        """Returns the keys of the nodes currently shown (files, or versions in the Tree view)."""
         if self._mode == "web":
             return set(self.engine.labels())
         keys = set()
@@ -3192,6 +3357,7 @@ class VaultGraphWindow(QMainWindow):
         return keys
 
     def _perform_write_and_animate(self, write_fn):
+        """Runs a change, redraws, and animates the nodes and lines that appeared."""
         before = self._snapshot_keys()
         write_fn()
         self._rebuild()
@@ -3206,6 +3372,7 @@ class VaultGraphWindow(QMainWindow):
                 self._spawn_particle_trail(edge)
 
     def _track_animation(self, anim):
+        """Keeps a running animation referenced until it finishes."""
         self._active_animations.append(anim)
         anim.finished.connect(lambda: self._active_animations.remove(anim) if anim in self._active_animations else None)
 
@@ -3215,6 +3382,7 @@ class VaultGraphWindow(QMainWindow):
         timer.timeout.connect(lambda: self._pending_timers.remove(timer) if timer in self._pending_timers else None)
 
     def _animate_node_appearance(self, node: NodeItem):
+        """Grows a new node from nothing to its full size."""
         target_radius = node.radius
         anim = QVariantAnimation(self)
         anim.setStartValue(0.0)
@@ -3226,6 +3394,7 @@ class VaultGraphWindow(QMainWindow):
         anim.start()
 
     def _animate_edge_appearance(self, edge: EdgeItem):
+        """Fades a new line in."""
         anim = QVariantAnimation(self)
         anim.setStartValue(0.0)
         anim.setEndValue(EDGE_REST_OPACITY)
@@ -3255,6 +3424,7 @@ class VaultGraphWindow(QMainWindow):
             anim.setEasingCurve(QEasingCurve.InOutQuad)
 
             def step(t, particle=particle, parent_pos=parent_pos, child_pos=child_pos):
+                """Moves one particle along the line (t from 0 to 1)."""
                 t = float(t)
                 x = parent_pos.x() + (child_pos.x() - parent_pos.x()) * t
                 y = parent_pos.y() + (child_pos.y() - parent_pos.y()) * t
@@ -3262,6 +3432,7 @@ class VaultGraphWindow(QMainWindow):
                 particle.setOpacity(math.sin(t * math.pi))
 
             def cleanup(particle=particle):
+                """Removes the particle when its animation ends."""
                 if particle.scene() is not None:
                     self.scene.removeItem(particle)
 
@@ -3280,6 +3451,7 @@ class VaultGraphWindow(QMainWindow):
     # ---------- live physics ("organic hydra" behavior) ----------
 
     def _physics_tick(self):
+        """One animation step: runs the physics and updates the speed readout."""
         if self._physics_paused:
             return
         started = time.perf_counter()
@@ -3302,6 +3474,7 @@ class VaultGraphWindow(QMainWindow):
                 self.perf_label.setStyleSheet("")
 
     def _physics_tick_body(self):
+        """The physics: nodes push apart, connected nodes pull together, and Outline/Swirl forces apply."""
         for edge in self._edge_items:
             edge.advance_flow(0.6)
 
@@ -3458,6 +3631,7 @@ def _existing_vault_engine(storage_root: str):
 
 
 def _open_python_engine(storage_root: str):
+    """Opens a Python-engine vault, asking for the passphrase in dialogs; refuses C++-engine vaults."""
     existing = _existing_vault_engine(storage_root)
     if existing == "cpp":
         QMessageBox.critical(None, "Wrong Engine", f"'{storage_root}' is a C++-engine vault "
@@ -3467,6 +3641,7 @@ def _open_python_engine(storage_root: str):
     session = VaultSession(storage_root)
 
     def get_new_passphrase():
+        """Asks for a new passphrase twice in dialogs."""
         pw1, ok1 = QInputDialog.getText(None, "New Vault", "Set a new vault passphrase:", QLineEdit.Password)
         if not ok1:
             sys.exit(0)
@@ -3476,12 +3651,14 @@ def _open_python_engine(storage_root: str):
         return pw1, pw2
 
     def get_existing_passphrase():
+        """Asks for the existing passphrase in a dialog."""
         pw, ok = QInputDialog.getText(None, "Unlock Vault", f"Passphrase for {storage_root}:", QLineEdit.Password)
         if not ok:
             sys.exit(0)
         return pw
 
     def confirm_reset():
+        """Asks whether to discard vault files that don't match this key."""
         result = QMessageBox.warning(
             None, "Vault Mismatch",
             "This vault's other files don't decrypt under this key. Discard them and start fresh?",
@@ -3498,6 +3675,7 @@ def _open_python_engine(storage_root: str):
 
 
 def _open_cpp_engine(storage_root: str):
+    """Opens a C++-engine vault, asking for the passphrase in dialogs; refuses Python-engine vaults."""
     from gearhash.master_key_store import create_new_vault_key, load_vault_key, WrongPassphraseError, MASTER_KEY_FILENAME
     from pfs_engine_binding import CppVaultSession, PfsEngineError
 
@@ -3541,11 +3719,12 @@ def _open_cpp_engine(storage_root: str):
 
 
 def main():
+    """Starts the desktop app: parses the arguments, opens the vault and shows the window."""
     parser = argparse.ArgumentParser(description="PFS Cosmic Web GUI")
     parser.add_argument("storage_root", help="vault directory")
     parser.add_argument("--engine", choices=["python", "cpp"], default="python",
                          help="storage backend -- 'python' (default) or 'cpp' (the compiled "
-                              "engine, same GUI feature set -- see manual.txt PART 10). A vault "
+                              "engine, same GUI feature set -- see user_manual.pdf). A vault "
                               "belongs to the engine that created it; the other engine refuses "
                               "to open it.")
     args = parser.parse_args()

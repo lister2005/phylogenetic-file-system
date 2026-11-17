@@ -24,16 +24,19 @@ class PfsMergeConflictError(PfsEngineError):
     """
 
     def __init__(self, message, conflicting_positions):
+        """Keeps the clashing chunk positions alongside the message."""
         super().__init__(message)
         self.conflicting_positions = list(conflicting_positions)
 
 
 class GenerationInfo:
+    """One saved version of a file, as reported by the C++ engine."""
     __slots__ = ("generation_index", "birth_timestamp", "new_chunks", "total_chunks",
                  "pruned", "has_parent", "node_uuid_hex", "parent_uuid_hex", "lateral_parent_count")
 
     def __init__(self, generation_index, birth_timestamp, new_chunks, total_chunks,
                  pruned, has_parent, node_uuid_hex, parent_uuid_hex, lateral_parent_count=0):
+        """Stores the version's fields as given."""
         self.generation_index = generation_index
         self.birth_timestamp = birth_timestamp
         self.new_chunks = new_chunks
@@ -45,11 +48,13 @@ class GenerationInfo:
         self.lateral_parent_count = lateral_parent_count
 
     def __repr__(self):
+        """Shows the main fields, for debugging."""
         return (f"GenerationInfo(gen={self.generation_index}, new_chunks={self.new_chunks}, "
                 f"total_chunks={self.total_chunks}, pruned={self.pruned})")
 
 
 class _CGenerationInfo(ctypes.Structure):
+    """C layout of a version record, as filled in by the C++ engine."""
     _fields_ = [
         ("generation_index", ctypes.c_uint64),
         ("birth_timestamp", ctypes.c_double),
@@ -64,6 +69,7 @@ class _CGenerationInfo(ctypes.Structure):
 
 
 class _CManifestInfo(ctypes.Structure):
+    """C layout of a recipe's summary (size, chunk counts, type)."""
     _fields_ = [
         ("total_blocks", ctypes.c_uint64),
         ("original_size", ctypes.c_uint64),
@@ -78,6 +84,7 @@ class _CManifestInfo(ctypes.Structure):
 
 
 class _CVacuumReport(ctypes.Structure):
+    """C layout of the result of vacuum."""
     _fields_ = [
         ("old_size", ctypes.c_uint64),
         ("new_size", ctypes.c_uint64),
@@ -94,6 +101,7 @@ class _CVacuumReport(ctypes.Structure):
 
 
 class _CFsckReport(ctypes.Structure):
+    """C layout of the result of fsck."""
     _fields_ = [
         ("scanned", ctypes.c_uint64),
         ("healthy", ctypes.c_uint64),
@@ -102,6 +110,7 @@ class _CFsckReport(ctypes.Structure):
 
 
 class _CVaultStats(ctypes.Structure):
+    """C layout of the vault statistics."""
     _fields_ = [
         ("container_size", ctypes.c_uint64),
         ("total_chunks", ctypes.c_uint64),
@@ -126,6 +135,7 @@ _UINT32_ERROR = 0xFFFFFFFF  # UINT32_MAX: pfs_rotate_key's error value (0 is a v
 
 
 def _load_lib():
+    """Loads the C++ engine library and declares the argument and return types of every function used."""
     lib = ctypes.CDLL(_LIB_PATH)
     lib.pfs_open.argtypes = [ctypes.c_char_p, ctypes.POINTER(ctypes.c_uint8)]
     lib.pfs_open.restype = ctypes.c_void_p
@@ -239,10 +249,12 @@ _lib = _load_lib()
 
 
 def _err():
+    """Turns the engine's last error message into a Python exception."""
     return PfsEngineError(_lib.pfs_last_error().decode("utf-8", errors="replace"))
 
 
 def _generation_info_from_c(info) -> GenerationInfo:
+    """Converts a C version record into a GenerationInfo."""
     return GenerationInfo(
         generation_index=info.generation_index,
         birth_timestamp=info.birth_timestamp,
@@ -265,8 +277,10 @@ def _serialize_calls(cls):
     lifecycle = {"close", "__enter__", "__exit__", "__del__"}
 
     def locked(fn):
+        """Decorator: makes calls on one session take its lock, and fail cleanly once it is closed."""
         @functools.wraps(fn)
         def wrapper(self, *args, **kwargs):
+            """Runs the call under the session's lock, refusing it if the session was closed."""
             lock = getattr(self, "_call_lock", None)  # absent if __init__ failed early
             if lock is None:
                 return fn(self, *args, **kwargs)
@@ -291,6 +305,7 @@ class CppVaultSession:
     """C++-engine counterpart to VaultSession. `kek`: the 32-byte KEK."""
 
     def __init__(self, storage_root: str, kek: bytes):
+        """Opens (or creates) a C++-engine vault with the given 32-byte key."""
         if len(kek) != 32:
             raise ValueError(f"kek must be exactly 32 bytes, got {len(kek)}")
         self._call_lock = threading.RLock()  # see _serialize_calls
@@ -303,23 +318,28 @@ class CppVaultSession:
         self.storage_root = storage_root
 
     def close(self):
+        """Closes the vault in the engine; safe to call more than once."""
         if self._handle:
             _lib.pfs_close(self._handle)
             self._handle = None
 
     def __enter__(self):
+        """Lets the session be used in a with-block."""
         return self
 
     def __exit__(self, *exc):
+        """Closes the session at the end of a with-block."""
         self.close()
 
     def __del__(self):
+        """Closes the session if it is garbage-collected while still open."""
         try:
             self.close()
         except Exception:
             pass
 
     def commit_write(self, label: str, source_path: str) -> str:
+        """Stores a file as the next version of label; returns the recipe filename."""
         buf = ctypes.create_string_buffer(256)
         rc = _lib.pfs_commit_write(self._handle, label.encode("utf-8"), source_path.encode("utf-8"),
                                     buf, len(buf))
@@ -328,6 +348,7 @@ class CppVaultSession:
         return buf.value.decode("utf-8")
 
     def fork_write(self, label: str, source_path: str, fork_from_generation: int) -> str:
+        """Stores a file as a new version whose parent is an older generation (a branch)."""
         buf = ctypes.create_string_buffer(256)
         rc = _lib.pfs_fork_write(self._handle, label.encode("utf-8"), source_path.encode("utf-8"),
                                   fork_from_generation, buf, len(buf))
@@ -336,6 +357,7 @@ class CppVaultSession:
         return buf.value.decode("utf-8")
 
     def commit_write_lateral(self, label: str, source_path: str, lateral_parent_label: str) -> str:
+        """Stores a file as the next version of label, also recording another file as a parent."""
         buf = ctypes.create_string_buffer(256)
         rc = _lib.pfs_commit_write_lateral(self._handle, label.encode("utf-8"), source_path.encode("utf-8"),
                                             lateral_parent_label.encode("utf-8"), buf, len(buf))
@@ -344,6 +366,7 @@ class CppVaultSession:
         return buf.value.decode("utf-8")
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> str:
+        """Makes a new file whose content combines two files and records both as parents."""
         buf = ctypes.create_string_buffer(256)
         rc = _lib.pfs_graft(self._handle, label_a.encode("utf-8"), label_b.encode("utf-8"),
                              new_label.encode("utf-8"), buf, len(buf))
@@ -382,21 +405,25 @@ class CppVaultSession:
         return buf.value.decode("utf-8")
 
     def reconstruct_label(self, label: str, output_path: str) -> None:
+        """Rebuilds the latest version of a file into output_path."""
         rc = _lib.pfs_reconstruct_label(self._handle, label.encode("utf-8"), output_path.encode("utf-8"))
         if rc != 0:
             raise _err()
 
     def checkout(self, label: str, generation_index: int, output_path: str) -> None:
+        """Rebuilds one generation of a file into output_path."""
         rc = _lib.pfs_checkout(self._handle, label.encode("utf-8"), generation_index, output_path.encode("utf-8"))
         if rc != 0:
             raise _err()
 
     def rename_label(self, old_label: str, new_label: str) -> None:
+        """Renames a file; content and history are unchanged."""
         rc = _lib.pfs_rename_label(self._handle, old_label.encode("utf-8"), new_label.encode("utf-8"))
         if rc != 0:
             raise _err()
 
     def delete_label(self, label: str, force: bool = False) -> dict:
+        """Deletes a file and its history; returns how much was freed and how much was kept as shared."""
         freed = ctypes.c_uint64(0)
         kept_shared = ctypes.c_uint64(0)
         rc = _lib.pfs_delete_label_ex(self._handle, label.encode("utf-8"), int(force),
@@ -406,6 +433,7 @@ class CppVaultSession:
         return {"manifests_freed": freed.value, "manifests_kept_shared": kept_shared.value}
 
     def prune_generation(self, label: str, generation_index: int, force: bool = False) -> bool:
+        """Frees one old generation's storage; returns whether anything was freed."""
         freed = ctypes.c_int(0)
         rc = _lib.pfs_prune_generation(self._handle, label.encode("utf-8"), generation_index, int(force),
                                         ctypes.byref(freed))
@@ -414,6 +442,7 @@ class CppVaultSession:
         return bool(freed.value)
 
     def vacuum(self) -> dict:
+        """Rewrites the container without unused chunks and returns a report."""
         report = _CVacuumReport()
         rc = _lib.pfs_vacuum(self._handle, ctypes.byref(report))
         if rc != 0:
@@ -433,11 +462,13 @@ class CppVaultSession:
         }
 
     def fsck(self) -> dict:
+        """Checks every stored chunk, repairs from spares where possible, and lists the ones that can't be."""
         report = _CFsckReport()
         unrecoverable = []
 
         @_HASH_CALLBACK
         def _cb(hex_cstr, _user_data):
+            """Collects the hash of a chunk that couldn't be repaired."""
             unrecoverable.append(hex_cstr.decode("ascii"))
 
         rc = _lib.pfs_fsck(self._handle, ctypes.byref(report), _cb, None)
@@ -461,16 +492,19 @@ class CppVaultSession:
             raise _err()
 
     def remove_tag(self, label: str, key: str) -> bool:
+        """Removes a tag from a file; returns whether it was there."""
         rc = _lib.pfs_remove_tag(self._handle, label.encode("utf-8"), key.encode("utf-8"))
         if rc < 0:
             raise _err()
         return bool(rc)
 
     def get_tags(self, label: str) -> dict:
+        """Returns a file's tags as a dictionary."""
         tags = {}
 
         @_TAG_CALLBACK
         def _cb(key_cstr, is_bool, bool_value, string_value_cstr, _user_data):
+            """Collects one tag from the engine."""
             key = key_cstr.decode("utf-8")
             tags[key] = bool(bool_value) if is_bool else string_value_cstr.decode("utf-8")
 
@@ -485,6 +519,7 @@ class CppVaultSession:
 
         @_TAG_CALLBACK
         def _cb(key_cstr, is_bool, bool_value, string_value_cstr, _user_data):
+            """Collects one tag from the engine."""
             key = key_cstr.decode("utf-8")
             tags[key] = bool(bool_value) if is_bool else string_value_cstr.decode("utf-8")
 
@@ -499,6 +534,7 @@ class CppVaultSession:
 
         @_UUID_CALLBACK
         def _cb(uuid_cstr, _user_data):
+            """Collects one lateral parent's UUID from the engine."""
             uuids.append(uuid_cstr.decode("ascii"))
 
         rc = _lib.pfs_get_lateral_parents_by_uuid(self._handle, uuid_hex.encode("ascii"), _cb, None)
@@ -507,10 +543,12 @@ class CppVaultSession:
         return uuids
 
     def list_labels(self) -> list:
+        """Returns the names of all files in the vault."""
         labels = []
 
         @_LABEL_CALLBACK
         def _cb(label_cstr, _user_data):
+            """Collects one file name from the engine."""
             labels.append(label_cstr.decode("utf-8"))
 
         rc = _lib.pfs_list_labels(self._handle, _cb, None)
@@ -519,10 +557,12 @@ class CppVaultSession:
         return labels
 
     def get_history(self, label: str) -> list:
+        """Returns every version of a file, oldest first."""
         history = []
 
         @_GENERATION_CALLBACK
         def _cb(info_ptr, _user_data):
+            """Collects one version record from the engine."""
             history.append(_generation_info_from_c(info_ptr.contents))
 
         rc = _lib.pfs_get_history(self._handle, label.encode("utf-8"), _cb, None)
@@ -531,10 +571,12 @@ class CppVaultSession:
         return history
 
     def get_heads(self, label: str) -> list:
+        """Returns the latest version of each branch of a file."""
         heads = []
 
         @_GENERATION_CALLBACK
         def _cb(info_ptr, _user_data):
+            """Collects one version record from the engine."""
             heads.append(_generation_info_from_c(info_ptr.contents))
 
         rc = _lib.pfs_get_heads(self._handle, label.encode("utf-8"), _cb, None)
@@ -543,6 +585,7 @@ class CppVaultSession:
         return heads
 
     def get_manifest_info(self, label: str) -> dict:
+        """Returns a summary of a file's latest recipe: size, chunk counts, type and fingerprint status."""
         info = _CManifestInfo()
         rc = _lib.pfs_get_manifest_info(self._handle, label.encode("utf-8"), ctypes.byref(info))
         if rc != 0:
@@ -565,6 +608,7 @@ class CppVaultSession:
 
         @_RAW_HASH_CALLBACK
         def _cb(hash_ptr, _user_data):
+            """Collects one fingerprint hash from the engine."""
             traits.add(bytes(hash_ptr[:32]))
 
         rc = _lib.pfs_get_manifest_fingerprint(self._handle, label.encode("utf-8"), _cb, None)
@@ -588,6 +632,7 @@ class CppVaultSession:
 
         @_TEXT_CALLBACK
         def _cb(text_cstr, _user_data):
+            """Collects one line of the text tree from the engine."""
             rendering.append(text_cstr.decode("utf-8", errors="replace"))
 
         rc = _lib.pfs_build_tree(self._handle, algorithm.encode("utf-8"), _cb, None)
@@ -601,6 +646,7 @@ class CppVaultSession:
 
         @_SIMILAR_CALLBACK
         def _cb(other_label_cstr, distance, _user_data):
+            """Collects one (file, distance) pair from the engine."""
             ranked.append((other_label_cstr.decode("utf-8"), distance))
 
         rc = _lib.pfs_similar(self._handle, label.encode("utf-8"), _cb, None)
@@ -616,6 +662,7 @@ class CppVaultSession:
 
         @_TEXT_CALLBACK
         def _cb(text_cstr, _user_data):
+            """Collects one clade line from the engine."""
             members.append(text_cstr.decode("utf-8"))
 
         rep_buf = ctypes.create_string_buffer(256)
@@ -631,6 +678,7 @@ class CppVaultSession:
 
         @_LABEL_COUNT_CALLBACK
         def _cb(label_cstr, count, _user_data):
+            """Collects one file whose fingerprints may be unreliable, with its count."""
             unreliable[label_cstr.decode("utf-8")] = count
 
         rc = _lib.pfs_get_unreliable_fingerprint_labels(self._handle, _cb, None)
@@ -644,6 +692,7 @@ class CppVaultSession:
 
         @_RAW_HASH_CALLBACK
         def _cb(hash_ptr, _user_data):
+            """Collects one chunk hash from the engine."""
             hashes.append(bytes(hash_ptr[:32]))
 
         rc = _lib.pfs_get_generation_chunk_hashes(self._handle, label.encode("utf-8"), generation_index, _cb, None)
@@ -687,17 +736,20 @@ class CppVaultSession:
 
     @property
     def container_path(self) -> str:
+        """Returns the path of the vault's main chunk container."""
         buf = ctypes.create_string_buffer(1024)
         _lib.pfs_get_container_path(self._handle, buf, len(buf))
         return buf.value.decode("utf-8")
 
     @property
     def mirror_container_path(self) -> str:
+        """Returns the path of the vault's spare-copy container."""
         buf = ctypes.create_string_buffer(1024)
         _lib.pfs_get_mirror_container_path(self._handle, buf, len(buf))
         return buf.value.decode("utf-8")
 
     def rotate_key(self) -> int:
+        """Starts a new key epoch for new chunks; returns its number."""
         new_epoch_id = _lib.pfs_rotate_key(self._handle)
         if new_epoch_id == _UINT32_ERROR:
             raise _err()

@@ -55,6 +55,7 @@ class Hasher:
         return (self.hash & mask) == 0
 
     def __repr__(self) -> str:
+        """Shows the current hash value in hex."""
         return f"Hasher(hash={self.hash:#018x})"
 
 

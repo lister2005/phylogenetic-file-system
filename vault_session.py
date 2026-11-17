@@ -39,6 +39,7 @@ class MutationConflictError(Exception):
     """
 
     def __init__(self, conflicting_positions):
+        """Records which chunk positions clash, with a readable message listing the first few."""
         self.conflicting_positions = list(conflicting_positions)
         preview = self.conflicting_positions[:10]
         more = "..." if len(self.conflicting_positions) > 10 else ""
@@ -53,6 +54,7 @@ def _changes_vault(method):
     reloading whatever other processes changed (vault_lock.py)."""
     @functools.wraps(method)
     def wrapper(self, *args, **kwargs):
+        """Runs the wrapped method inside _changing(), under the vault's write lock."""
         with self._changing():
             return method(self, *args, **kwargs)
     return wrapper
@@ -69,6 +71,7 @@ class VaultSession:
     """
 
     def __init__(self, storage_root: str):
+        """Prepares a session for a vault folder; nothing is unlocked until unlock_or_create()."""
         self.storage_root = storage_root
         os.makedirs(storage_root, exist_ok=True)
         self.crypto = None
@@ -104,6 +107,7 @@ class VaultSession:
             raise
 
     def _unlock_or_create_locked(self, get_new_passphrase, get_existing_passphrase, confirm_reset) -> None:
+        """Creates a new vault (asking for a passphrase twice) or unlocks an existing one, then loads its state."""
         key_path = os.path.join(self.storage_root, MASTER_KEY_FILENAME)
         if not os.path.exists(key_path):
             pw1, pw2 = get_new_passphrase()
@@ -140,18 +144,22 @@ class VaultSession:
             self._lock = None
 
     def __enter__(self):
+        """Lets the session be used in a with-block."""
         return self
 
     def __exit__(self, *exc):
+        """Closes the session at the end of a with-block."""
         self.close()
 
     def __del__(self):
+        """Closes the session if it is garbage-collected while still open."""
         try:
             self.close()
         except Exception:
             pass
 
     def _wipe_stale_vault_files_exclusively(self) -> list:
+        """Removes leftover files from an earlier vault, but only if no other program has the folder open."""
         try:
             with self._lock.exclusive():
                 return self._wipe_stale_vault_files()
@@ -161,6 +169,7 @@ class VaultSession:
     # ---------- sharing a vault between processes ----------
 
     def _state_signature(self):
+        """Returns size/time/inode of the shared state files, used to notice changes made by other programs."""
         sig = []
         for name in _SHARED_STATE_FILES:
             try:
@@ -204,6 +213,7 @@ class VaultSession:
 
     @contextmanager
     def _changing(self):
+        """Context manager for one change: takes the write lock, reloads others' changes first, then records the new state."""
         with self._lock.write():
             self._reload_if_changed()
             try:
@@ -251,6 +261,7 @@ class VaultSession:
         return removed
 
     def _load_catalog(self) -> None:
+        """Decrypts and loads the catalog (file name -> recipe), updating the existing dictionary in place."""
         path = os.path.join(self.storage_root, CATALOG_FILENAME)
         if os.path.exists(path):
             with open(path, "rb") as f:
@@ -264,6 +275,7 @@ class VaultSession:
         self.catalog.update(loaded)
 
     def save_catalog(self) -> None:
+        """Encrypts the catalog and replaces the file atomically."""
         path = os.path.join(self.storage_root, CATALOG_FILENAME)
         raw = pickle.dumps(self.catalog)
         encrypted = self.crypto.encrypt_block(raw, associated_data=b"catalog")
@@ -275,6 +287,7 @@ class VaultSession:
         os.replace(tmp, path)
 
     def read_manifest_metadata(self, manifest_path: str) -> dict:
+        """Decrypts a recipe file and returns its metadata."""
         manifest_filename = os.path.basename(manifest_path)
         with open(manifest_path, "rb") as f:
             encrypted = f.read()
@@ -283,12 +296,15 @@ class VaultSession:
         return engine.metadata
 
     def read_similarity_fingerprint(self, manifest_path: str, metadata: dict = None):
+        """Returns the similarity fingerprints stored for a recipe, or None."""
         return read_similarity_fingerprint(manifest_path, self.crypto, metadata)
 
     def similarity_fingerprint_count(self, manifest_path: str, metadata: dict = None):
+        """Returns how many similarity fingerprints a recipe has, without loading them all if possible."""
         return similarity_fingerprint_count(manifest_path, self.crypto, metadata)
 
     def manifest_path_for(self, label: str) -> str:
+        """Returns the full path of the recipe for a file name."""
         return os.path.join(self.storage_root, self.catalog[label])
 
     @_changes_vault
@@ -441,6 +457,7 @@ class VaultSession:
         return names
 
     def rename_label(self, old_label: str, new_label: str) -> None:
+        """Renames a file; its content and history are unchanged."""
         with self._changing():
             if old_label not in self.catalog:
                 raise KeyError(f"No such label: '{old_label}'")
@@ -451,14 +468,17 @@ class VaultSession:
             self.save_catalog()
 
     def set_tag(self, label: str, key: str, value) -> None:
+        """Sets a tag on a file's history."""
         with self._changing():
             self.lineage.set_tag(label, key, value)
 
     def remove_tag(self, label: str, key: str) -> bool:
+        """Removes a tag from a file; returns whether it was there."""
         with self._changing():
             return self.lineage.remove_tag(label, key)
 
     def rotate_keys(self) -> int:
+        """Starts a new key epoch: new chunks are encrypted with a fresh data key; returns its number."""
         with self._changing():
             return self.pipeline.rotate_keys()
 
@@ -469,6 +489,7 @@ class VaultSession:
 
     @property
     def mirror_all(self) -> bool:
+        """True if spare copies are kept for every chunk (the 'spares all' setting)."""
         return bool(self.pipeline.settings.get("mirror_all"))
 
     def set_mirror_all(self, enabled: bool) -> int:

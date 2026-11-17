@@ -23,6 +23,7 @@ namespace {
 constexpr double kInf = std::numeric_limits<double>::infinity();
 }  // namespace
 
+// Makes a random 16-byte UUID for a tree node.
 PhyloUuid generate_phylo_uuid() {
     static std::mt19937_64 rng(
         static_cast<uint64_t>(std::chrono::high_resolution_clock::now().time_since_epoch().count()));
@@ -31,6 +32,7 @@ PhyloUuid generate_phylo_uuid() {
     return id;
 }
 
+// Formats a tree node UUID as 32 hex characters.
 std::string phylo_uuid_to_hex(const PhyloUuid& id) {
     static const char* hex = "0123456789abcdef";
     std::string out;
@@ -42,6 +44,7 @@ std::string phylo_uuid_to_hex(const PhyloUuid& id) {
     return out;
 }
 
+// Computes the similarity fingerprints of a buffer (fine-grained chunking, one hash per chunk).
 TraitSet extract_similarity_traits(const uint8_t* data, size_t size) {
     TraitSet traits;
     size_t cursor = 0;
@@ -56,6 +59,7 @@ TraitSet extract_similarity_traits(const uint8_t* data, size_t size) {
     return traits;
 }
 
+// Computes the similarity fingerprints of a file on disk.
 TraitSet extract_similarity_traits(const std::string& file_path) {
     int fd = open(file_path.c_str(), O_RDONLY);
     if (fd < 0) throw std::runtime_error("failed to open '" + file_path + "' for fingerprinting: " + strerror(errno));
@@ -74,10 +78,12 @@ TraitSet extract_similarity_traits(const std::string& file_path) {
     return traits;
 }
 
+// True if a file has enough fingerprints for its distances to mean something.
 bool trait_set_is_reliable(const TraitSet& traits) {
     return traits.size() >= kMinReliableTraitCount;
 }
 
+// Jaccard distance between two fingerprint sets: 0 = identical, 1 = nothing in common.
 double jaccard_distance(const TraitSet& a, const TraitSet& b) {
     if (a.empty() && b.empty()) return 1.0;
     size_t intersection = 0;
@@ -95,12 +101,14 @@ double jaccard_distance(const TraitSet& a, const TraitSet& b) {
 
 namespace {
 
+// Returns the union of two fingerprint sets.
 TraitSet trait_union(const TraitSet& a, const TraitSet& b) {
     TraitSet out = a;
     out.insert(b.begin(), b.end());
     return out;
 }
 
+// Counts the fingerprints in one set but not the other.
 uint64_t trait_symmetric_diff_count(const TraitSet& a, const TraitSet& b) {
     uint64_t count = 0;
     auto ia = a.begin(), ib = b.begin();
@@ -114,6 +122,7 @@ uint64_t trait_symmetric_diff_count(const TraitSet& a, const TraitSet& b) {
     return count;
 }
 
+// Makes one leaf node per file, each with its own branch-signature bit.
 std::vector<PhyloNode> make_leaves(const std::map<std::string, TraitSet>& named_traits) {
     std::vector<PhyloNode> leaves;
     leaves.reserve(named_traits.size());
@@ -145,6 +154,7 @@ std::vector<std::vector<double>> initial_distances(const std::vector<PhyloNode>&
 
 }  // namespace
 
+// Builds a UPGMA tree: repeatedly joins the two closest groups, averaging distances.
 PhyloTree build_tree_upgma_from_traits(const std::map<std::string, TraitSet>& named_traits) {
     std::vector<PhyloNode> leaves = make_leaves(named_traits);
     if (leaves.size() <= 1) return leaves;
@@ -219,6 +229,7 @@ PhyloTree build_tree_upgma_from_traits(const std::map<std::string, TraitSet>& na
     return all_nodes;
 }
 
+// Builds a Neighbour-Joining tree, which doesn't assume files change at a steady rate.
 PhyloTree build_tree_nj_from_traits(const std::map<std::string, TraitSet>& named_traits) {
     std::vector<PhyloNode> leaves = make_leaves(named_traits);
     if (leaves.size() <= 1) return leaves;
@@ -305,6 +316,7 @@ PhyloTree build_tree_nj_from_traits(const std::map<std::string, TraitSet>& named
     return all_nodes;
 }
 
+// Groups files whose distance is within the threshold into clades (connected groups).
 std::map<std::string, std::vector<std::string>> compute_clades(
     const std::map<std::string, TraitSet>& named_traits, double threshold) {
     std::vector<std::string> labels;
@@ -347,6 +359,7 @@ std::map<std::string, std::vector<std::string>> compute_clades(
     return result;
 }
 
+// Renders a tree as indented text.
 std::string visualize_tree(const PhyloTree& nodes) {
     std::map<PhyloUuid, std::vector<size_t>> children;
     std::vector<size_t> roots;

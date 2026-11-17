@@ -7,6 +7,7 @@ from typing import NamedTuple
 
 
 class Phenotype(NamedTuple):
+    """A file type detected from content: its chunking mask and a readable name."""
     mask: int
     name: str
 
@@ -48,6 +49,7 @@ def detect(data: bytes) -> Phenotype:
 
 
 def _looks_like_text(sample: bytes) -> bool:
+    """True if the sample is valid UTF-8 and almost all printable characters."""
     try:
         sample.decode("utf-8")
     except UnicodeDecodeError:
@@ -58,5 +60,6 @@ def _looks_like_text(sample: bytes) -> bool:
 
 
 def detect_from_file(file_path: str) -> Phenotype:
+    """Detects a file's type from its first 64 bytes."""
     with open(file_path, "rb") as f:
         return detect(f.read(64))

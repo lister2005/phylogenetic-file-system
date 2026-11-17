@@ -17,18 +17,21 @@ constexpr char kMagic[4] = {'P', 'F', 'S', 'C'};
 constexpr uint16_t kVersion = 1;
 constexpr const char* kAad = "catalog";
 
+// True if a file exists and can be opened.
 bool file_exists(const std::string& path) {
     std::ifstream f(path);
     return f.good();
 }
 }  // namespace
 
+// Opens the catalog (file name -> recipe filename) of a vault and loads it.
 Catalog::Catalog(std::string storage_root, const Bytes32& kek)
     : storage_root_(std::move(storage_root)), kek_(kek) {
     path_ = storage_root_ + "/catalog.pfsc";
     load();
 }
 
+// Decrypts and reads the catalog file; an absent file means an empty catalog.
 void Catalog::load() {
     entries_.clear();
     if (!file_exists(path_)) return;
@@ -52,6 +55,7 @@ void Catalog::load() {
     }
 }
 
+// Encrypts the catalog and replaces the file atomically.
 void Catalog::save() {
     BinaryWriter w;
     w.raw_bytes(reinterpret_cast<const uint8_t*>(kMagic), 4);
@@ -81,22 +85,26 @@ void Catalog::save() {
     set_immutable(path_, true);
 }
 
+// Returns the recipe filename for a file name, if the file exists.
 std::optional<std::string> Catalog::get(const std::string& label) const {
     auto it = entries_.find(label);
     if (it == entries_.end()) return std::nullopt;
     return it->second;
 }
 
+// Adds or updates a file's entry and saves.
 void Catalog::set(const std::string& label, const std::string& manifest_filename) {
     entries_[label] = manifest_filename;
     save();
 }
 
+// Removes a file's entry and saves.
 void Catalog::remove(const std::string& label) {
     entries_.erase(label);
     save();
 }
 
+// Returns every file name in the catalog.
 std::vector<std::string> Catalog::labels() const {
     std::vector<std::string> out;
     out.reserve(entries_.size());

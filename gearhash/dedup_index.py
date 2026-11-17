@@ -32,33 +32,41 @@ _MIRROR_AAD_SUFFIX = b"|mirror"  # distinct AAD, so a row can't be replayed
 
 
 def _derive_subkeys(kek: bytes) -> Tuple[bytes, bytes]:
+    """Derives two separate keys from the vault key: one for blinding lookups, one for encrypting rows."""
     hmac_key = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"pfs-dedup-hmac-key").derive(kek)
     value_key = HKDF(algorithm=SHA256(), length=32, salt=None, info=b"pfs-dedup-value-key").derive(kek)
     return hmac_key, value_key
 
 
 def _lookup_key(hmac_key: bytes, content_hash: bytes) -> bytes:
+    """Blinds a chunk's content hash with HMAC, so the index can't be searched for a known file."""
     return hmac.new(hmac_key, content_hash, hashlib.sha256).digest()
 
 
 def _pack_value(content_hash: bytes, offset: int, length: int, ref_count: int, epoch_id: int) -> bytes:
+    """Packs one index entry (hash, offset, length, reference count, key epoch) into bytes."""
     return struct.pack(_VALUE_FORMAT, content_hash, offset, length, ref_count, epoch_id)
 
 
 def _unpack_value(data: bytes):
+    """Unpacks an index entry packed by _pack_value."""
     return struct.unpack(_VALUE_FORMAT, data)
 
 
 def _pack_mirror_value(offset: int, length: int) -> bytes:
+    """Packs a spare (mirror) copy's location into bytes."""
     return struct.pack(_MIRROR_VALUE_FORMAT, offset, length)
 
 
 def _unpack_mirror_value(data: bytes):
+    """Unpacks a spare copy's location packed by _pack_mirror_value."""
     return struct.unpack(_MIRROR_VALUE_FORMAT, data)
 
 
 class GlobalBlockIndex:
+    """The vault-wide index of stored chunks, kept in SQLite with blinded keys and encrypted values."""
     def __init__(self, storage_root: str, crypto_engine):
+        """Opens (or creates) the index database in the vault and derives its keys."""
         self.storage_root = storage_root
         self.crypto = crypto_engine
         self.hmac_key, self.value_key = _derive_subkeys(crypto_engine.key)
@@ -88,16 +96,19 @@ class GlobalBlockIndex:
             self._in_transaction = True
 
     def commit(self) -> None:
+        """Commits the open transaction, if any."""
         if self._in_transaction:
             self.conn.execute("COMMIT")
             self._in_transaction = False
 
     def rollback(self) -> None:
+        """Discards the open transaction, if any."""
         if self._in_transaction:
             self.conn.execute("ROLLBACK")
             self._in_transaction = False
 
     def close(self) -> None:
+        """Closes the database connection."""
         self.conn.close()
 
     def compact(self) -> None:
@@ -170,9 +181,11 @@ class GlobalBlockIndex:
         self.conn.execute(sql, params)
 
     def register_new(self, content_hash: bytes, offset: int, length: int, epoch_id: int) -> None:
+        """Records a newly stored chunk with a reference count of 1."""
         self._upsert(content_hash, offset, length, 1, epoch_id)
 
     def increment_ref(self, content_hash: bytes) -> None:
+        """Adds one to a stored chunk's reference count."""
         offset, length, ref_count, epoch_id = self._require(content_hash)
         self._upsert(content_hash, offset, length, ref_count + 1, epoch_id)
 
@@ -253,12 +266,14 @@ class GlobalBlockIndex:
         return {ch: (o, l, r, e) for ch, o, l, r, e in self.iter_all()}
 
     def _require(self, content_hash: bytes) -> Tuple[int, int, int, int]:
+        """Returns a chunk's entry, raising KeyError if it isn't in the index."""
         existing = self.lookup(content_hash)
         if existing is None:
             raise KeyError(f"No index entry for content hash {content_hash.hex()[:16]}...")
         return existing
 
     def _decrypt_row(self, lookup_key: bytes, encrypted_value: bytes):
+        """Decrypts one stored row, checking it belongs to this lookup key."""
         aead = AESGCM(self.value_key)
         iv = encrypted_value[:12]
         ciphertext = encrypted_value[12:]
@@ -266,6 +281,7 @@ class GlobalBlockIndex:
         return _unpack_value(raw)
 
     def _upsert(self, content_hash: bytes, offset: int, length: int, ref_count: int, epoch_id: int) -> None:
+        """Encrypts an entry and inserts or replaces its row."""
         key = _lookup_key(self.hmac_key, content_hash)
         raw = _pack_value(content_hash, offset, length, ref_count, epoch_id)
         aead = AESGCM(self.value_key)

@@ -60,7 +60,9 @@ LOG_FILENAME = ".fuse_daemon.log"
 
 
 class PFSFuse(Operations):
+    """The FUSE file system: shows a Python-engine vault as a folder, with families of similar files in sub-folders."""
     def __init__(self, storage_root: str):
+        """Unlocks the vault (asking for the passphrase) and prepares the scratch folder and open-file table."""
         self.session = VaultSession(storage_root)
         self._unlock()
 
@@ -88,13 +90,17 @@ class PFSFuse(Operations):
     # ---------- setup ----------
 
     def _unlock(self):
+        """Asks for the passphrase on the terminal and unlocks or creates the vault."""
         def get_new_passphrase():
+            """Asks for a new passphrase twice."""
             return getpass.getpass("Set a new vault passphrase: "), getpass.getpass("Confirm passphrase: ")
 
         def get_existing_passphrase():
+            """Asks for the existing passphrase."""
             return getpass.getpass("Enter vault passphrase: ")
 
         def confirm_reset():
+            """Asks whether to discard vault files that don't match this key."""
             answer = input(
                 "Vault's other files don't decrypt under this key. Type 'reset' to "
                 "discard them and start fresh, or anything else to abort: "
@@ -117,6 +123,7 @@ class PFSFuse(Operations):
         self._clades = CladeWorker(python_session_loader(self.session), name="fuse-clade-worker").start(labels)
 
     def _catalog_changed(self) -> None:
+        """Notes that the list of files changed, so cached directory views are rebuilt."""
         with self._lock:
             self._catalog_epoch += 1
 
@@ -134,6 +141,7 @@ class PFSFuse(Operations):
 
     def _on_external_change(self, changed, removed) -> None:
         # Runs under the vault's write lock: only queue events, take no other lock.
+        """Called when another program changed the vault: tells the clade worker which files changed."""
         if self._clades is None:
             return
         for label in removed:
@@ -189,6 +197,7 @@ class PFSFuse(Operations):
     # ---------- directory / metadata ----------
 
     def getattr(self, path, fh=None):
+        """Returns a file's or folder's attributes (type, size, permissions, times)."""
         self._refresh()
         now = time.time()
         resolved = self._resolve(path)
@@ -220,6 +229,7 @@ class PFSFuse(Operations):
                     st_ctime=mtime, st_mtime=mtime, st_atime=mtime)
 
     def readdir(self, path, fh):
+        """Lists a folder: the top level shows ungrouped files and family folders; a family folder shows its files."""
         self._refresh()
         resolved = self._resolve(path)
         if resolved is None:
@@ -242,6 +252,7 @@ class PFSFuse(Operations):
     # ---------- read path ----------
 
     def _open_reader(self, manifest_path: str) -> ManifestReader:
+        """Opens a reader for a recipe, turning any failure into an I/O error."""
         try:
             return ManifestReader(manifest_path, self.session.pipeline.container_path,
                                   self.session.crypto.key)
@@ -249,9 +260,11 @@ class PFSFuse(Operations):
             raise FuseOSError(errno.EIO)
 
     def _new_spill(self):
+        """Creates a temporary scratch file that holds a file's contents while it is being edited."""
         return tempfile.mkstemp(dir=self.scratch_dir, prefix="write_")
 
     def _copy_into(self, reader: ManifestReader, fd: int) -> None:
+        """Copies a stored file's contents into a scratch file, a piece at a time."""
         position = 0
         while position < reader.size:
             piece = reader.read(position, SPILL_COPY_BYTES)
@@ -274,11 +287,13 @@ class PFSFuse(Operations):
         handle["spill_fd"], handle["spill_path"] = fd, path
 
     def _handle_size(self, handle: dict) -> int:
+        """Returns the current size of an open file (its scratch copy if edited, else the stored version)."""
         if handle["spill_fd"] is not None:
             return os.fstat(handle["spill_fd"]).st_size
         return handle["reader"].size
 
     def open(self, path, flags):
+        """Opens a stored file for reading; it is copied to a scratch file only if written to."""
         self._refresh()
         resolved = self._resolve(path)
         if resolved is None or resolved[0] != "file":
@@ -293,12 +308,14 @@ class PFSFuse(Operations):
 
     def create(self, path, mode, fi=None):
         # New files only at the root; they're clustered once fingerprinted.
+        """Creates a new, empty file at the top level of the folder."""
         parts = [p for p in path.split("/") if p]
         if len(parts) != 1:
             raise FuseOSError(errno.EACCES)
         return self._new_handle(parts[0], spill=self._new_spill(), dirty=True)
 
     def _new_handle(self, label: str, reader: ManifestReader = None, spill=None, dirty: bool = False) -> int:
+        """Records an open file and returns its handle number."""
         spill_fd, spill_path = spill if spill is not None else (None, None)
         with self._lock:
             fh = self._next_fh
@@ -308,6 +325,7 @@ class PFSFuse(Operations):
         return fh
 
     def read(self, path, size, offset, fh):
+        """Reads from an open file: from its scratch copy if edited, else decrypting only the needed chunks."""
         with self._lock:
             handle = self._handles.get(fh)
         if handle is None:
@@ -322,6 +340,7 @@ class PFSFuse(Operations):
     # ---------- write path ----------
 
     def write(self, path, data, offset, fh):
+        """Writes to an open file's scratch copy, creating the copy on the first write."""
         with self._lock:
             handle = self._handles.get(fh)
             if handle is None:
@@ -333,11 +352,13 @@ class PFSFuse(Operations):
         return len(data)
 
     def _truncate_handle(self, handle: dict, length: int) -> None:
+        """Changes the length of an open file's scratch copy."""
         self._materialize(handle)
         os.ftruncate(handle["spill_fd"], length)
         handle["dirty"] = True
 
     def truncate(self, path, length, fh=None):
+        """Changes a file's length, whether or not it is open."""
         with self._lock:
             if fh is not None and fh in self._handles:
                 self._truncate_handle(self._handles[fh], length)
@@ -376,6 +397,7 @@ class PFSFuse(Operations):
         self._commit(label, tmp_path)
 
     def release(self, path, fh):
+        """Closes a file; if it was changed, stores the scratch copy as a new version."""
         with self._lock:
             handle = self._handles.pop(fh, None)
         if handle is None:
@@ -413,6 +435,7 @@ class PFSFuse(Operations):
         deletes it.
         """
         def _job():
+            """Computes the new version's similarity fingerprints in the background and saves them."""
             try:
                 fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(tmp_path)
                 self.session.pipeline.attach_similarity_fingerprint(manifest_path, fingerprint)
@@ -438,6 +461,7 @@ class PFSFuse(Operations):
     # ---------- delete / rename ----------
 
     def unlink(self, path):
+        """Deletes a file and its history from the vault."""
         resolved = self._resolve(path)
         if resolved is None or resolved[0] != "file":
             raise FuseOSError(errno.ENOENT)
@@ -450,6 +474,7 @@ class PFSFuse(Operations):
 
     def rename(self, old, new):
         # Only the destination's basename (the new label) matters.
+        """Renames a file; only the new name matters, since family folders are worked out automatically."""
         old_resolved = self._resolve(old)
         if old_resolved is None or old_resolved[0] != "file":
             raise FuseOSError(errno.ENOENT)
@@ -498,6 +523,7 @@ class PFSFuse(Operations):
 
 
 def _pid_file_path(storage_root: str) -> str:
+    """Returns the path of the mount's PID file inside the vault."""
     return os.path.join(storage_root, PID_FILENAME)
 
 
@@ -516,6 +542,7 @@ def _read_pid_file(storage_root: str):
 
 
 def _pid_is_alive(pid: int) -> bool:
+    """True if a process with this PID exists."""
     try:
         os.kill(pid, 0)  # signal 0: existence check only
         return True
@@ -525,6 +552,7 @@ def _pid_is_alive(pid: int) -> bool:
         return True  # exists, owned by someone else
 
 
+# Unlocks the vault and mounts it, in the background unless foreground is set.
 def do_mount(storage_root: str, mountpoint: str, foreground: bool) -> None:
     existing = _read_pid_file(storage_root)
     if existing is not None and _pid_is_alive(existing[0]):
@@ -580,6 +608,7 @@ def do_mount(storage_root: str, mountpoint: str, foreground: bool) -> None:
                 pass
 
 
+# Reports whether a mount of this vault is running.
 def do_status(storage_root: str) -> None:
     existing = _read_pid_file(storage_root)
     if existing is None:
@@ -594,6 +623,7 @@ def do_status(storage_root: str) -> None:
         os.remove(_pid_file_path(storage_root))
 
 
+# Unmounts the vault and stops its background process.
 def do_stop(storage_root: str) -> None:
     existing = _read_pid_file(storage_root)
     if existing is None:

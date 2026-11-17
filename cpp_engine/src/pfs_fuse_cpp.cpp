@@ -74,6 +74,7 @@ struct PfsFuseState {
     std::map<std::string, std::string> label_to_clade;
 };
 
+// Returns the mount's shared state, set up in main().
 PfsFuseState* state() {
     return static_cast<PfsFuseState*>(fuse_get_context()->private_data);
 }
@@ -85,6 +86,7 @@ void label_changed_locked(PfsFuseState* st, const std::string& label) {
     if (manifest_filename && st->clades) st->clades->changed(label, *manifest_filename);
 }
 
+// Reports a deleted file to the clade worker. Caller holds st->mutex.
 void label_removed_locked(PfsFuseState* st, const std::string& label) {
     st->catalog_epoch++;
     if (st->clades) st->clades->removed(label);
@@ -160,6 +162,7 @@ bool resolve_locked(PfsFuseState* st, const std::string& path, Resolved* out) {
     return true;
 }
 
+// Records an open file and returns its handle number.
 uint64_t new_handle(PfsFuseState* st, FileHandle handle) {
     std::lock_guard<std::mutex> lock(st->mutex);
     uint64_t fh = st->next_fh++;
@@ -177,6 +180,7 @@ std::pair<int, std::string> new_spill(PfsFuseState* st) {
     return {fd, std::string(tmp_template.data())};
 }
 
+// Copies a stored file's contents into a scratch file, a piece at a time.
 void copy_into(ManifestReader& reader, int fd) {
     std::vector<uint8_t> piece(kSpillCopyBytes);
     uint64_t position = 0;
@@ -205,6 +209,7 @@ void materialize_locked(PfsFuseState* st, FileHandle& handle) {
     handle.spill_path = path;
 }
 
+// Returns the current size of an open file (its scratch copy if edited, else the stored version).
 off_t handle_size(const FileHandle& handle) {
     if (handle.spill_fd >= 0) {
         struct stat sb{};
@@ -286,6 +291,7 @@ int pfs_getattr(const char* path, struct stat* stbuf, struct fuse_file_info*) {
     return 0;
 }
 
+// Lists a folder: the top level shows ungrouped files and family folders; a family folder shows its files.
 int pfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, struct fuse_file_info*,
                 enum fuse_readdir_flags) {
     auto* st = state();
@@ -329,6 +335,7 @@ int pfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, stru
     return 0;
 }
 
+// Opens a stored file for reading; it is copied to a scratch file only if written to.
 int pfs_open(const char* path, struct fuse_file_info* fi) {
     auto* st = state();
     std::string p(path);
@@ -361,6 +368,7 @@ int pfs_open(const char* path, struct fuse_file_info* fi) {
     return 0;
 }
 
+// Creates a new, empty file at the top level of the folder.
 int pfs_create(const char* path, mode_t, struct fuse_file_info* fi) {
     std::string label;
     // New files only at the root; they're clustered once fingerprinted.
@@ -382,6 +390,7 @@ int pfs_create(const char* path, mode_t, struct fuse_file_info* fi) {
     return 0;
 }
 
+// Reads from an open file: from its scratch copy if edited, else decrypting only the needed chunks.
 int pfs_read(const char*, char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
     auto* st = state();
     std::lock_guard<std::mutex> lock(st->mutex);
@@ -400,6 +409,7 @@ int pfs_read(const char*, char* buf, size_t size, off_t offset, struct fuse_file
     }
 }
 
+// Writes to an open file's scratch copy, creating the copy on the first write.
 int pfs_write(const char*, const char* buf, size_t size, off_t offset, struct fuse_file_info* fi) {
     auto* st = state();
     std::lock_guard<std::mutex> lock(st->mutex);
@@ -418,6 +428,7 @@ int pfs_write(const char*, const char* buf, size_t size, off_t offset, struct fu
     return static_cast<int>(n);
 }
 
+// Changes a file's length, whether or not it is open.
 int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
     auto* st = state();
     if (fi != nullptr) {
@@ -493,6 +504,7 @@ int pfs_truncate(const char* path, off_t length, struct fuse_file_info* fi) {
     return 0;
 }
 
+// Closes a file; if it was changed, stores the scratch copy as a new version.
 int pfs_release(const char*, struct fuse_file_info* fi) {
     auto* st = state();
     FileHandle handle;
@@ -519,6 +531,7 @@ int pfs_release(const char*, struct fuse_file_info* fi) {
     return 0;
 }
 
+// Deletes a file and its history from the vault.
 int pfs_unlink(const char* path) {
     auto* st = state();
     std::string p(path);
@@ -532,6 +545,7 @@ int pfs_unlink(const char* path) {
     return 0;
 }
 
+// Renames a file; only the new name matters, since family folders are worked out automatically.
 int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
     auto* st = state();
     std::string old_p(old_path);
@@ -563,6 +577,7 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
     return 0;
 }
 
+// Sets up the mount: turns off kernel caching and starts the clade worker.
 void* pfs_init(struct fuse_conn_info*, struct fuse_config* cfg) {
     cfg->kernel_cache = 0;  // content changes under us; don't cache
     // A path can turn from file into clade directory, and a cached dentry of
@@ -612,6 +627,7 @@ const struct fuse_operations kOperations = [] {
     return ops;
 }();
 
+// Reads the vault key from the PFS_KEK_HEX environment variable (set by mount_pfs_cpp.py).
 Bytes32 kek_from_env() {
     const char* hex = std::getenv("PFS_KEK_HEX");
     if (!hex || strlen(hex) != 64) {
@@ -625,6 +641,7 @@ Bytes32 kek_from_env() {
 
 }  // namespace
 
+// Opens the vault with the key from the environment and runs the FUSE mount in the foreground.
 int main(int argc, char** argv) {
     if (argc < 3) {
         fprintf(stderr, "usage: PFS_KEK_HEX=<hex> %s <storage_root> <mountpoint> [fuse options...]\n", argv[0]);
