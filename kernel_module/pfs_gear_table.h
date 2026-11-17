@@ -1,6 +1,8 @@
 /* SPDX-License-Identifier: GPL-2.0 */
 /* Generated from gearhash/table.py's GEAR_TABLE -- the same table the
- * userspace engines chunk with, so pfsfs cuts identical chunk boundaries. */
+ * userspace engines chunk with, so pfsfs cuts identical chunk boundaries.
+ * The table comes from rust-gearhash (https://github.com/srijs/rust-gearhash),
+ * Copyright (c) 2019 Sam Rijs and contributors, MIT license (notice in LICENSE). */
 #ifndef PFS_GEAR_TABLE_H
 #define PFS_GEAR_TABLE_H
 

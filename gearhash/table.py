@@ -1,7 +1,8 @@
 """
 Gear hash table: 256 random 64-bit values, one per byte value.
 
-Ported from ``table.rs``.
+Ported from ``src/table.rs`` in rust-gearhash (https://github.com/srijs/rust-gearhash),
+Copyright (c) 2019 Sam Rijs and contributors, MIT license (notice in LICENSE).
 """
 
 from typing import List

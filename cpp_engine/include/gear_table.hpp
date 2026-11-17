@@ -2,6 +2,8 @@
 #include <cstdint>
 
 // Ported verbatim from gearhash/table.py GEAR_TABLE -- must match exactly.
+// The table comes from rust-gearhash (https://github.com/srijs/rust-gearhash),
+// Copyright (c) 2019 Sam Rijs and contributors, MIT license (notice in LICENSE).
 namespace pfs_engine {
 inline constexpr uint64_t kGearTable[256] = {
     0xb088d3a9e840f559ULL, 0x5652c7f739ed20d6ULL, 0x45b28969898972abULL, 0x6b0a89d5b68ec777ULL,

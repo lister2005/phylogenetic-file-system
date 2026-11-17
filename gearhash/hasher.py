@@ -1,4 +1,6 @@
-"""Gear hasher and mask helper, ported from ``lib.rs``."""
+"""Gear hasher and mask helper, ported from ``src/lib.rs`` in rust-gearhash
+(https://github.com/srijs/rust-gearhash), Copyright (c) 2019 Sam Rijs and contributors,
+MIT license (notice in LICENSE)."""
 
 from __future__ import annotations
 from typing import Optional, Sequence

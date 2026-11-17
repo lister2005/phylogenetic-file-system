@@ -105,3 +105,13 @@ mount with `mount_pfs_cpp.py`.
 language: the ideas behind it, how your files are stored and protected, every
 part of the desktop app, the shell, what PFS can't do yet, and a guided first
 walk through everything.
+
+**[DOCUMENTATION.md](DOCUMENTATION.md)** tells the story of the project: where
+the idea came from, how PFS works, and the problems solved along the way.
+**[AUTHORSHIP.md](AUTHORSHIP.md)** sets out who did what and whose work PFS
+builds on.
+
+## License
+
+PFS is released under the [MIT License](LICENSE). The Linux kernel modules in
+`kernel_module/` are GPL-2.0, as the kernel requires.
