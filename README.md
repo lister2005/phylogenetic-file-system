@@ -34,6 +34,8 @@ living map of your files.
   disk: `run` hands its variables straight to a program, comparisons show
   which values changed but never the values, and `shred` destroys old keys
   for good.
+- **Share it with others.** Each person gets their own passphrase, and a
+  secret can be restricted so only the people you choose can read it.
 - **Three ways in:**
   - a **desktop app** that draws your files as an animated map, with a time
     slider to look back at how things were;

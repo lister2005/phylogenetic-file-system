@@ -12,8 +12,9 @@ import time
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional
 from cryptography.exceptions import InvalidTag
-from gearhash.master_key_store import (create_new_vault_key, load_vault_key, change_passphrase,
-                                       WrongPassphraseError, MASTER_KEY_FILENAME)
+from gearhash.master_key_store import (create_new_vault_key, unlock_user, change_passphrase,
+                                       WrongPassphraseError, MASTER_KEY_FILENAME, list_users,
+                                       add_user, remove_user, public_keys)
 from gearhash.pipeline import (StoragePipeline, MANIFEST_SUFFIX, TRAITS_SUFFIX, SETTINGS_FILENAME,
                                read_similarity_fingerprint, similarity_fingerprint_count)
 from gearhash.crypto import CryptoEngine
@@ -79,6 +80,8 @@ class VaultSession:
         os.makedirs(storage_root, exist_ok=True)
         self.crypto = None
         self.pipeline = None
+        # Who unlocked the vault (master_key_store.UserKeys); set by unlock_or_create.
+        self.user = None
         self.catalog = {}
         self.lineage = None
         # Taken in unlock_or_create, released in close().
@@ -116,14 +119,17 @@ class VaultSession:
             pw1, pw2 = get_new_passphrase()
             if pw1 != pw2:
                 raise VaultUnlockError("Passphrases didn't match.")
-            kek = create_new_vault_key(self.storage_root, pw1)
+            create_new_vault_key(self.storage_root, pw1)
+            self.user = unlock_user(self.storage_root, pw1)
+            kek = self.user.kek
             self._wipe_stale_vault_files_exclusively()
         else:
             pw = get_existing_passphrase()
             try:
-                kek = load_vault_key(self.storage_root, pw)
-            except WrongPassphraseError:
-                raise VaultUnlockError("Wrong passphrase.")
+                self.user = unlock_user(self.storage_root, pw)
+            except WrongPassphraseError as e:
+                raise VaultUnlockError("Wrong passphrase." if "tampered" not in str(e) else str(e))
+            kek = self.user.kek
 
         self.crypto = CryptoEngine(kek)
         try:
@@ -492,9 +498,30 @@ class VaultSession:
             return self.pipeline.rotate_keys()
 
     def change_passphrase(self, old_passphrase: str, new_passphrase: str) -> None:
-        """Re-wraps the same key; other processes' sessions are unaffected."""
+        """Changes the current user's passphrase (re-wraps the same key);
+        other users and other processes' sessions are unaffected."""
         with self._changing():
-            change_passphrase(self.storage_root, old_passphrase, new_passphrase)
+            change_passphrase(self.storage_root, old_passphrase, new_passphrase, user=self.user.name)
+
+    # ---------- users ----------
+
+    def users(self) -> list:
+        """The vault's user names."""
+        return list_users(self.storage_root)
+
+    def add_user(self, name: str, passphrase: str) -> None:
+        """Adds a user with their own passphrase."""
+        with self._changing():
+            add_user(self.storage_root, self.crypto.key, name, passphrase)
+
+    def remove_user(self, name: str) -> None:
+        """Removes a user, so their passphrase no longer opens the vault."""
+        with self._changing():
+            remove_user(self.storage_root, self.crypto.key, name)
+
+    def public_keys(self) -> dict:
+        """{user name: public key}, for restricting a file to some users."""
+        return public_keys(self.storage_root, self.crypto.key)
 
     @property
     def mirror_all(self) -> bool:

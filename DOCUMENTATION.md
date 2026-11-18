@@ -276,7 +276,9 @@ listed in the manual as a known limitation.
 branching, merging and grafting; similarity grouping; two engines, either of
 which lets several programs share a vault; secrets mode for `.env` files and
 credentials (kept off the disk, handed to programs with `run`, old values
-destroyed with `shred`); the desktop app, the shell and the mounted folder.
+destroyed with `shred`, and each variable's history shown without its value);
+several users with their own passphrases, and secrets restricted to chosen
+users; the desktop app, the shell and the mounted folder.
 
 **Partly there:** a Linux kernel module version of PFS's storage has been
 written and compiles, but hasn't yet been loaded and tested on a real
@@ -284,7 +286,8 @@ machine.
 
 **Known limits:** Linux only; files that aren't text merge piece by piece, not line by line;
 text that repeats exactly deduplicates poorly (see above); no independent
-security audit; one passphrase per vault.
+security audit; every user can change or delete any file, and removing a
+user doesn't re-encrypt the vault.
 
 ## The bigger vision
 

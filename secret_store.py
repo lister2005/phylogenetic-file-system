@@ -10,6 +10,7 @@ which variables changed, never their values.
 
 import os
 import re
+from typing import NamedTuple
 
 from gearhash.scrub import scrub_and_remove, scrub_file  # noqa: F401 (re-exported)
 
@@ -232,3 +233,67 @@ def auto_lock_seconds() -> float:
         return max(float(raw), 0.0)
     except ValueError:
         return AUTO_LOCK_SECONDS
+
+
+class VariableEvent(NamedTuple):
+    """One change to one variable: in which generation, when, and how."""
+    generation: int
+    timestamp: float
+    kind: str  # "added", "changed" or "removed"
+
+
+def variable_history(versions) -> tuple:
+    """Per-variable history of a secret .env file, values never included.
+
+    versions: (generation, parent generation or None, timestamp, content
+    bytes or None if unreadable) for each version. Each version is compared
+    with its own parent, so branches are handled correctly. Returns
+    ({name: [VariableEvent, ...]}, [generations that couldn't be read]).
+    """
+    parsed, unreadable = {}, []
+    for generation, _parent, _ts, content in versions:
+        try:
+            parsed[generation] = None if content is None else parse_dotenv(content.decode("utf-8"))
+        except (UnicodeDecodeError, DotenvError):
+            parsed[generation] = None
+        if parsed[generation] is None:
+            unreadable.append(generation)
+    events = {}
+    for generation, parent, ts, _content in versions:
+        after = parsed[generation]
+        if after is None:
+            continue
+        if parent is None:
+            before = {}
+        elif parsed.get(parent) is None:
+            continue  # nothing readable to compare with
+        else:
+            before = parsed[parent]
+        for name, value in after.items():
+            if name not in before:
+                events.setdefault(name, []).append(VariableEvent(generation, ts, "added"))
+            elif before[name] != value:
+                events.setdefault(name, []).append(VariableEvent(generation, ts, "changed"))
+        for name in before:
+            if name not in after:
+                events.setdefault(name, []).append(VariableEvent(generation, ts, "removed"))
+    return events, unreadable
+
+
+def summarize_variable(events) -> str:
+    """One line for a variable: when added, how often changed, when last changed or removed."""
+    import time as _time
+
+    def when(event):
+        """Generation and date of an event."""
+        return f"generation {event.generation} ({_time.strftime('%Y-%m-%d %H:%M', _time.localtime(event.timestamp))})"
+    added = [e for e in events if e.kind == "added"]
+    changed = [e for e in events if e.kind == "changed"]
+    parts = [f"added in {when(added[0])}" if added else "present from the start"]
+    if changed:
+        parts.append(f"changed {len(changed)} time(s), last in {when(changed[-1])}")
+    else:
+        parts.append("never changed")
+    if events[-1].kind == "removed":
+        parts.append(f"removed in {when(events[-1])}")
+    return "; ".join(parts)

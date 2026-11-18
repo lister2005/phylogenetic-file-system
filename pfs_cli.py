@@ -20,7 +20,8 @@ import threading
 
 sys.path.insert(0, os.getcwd())
 
-from gearhash.master_key_store import (load_vault_key, create_new_vault_key, change_passphrase,
+from gearhash import master_key_store
+from gearhash.master_key_store import (load_vault_key, create_new_vault_key, change_passphrase, unlock_user,
                                         WrongPassphraseError, MASTER_KEY_FILENAME)
 from gearhash import fingerprint as stored_fingerprint
 from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME
@@ -36,8 +37,10 @@ from vault_session import VaultSession, VaultUnlockError, MutationConflictError,
 from vault_lock import VaultBusyError
 from lineage import LINEAGE_FILENAME
 from text_merge import MAX_TEXT_MERGE_CHUNKS, merge_bytes
-from secret_store import (MemoryFile, MAX_SECRET_BYTES, DotenvError, auto_lock_seconds,
-                          environment_for as secret_environment_for, is_secret, read_via_memory)
+import restricted
+from secret_store import (MemoryFile, MAX_SECRET_BYTES, summarize_variable, DotenvError, auto_lock_seconds,
+                          environment_for as secret_environment_for, is_secret, read_via_memory,
+                          variable_history)
 
 # Optional: only --engine cpp needs the compiled engine.
 try:
@@ -218,8 +221,10 @@ class _ReauthMixin:
             if time.monotonic() - self._reauth_ok_at < _reauth_grace_seconds():
                 return True
         pw = getpass.getpass(f"Re-enter vault passphrase to {action_description}: ")
+        user = getattr(self, "_user_keys", lambda: None)()
         try:
-            kek = load_vault_key(self.storage_root, pw)
+            # Only the user who unlocked this shell's passphrase counts.
+            kek = load_vault_key(self.storage_root, pw, **({"user": user.name} if user else {}))
         except WrongPassphraseError:
             self._reauth_ok_at = None
             print("Wrong passphrase. Cancelled.")
@@ -409,6 +414,194 @@ class _SecretsMixin:
             print(f"Can't use those files: {e}")
             return None
 
+    # ---------- users and restricted files ----------
+
+    def _open(self, raw: bytes) -> bytes:
+        """Content as the current user can read it (unsealed if restricted to them)."""
+        return restricted.open_content(raw, self._user_keys())
+
+    def _public_keys(self) -> dict:
+        """{user name: public key}."""
+        return master_key_store.public_keys(self.storage_root, self._current_kek())
+
+    def _write_restricted(self, label: str, file_path: str) -> bool:
+        """For 'write' to a restricted file: seals the new version for the
+        same users. Returns False if the file isn't restricted."""
+        if not self._has_label(label):
+            return False
+        raw = self._read_raw(label)
+        if not restricted.is_sealed(raw):
+            return False
+        if os.path.getsize(file_path) > 16 * MAX_SECRET_BYTES:
+            print("Write failed: a restricted file can be at most 16 MB.")
+            return True
+        with open(file_path, "rb") as f:
+            content = f.read()
+        try:
+            sealed = restricted.reseal_like(raw, content, self._public_keys())
+        except ValueError as e:
+            print(f"Write failed: {e}")
+            return True
+        self._commit_raw_bytes(label, sealed)
+        print(f"Stored as '{label}' -- sealed again for: {', '.join(restricted.recipients_of(sealed))}.")
+        return True
+
+    def do_users(self, arg):
+        """users [add <name> | remove <name>]  -- list, add or remove the people who can open this vault
+
+Example:
+  users               (everyone with their own passphrase; you are marked)
+  users add alice     (asks for alice's new passphrase twice)
+  users remove alice  (alice's passphrase no longer opens the vault)
+(every user can open the whole vault, except files restricted to other
+users with 'restrict'. Removing a user doesn't re-encrypt the vault: if
+they copied its files while they had access, restricted files are what
+stay out of their reach.)"""
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        me = self._user_keys().name if self._user_keys() else None
+        if not parts:
+            for name in master_key_store.list_users(self.storage_root):
+                print(f"  {name}" + ("   (you)" if name == me else ""))
+            return
+        if len(parts) != 2 or parts[0] not in ("add", "remove"):
+            print("Usage: users [add <name> | remove <name>]")
+            return
+        action, name = parts
+        if not self._require_reauth(f"{action} user '{name}'", always_ask=True):
+            return
+        try:
+            if action == "add":
+                pw1 = getpass.getpass(f"New passphrase for {name}: ")
+                pw2 = getpass.getpass("Confirm it: ")
+                if pw1 != pw2 or not pw1:
+                    print("The passphrases didn't match (or were empty). Nothing changed.")
+                    return
+                self._add_user(name, pw1)
+                print(f"Added user '{name}'. They open this vault with their own passphrase.")
+            else:
+                if name == me:
+                    print("You can't remove yourself while you are using the vault.")
+                    return
+                self._remove_user(name)
+                print(f"Removed user '{name}'. Restrict files again ('restrict') to drop them from those too.")
+        except master_key_store.UserError as e:
+            print(f"Nothing changed: {e}")
+
+    def do_restrict(self, arg):
+        """restrict <label> <user> [<user> ...]  -- let only these users (and you) read a file
+
+Example:
+  restrict prod.env alice
+(the latest version is sealed for these users as a new version, and the
+file is tagged secret. Everyone else who can open the vault sees only
+sealed bytes. Earlier versions are not sealed: shred them with 'shred'
+if they hold the same secrets. 'unrestrict' undoes it.)"""
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        if len(parts) < 2:
+            print("Usage: restrict <label> <user> [<user> ...]")
+            return
+        label, names = parts[0], parts[1:]
+        if not self._has_label(label):
+            print(f"No such label: '{label}'")
+            return
+        if not self._require_reauth(f"restrict '{label}'"):
+            return
+        try:
+            content = self._open(self._read_raw(label))
+            recipients = restricted.recipients_for(names, self._public_keys(), self._user_keys().name)
+        except (ValueError, PermissionError) as e:
+            print(f"Restrict failed: {e}")
+            return
+        self._commit_raw_bytes(label, restricted.seal(content, recipients))
+        for key, value in (("secret", True), ("no_graft_source", True),
+                           (restricted.RESTRICTED_TAG, ", ".join(sorted(recipients)))):
+            self._set_tag(label, key, value)
+        print(f"'{label}' is now readable only by: {', '.join(sorted(recipients))}.")
+        older = [n for n in self._history_nodes(label)[:-1] if not n[3]]
+        if older:
+            print(f"Its {len(older)} earlier version(s) are still readable by every user; shred them "
+                  f"(e.g. 'shred {label} {older[0][0]}') if they hold the same secrets.")
+
+    def do_unrestrict(self, arg):
+        """unrestrict <label>  -- make a restricted file readable by every user again
+
+Example:
+  unrestrict prod.env
+(saves the latest version unsealed, as a new version; the file stays
+tagged secret)"""
+        label = _join_args(arg)
+        if not label or not self._has_label(label):
+            print("Usage: unrestrict <label>")
+            return
+        if not self._require_reauth(f"unrestrict '{label}'"):
+            return
+        raw = self._read_raw(label)
+        if not restricted.is_sealed(raw):
+            print(f"'{label}' isn't restricted.")
+            return
+        try:
+            content = self._open(raw)
+        except PermissionError as e:
+            print(f"Unrestrict failed: {e}")
+            return
+        self._commit_raw_bytes(label, content)
+        self._remove_tag(label, restricted.RESTRICTED_TAG)
+        self._remove_tag(label, "no_graft_source")
+        print(f"'{label}' is readable by every user again.")
+
+    def do_variables(self, arg):
+        """variables <label> [<name>]  -- when each variable of a .env file was added, changed or removed
+
+Example:
+  variables app.env           (one line per variable)
+  variables app.env API_KEY   (every change to one variable)
+(values are never shown. Versions that were pruned, shredded or
+restricted to other users are skipped.)"""
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        if len(parts) not in (1, 2):
+            print("Usage: variables <label> [<name>]")
+            return
+        label = parts[0]
+        if not self._has_label(label):
+            print(f"No such label: '{label}'")
+            return
+        if not self._require_reauth(f"view the variables of '{label}'"):
+            return
+        versions = []
+        for generation, parent, ts, pruned in self._history_nodes(label):
+            content = None
+            if not pruned:
+                try:
+                    content = self._open(self._read_raw(label, generation))
+                except (ValueError, PermissionError):
+                    content = None
+            versions.append((generation, parent, ts, content))
+        events, unreadable = variable_history(versions)
+        if not events:
+            print(f"No variables found in '{label}' (is it a .env file?).")
+            return
+        if len(parts) == 2:
+            name = parts[1]
+            if name not in events:
+                print(f"'{label}' has no variable called {name}.")
+                return
+            for e in events[name]:
+                print(f"  generation {e.generation}  {time.strftime('%Y-%m-%d %H:%M', time.localtime(e.timestamp))}  "
+                      f"{e.kind}")
+        else:
+            width = max(len(n) for n in events) + 2
+            for name in sorted(events):
+                print(f"  {name:<{width}}{summarize_variable(events[name])}")
+        if unreadable:
+            print(f"(skipped generation(s) {', '.join(map(str, unreadable))}: pruned, shredded, restricted "
+                  f"or not a .env file)")
+
     def do_run(self, arg):
         """run <label> [<label2> ...] -- <command> [arguments...]  -- run a program with a .env file's variables
 
@@ -590,7 +783,7 @@ class PFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
             print(str(e))
             sys.exit(1)
 
-        print("New vault created.\n" if not vault_existed else "Vault unlocked.\n")
+        print("New vault created.\n" if not vault_existed else f"Vault unlocked as '{self._session.user.name}'.\n")
         self._load_history()
 
     def _load_history(self):
@@ -662,8 +855,44 @@ class PFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
         return self._session.lineage.get_tags(label)
 
     def _read_label_bytes(self, label: str) -> bytes:
-        """A file's latest content, rebuilt in memory (for 'run')."""
-        return self._session.read_bytes(label)
+        """A file's latest content as the current user can read it, in memory (for 'run')."""
+        return self._open(self._session.read_bytes(label))
+
+    def _user_keys(self):
+        """Who unlocked this shell (master_key_store.UserKeys)."""
+        return self._session.user
+
+    def _read_raw(self, label, generation=None) -> bytes:
+        """A file's stored content (still sealed if restricted), in memory."""
+        return self._session.read_bytes(label, generation, limit=None)
+
+    def _commit_raw_bytes(self, label, data: bytes) -> None:
+        """Stores data exactly as given as the next version of label, from memory."""
+        with MemoryFile() as mem:
+            mem.write(data)
+            self._session.commit_write(label, mem.path)
+
+    def _set_tag(self, label, key, value) -> None:
+        """Sets a tag on a file."""
+        self._session.set_tag(label, key, value)
+
+    def _remove_tag(self, label, key) -> None:
+        """Removes a tag from a file."""
+        self._session.remove_tag(label, key)
+
+    def _history_nodes(self, label) -> list:
+        """(generation, parent generation, timestamp, pruned) for every version."""
+        history = self._session.lineage.get_history(label)
+        gen_of = {n.node_uuid: n.generation_index for n in history}
+        return [(n.generation_index, gen_of.get(n.parent_uuid), n.birth_timestamp, n.pruned) for n in history]
+
+    def _add_user(self, name, passphrase) -> None:
+        """Adds a user (under the vault's write lock)."""
+        self._session.add_user(name, passphrase)
+
+    def _remove_user(self, name) -> None:
+        """Removes a user (under the vault's write lock)."""
+        self._session.remove_user(name)
 
     def _shred(self, label, generation, force) -> dict:
         """Shreds through the session (see VaultSession.shred)."""
@@ -678,12 +907,16 @@ class PFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
         return {n.generation_index: n.total_chunks for n in self._session.lineage.get_history(label)}
 
     def _read_generation_bytes(self, label, generation) -> bytes:
-        """One generation's content, rebuilt in memory."""
-        return self._session.read_bytes(label, generation, limit=None)
+        """One generation's content as the current user can read it, in memory."""
+        return self._open(self._session.read_bytes(label, generation, limit=None))
 
     def _commit_merged(self, label, generation_a, generation_b, path) -> None:
-        """Commits merged content as the merge of two branches."""
-        self._session.commit_merged(label, generation_a, generation_b, path)
+        """Commits merged content as the merge of two branches (sealed again if restricted)."""
+        with open(path, "rb") as f:
+            data = f.read()
+        with MemoryFile() as mem:
+            mem.write(restricted.reseal_like(self._read_raw(label), data, self._public_keys()))
+            self._session.commit_merged(label, generation_a, generation_b, mem.path)
 
 
     def do_write(self, arg):
@@ -712,6 +945,8 @@ a relative file_path resolves against 'navigate's directory, if set)"""
             print(f"File not found: {file_path}")
             return
         if not self._require_reauth("store a file"):
+            return
+        if self._write_restricted(label, file_path):
             return
 
         is_new_version = label in self.catalog
@@ -768,6 +1003,10 @@ Example:
             print(f"File not found: {file_path}")
             return
         if not self._require_reauth(f"fork '{label}' from generation {generation}"):
+            return
+        if restricted.is_sealed(self._read_raw(label)):
+            print(f"'{label}' is restricted, and a fork would store its new branch unsealed. Save new "
+                  f"versions with 'write', or 'unrestrict' it first.")
             return
 
         try:
@@ -2363,8 +2602,49 @@ class CppPFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
         return self._session.get_tags(label)
 
     def _read_label_bytes(self, label: str) -> bytes:
-        """A file's latest content, rebuilt in memory (for 'run')."""
-        return read_via_memory(lambda path: self._session.reconstruct_label(label, path), MAX_SECRET_BYTES)
+        """A file's latest content as the current user can read it, in memory (for 'run')."""
+        return self._open(read_via_memory(lambda path: self._session.reconstruct_label(label, path),
+                                          MAX_SECRET_BYTES))
+
+    def _user_keys(self):
+        """Who unlocked this shell (master_key_store.UserKeys)."""
+        return self._user
+
+    def _read_raw(self, label, generation=None) -> bytes:
+        """A file's stored content (still sealed if restricted), in memory."""
+        if generation is None:
+            return read_via_memory(lambda path: self._session.reconstruct_label(label, path))
+        return read_via_memory(lambda path: self._session.checkout(label, generation, path))
+
+    def _commit_raw_bytes(self, label, data: bytes) -> None:
+        """Stores data exactly as given as the next version of label, from memory."""
+        with MemoryFile() as mem:
+            mem.write(data)
+            self._session.commit_write(label, mem.path)
+        self._clades.changed(label)
+
+    def _set_tag(self, label, key, value) -> None:
+        """Sets a tag on a file."""
+        self._session.set_tag(label, key, value)
+
+    def _remove_tag(self, label, key) -> None:
+        """Removes a tag from a file."""
+        self._session.remove_tag(label, key)
+
+    def _history_nodes(self, label) -> list:
+        """(generation, parent generation, timestamp, pruned) for every version."""
+        history = self._session.get_history(label)
+        gen_of = {n.node_uuid_hex: n.generation_index for n in history}
+        return [(n.generation_index, gen_of.get(n.parent_uuid_hex) if n.has_parent else None,
+                 n.birth_timestamp, n.pruned) for n in history]
+
+    def _add_user(self, name, passphrase) -> None:
+        """Adds a user."""
+        master_key_store.add_user(self.storage_root, self._kek, name, passphrase)
+
+    def _remove_user(self, name) -> None:
+        """Removes a user."""
+        master_key_store.remove_user(self.storage_root, self._kek, name)
 
     def _merge_base(self, label, generation_a, generation_b) -> int:
         """The generation two branches last had in common."""
@@ -2375,12 +2655,16 @@ class CppPFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
         return {n.generation_index: n.total_chunks for n in self._session.get_history(label)}
 
     def _read_generation_bytes(self, label, generation) -> bytes:
-        """One generation's content, rebuilt in memory."""
-        return read_via_memory(lambda path: self._session.checkout(label, generation, path))
+        """One generation's content as the current user can read it, in memory."""
+        return self._open(read_via_memory(lambda path: self._session.checkout(label, generation, path)))
 
     def _commit_merged(self, label, generation_a, generation_b, path) -> None:
-        """Commits merged content as the merge of two branches."""
-        self._session.commit_merged(label, generation_a, generation_b, path)
+        """Commits merged content as the merge of two branches (sealed again if restricted)."""
+        with open(path, "rb") as f:
+            data = f.read()
+        with MemoryFile() as mem:
+            mem.write(restricted.reseal_like(self._read_raw(label), data, self._public_keys()))
+            self._session.commit_merged(label, generation_a, generation_b, mem.path)
 
     def _shred(self, label, generation, force) -> dict:
         """Shreds through the C++ engine; its errors become the shell's usual ones."""
@@ -2401,16 +2685,17 @@ class CppPFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
             if pw1 != pw2:
                 print("Passphrases didn't match.")
                 sys.exit(1)
-            kek = create_new_vault_key(self.storage_root, pw1)
+            create_new_vault_key(self.storage_root, pw1)
+            self._user = unlock_user(self.storage_root, pw1)
         else:
             pw = getpass.getpass("Enter vault passphrase: ")
             try:
-                kek = load_vault_key(self.storage_root, pw)
-            except WrongPassphraseError:
-                print("Wrong passphrase.")
+                self._user = unlock_user(self.storage_root, pw)
+            except WrongPassphraseError as e:
+                print("Wrong passphrase." if "tampered" not in str(e) else str(e))
                 sys.exit(1)
-        print("New C++ vault created.\n" if not vault_existed else "C++ vault unlocked.\n")
-        return kek
+        print("New C++ vault created.\n" if not vault_existed else f"C++ vault unlocked as '{self._user.name}'.\n")
+        return self._user.kek
 
     def _resolve_path(self, path: str) -> str:
         """Resolves a path against the folder chosen with 'cd', if any."""
@@ -2446,6 +2731,8 @@ relative file_path resolves against 'navigate's directory, if set)"""
             print(f"File not found: {file_path}")
             return
         if not self._require_reauth("store a file"):
+            return
+        if self._write_restricted(label, file_path):
             return
         try:
             start = time.perf_counter()
@@ -2550,6 +2837,10 @@ shows the branch heads; 'merge' reconciles them.)"""
             print(f"File not found: {file_path}")
             return
         if not self._require_reauth(f"fork '{label}' from generation {generation}"):
+            return
+        if restricted.is_sealed(self._read_raw(label)):
+            print(f"'{label}' is restricted, and a fork would store its new branch unsealed. Save new "
+                  f"versions with 'write', or 'unrestrict' it first.")
             return
         try:
             manifest = self._session.fork_write(label, file_path, generation)
@@ -3242,7 +3533,7 @@ Example:
             print("New passphrases didn't match. Nothing changed.")
             return
         try:
-            change_passphrase(self.storage_root, old_pw, new_pw1)
+            change_passphrase(self.storage_root, old_pw, new_pw1, user=self._user.name)
             print("Passphrase changed. The key itself (and all your data) is untouched.")
         except WrongPassphraseError:
             print("Current passphrase was incorrect. Nothing changed.")
@@ -3556,17 +3847,20 @@ def secret_environment_from_vault(storage_root: str, engine: str, labels, passph
         if CppVaultSession is None:
             raise ValueError(f"Couldn't load the C++ engine library: {_CPP_ENGINE_IMPORT_ERROR}")
         try:
-            kek = load_vault_key(storage_root, passphrase)
+            user = unlock_user(storage_root, passphrase)
         except WrongPassphraseError:
             raise ValueError("Wrong passphrase.")
-        session = CppVaultSession(storage_root, kek)
+        session = CppVaultSession(storage_root, user.kek)
         try:
             known = set(session.list_labels())
             for label in labels:
                 if label not in known:
                     raise ValueError(f"No such label: '{label}'")
-                contents.append(read_via_memory(lambda path, l=label: session.reconstruct_label(l, path),
-                                                MAX_SECRET_BYTES))
+                raw = read_via_memory(lambda path, l=label: session.reconstruct_label(l, path), MAX_SECRET_BYTES)
+                try:
+                    contents.append(restricted.open_content(raw, user))
+                except PermissionError as e:
+                    raise ValueError(f"Can't use '{label}': {e}")
         finally:
             session.close()
     else:
@@ -3582,7 +3876,10 @@ def secret_environment_from_vault(storage_root: str, engine: str, labels, passph
             for label in labels:
                 if label not in session.catalog:
                     raise ValueError(f"No such label: '{label}'")
-                contents.append(session.read_bytes(label))
+                try:
+                    contents.append(restricted.open_content(session.read_bytes(label), session.user))
+                except PermissionError as e:
+                    raise ValueError(f"Can't use '{label}': {e}")
         finally:
             session.close()
     try:

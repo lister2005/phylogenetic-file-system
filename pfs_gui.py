@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QInputDialog, QLineEdit, QMessageBox, QDockWidget, QTextEdit,
     QStatusBar, QToolBar, QSlider, QLabel, QPushButton, QMenu, QFileDialog,
     QDialog, QVBoxLayout, QHBoxLayout, QListWidget, QTableWidget, QTableWidgetItem,
-    QWidget, QHeaderView, QPlainTextEdit, QScrollArea, QToolTip, QComboBox,
+    QWidget, QHeaderView, QPlainTextEdit, QScrollArea, QToolTip, QComboBox, QCheckBox,
 )
 from PySide6.QtGui import (
     QColor, QBrush, QPen, QPainter, QFont, QKeySequence, QAction,
@@ -48,7 +48,9 @@ from PhylogeneticAnalyzer import PhylogeneticAnalyzer
 from TreeConstructor import TreeConstructor
 from pfs_engine_adapter import PythonEngineAdapter, CppEngineAdapter
 from gearhash.phenotype import detect as detect_phenotype, detect_from_file
-from secret_store import SECRET_TAG, auto_lock_seconds, is_secret, masked_changes
+from secret_store import SECRET_TAG, auto_lock_seconds, is_secret, masked_changes, summarize_variable
+import restricted
+from gearhash.master_key_store import UserError
 import lineage_diff
 
 # ---------- palette ----------
@@ -1212,6 +1214,111 @@ class LineConflictDialog(QDialog):
         self.merge_button.setEnabled(len(self.choices()) == len(self.conflicts))
 
 
+class UsersDialog(QDialog):
+    """Lists the people who can open the vault, and adds or removes them."""
+
+    def __init__(self, parent, engine):
+        """Builds the list with Add and Remove buttons."""
+        super().__init__(parent)
+        self.engine = engine
+        self.setWindowTitle("Users")
+        self.resize(420, 360)
+        layout = QVBoxLayout(self)
+        note = QLabel("Everyone here opens this vault with their own passphrase. Files restricted to some "
+                      "users stay sealed for the others.", self)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.list = QListWidget(self)
+        layout.addWidget(self.list)
+        buttons = QHBoxLayout()
+        add = QPushButton("Add user...", self)
+        add.clicked.connect(self._add)
+        remove = QPushButton("Remove", self)
+        remove.clicked.connect(self._remove)
+        close = QPushButton("Close", self)
+        close.clicked.connect(self.accept)
+        for b in (add, remove):
+            buttons.addWidget(b)
+        buttons.addStretch(1)
+        buttons.addWidget(close)
+        layout.addLayout(buttons)
+        self._fill()
+
+    def _fill(self):
+        """Shows the current users, marking you."""
+        self.list.clear()
+        me = self.engine.user.name if self.engine.user else None
+        for name in self.engine.users():
+            self.list.addItem(f"{name}  (you)" if name == me else name)
+
+    def _add(self):
+        """Asks for a name and a passphrase (twice), then adds the user."""
+        name, ok = QInputDialog.getText(self, "Add user", "Name:")
+        if not ok or not name.strip():
+            return
+        pw1, ok1 = QInputDialog.getText(self, "Add user", f"New passphrase for {name}:", QLineEdit.Password)
+        if not ok1:
+            return
+        pw2, ok2 = QInputDialog.getText(self, "Add user", "Confirm it:", QLineEdit.Password)
+        if not ok2 or pw1 != pw2 or not pw1:
+            QMessageBox.warning(self, "Add user", "The passphrases didn't match (or were empty).")
+            return
+        try:
+            self.engine.add_user(name.strip(), pw1)
+        except UserError as e:
+            QMessageBox.warning(self, "Add user", str(e))
+        self._fill()
+
+    def _remove(self):
+        """Removes the selected user after asking."""
+        item = self.list.currentItem()
+        if item is None:
+            return
+        name = item.text().replace("  (you)", "")
+        if QMessageBox.question(self, "Remove user", f"Remove '{name}'? Their passphrase will no longer open "
+                                f"this vault.", QMessageBox.Yes | QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            self.engine.remove_user(name)
+        except UserError as e:
+            QMessageBox.warning(self, "Remove user", str(e))
+        self._fill()
+
+
+class RestrictDialog(QDialog):
+    """Chooses the users who may read a file; you are always included."""
+
+    def __init__(self, parent, label, users, me, current=None):
+        """One checkbox per user; yours is ticked and can't be cleared."""
+        super().__init__(parent)
+        self.setWindowTitle(f"Restrict -- {label}")
+        layout = QVBoxLayout(self)
+        note = QLabel(f"Only the users you tick (and you) will be able to read '{label}'. Earlier versions "
+                      f"stay readable by everyone until you shred them.", self)
+        note.setWordWrap(True)
+        layout.addWidget(note)
+        self.boxes = {}
+        for name in users:
+            box = QCheckBox(f"{name} (you)" if name == me else name, self)
+            box.setChecked(name == me or (current is not None and name in current))
+            box.setEnabled(name != me)
+            layout.addWidget(box)
+            self.boxes[name] = box
+        buttons = QHBoxLayout()
+        buttons.addStretch(1)
+        ok = QPushButton("Restrict", self)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel", self)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(ok)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+
+    def chosen(self):
+        """The ticked users."""
+        return [name for name, box in self.boxes.items() if box.isChecked()]
+
+
 class TextViewerDialog(QDialog):
     """Read-only in-app text viewer (past generations)."""
 
@@ -1576,6 +1683,11 @@ class VaultGraphWindow(QMainWindow):
                                            "rename, duplicate, fork, merge, graft, tag, prune, checkout, edit...")
         palette_toolbar_action.triggered.connect(self._open_command_palette)
         toolbar.addAction(palette_toolbar_action)
+
+        users_action = QAction("Users", self)
+        users_action.setToolTip("The people who can open this vault, each with their own passphrase")
+        users_action.triggered.connect(lambda: UsersDialog(self, self.engine).exec())
+        toolbar.addAction(users_action)
 
         self.theme_action = QAction("☀  Light", self, checkable=True)
         self.theme_action.setToolTip("Switch between dark and light theme")
@@ -2202,6 +2314,7 @@ class VaultGraphWindow(QMainWindow):
         self.stats_label.setText(
             f"{len(meta_by_label)} file(s) · {total_size:,}B logical · "
             f"{container_size:,}B on disk · {dedup_pct:.0f}% deduped{branch_hint}"
+            + (f" · you: {self.engine.user.name}" if self.engine.user else "")
         )
 
     def _refresh_list_table(self):
@@ -2869,8 +2982,22 @@ class VaultGraphWindow(QMainWindow):
         ]
         if sharing_labels:
             file_rows.append(("Storage", f"shared with {', '.join(sharing_labels)} (0 new bytes)"))
+        variables_card = None
         if is_secret(tags):
             file_rows.append(("Secret", "yes -- opens only inside the app; values hidden in comparisons"))
+            try:
+                readers = self.engine.restriction(label)
+            except Exception:
+                readers = None
+            if readers:
+                file_rows.append(("Readable by", ", ".join(readers)))
+            try:
+                events, _unreadable = self.engine.variable_history(label)
+            except Exception:
+                events = {}
+            if events:
+                variables_card = {"heading": "Variables (values hidden)",
+                                  "rows": [(name, summarize_variable(events[name])) for name in sorted(events)]}
 
         cards = [
             {"heading": "File", "rows": file_rows},
@@ -2880,6 +3007,8 @@ class VaultGraphWindow(QMainWindow):
             ], "note": branch_note if len(heads) > 1 else None},
             {"heading": "Tags", "rows": [(k, v) for k, v in tags.items()] if tags else [("(none)", "")]},
         ]
+        if variables_card is not None:
+            cards.insert(1, variables_card)
         self._render_cards(label, cards)
 
     def _show_details_for_generation(self, node_uuid):
@@ -3038,6 +3167,10 @@ class VaultGraphWindow(QMainWindow):
             menu.addSeparator()
             menu.addAction("Unmark as secret" if secret else "Mark as secret",
                            lambda: self._set_secret(label, not secret))
+            if len(self.engine.users()) > 1 or (secret and self._is_restricted(label)):
+                menu.addAction("Restrict to users...", lambda: self._restrict_action(label))
+                if secret and self._is_restricted(label):
+                    menu.addAction("Remove restriction", lambda: self._unrestrict_action(label))
             menu.addSeparator()
             menu.addAction("Delete (shreds it)..." if secret else "Delete...", lambda: self._delete_label(label))
             menu.addAction("Shred (erase securely)...", lambda: self._shred_action(label))
@@ -3155,6 +3288,35 @@ class VaultGraphWindow(QMainWindow):
             self._toast(f"'{label}' is no longer secret")
         self._rebuild()
 
+    def _is_restricted(self, label) -> bool:
+        """True if the file's latest version is sealed for some users."""
+        try:
+            return self.engine.restriction(label) is not None
+        except Exception:
+            return False
+
+    def _restrict_action(self, label):
+        """Asks which users may read the file, then seals it for them."""
+        me = self.engine.user.name if self.engine.user else None
+        dlg = RestrictDialog(self, label, self.engine.users(), me, self.engine.restriction(label))
+        if dlg.exec() != QDialog.Accepted:
+            return
+        try:
+            self._perform_write_and_animate(lambda: self.engine.restrict(label, dlg.chosen()))
+        except (PermissionError, ValueError) as e:
+            QMessageBox.warning(self, "Restrict", str(e))
+            return
+        self._toast(f"'{label}' is now readable only by: {', '.join(sorted(set(dlg.chosen()) | {me}))}")
+
+    def _unrestrict_action(self, label):
+        """Makes a restricted file readable by every user again."""
+        try:
+            self._perform_write_and_animate(lambda: self.engine.unrestrict(label))
+        except (PermissionError, ValueError) as e:
+            QMessageBox.warning(self, "Remove restriction", str(e))
+            return
+        self._toast(f"'{label}' is readable by every user again")
+
     def _shred_action(self, label, generation_index=None):
         """Asks for confirmation, then securely erases a file or one old version."""
         what = (f"'{label}' and all its history" if generation_index is None
@@ -3265,6 +3427,14 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "Prune failed", str(e))
 
     def _fork_from_generation_action(self, label, generation_index):
+        """Starts a branch from an older generation, unless the file is restricted."""
+        if self._is_restricted(label):
+            QMessageBox.information(self, "Fork", f"'{label}' is restricted, and a fork would store its new "
+                                    f"branch unsealed. Edit it in the app instead, or remove the restriction.")
+            return
+        self._fork_from_generation_action_unrestricted(label, generation_index)
+
+    def _fork_from_generation_action_unrestricted(self, label, generation_index):
         """Asks for a file and stores it as a branch from an older generation."""
         path, _ = QFileDialog.getOpenFileName(self, f"Fork '{label}' generation {generation_index} with...")
         if not path:
@@ -3515,7 +3685,11 @@ class VaultGraphWindow(QMainWindow):
         if self.engine.is_secret(label):
             # Secret: the text lives only in memory and in the editor.
             tmp_path = None
-            initial_text = self.engine.read_bytes(label).decode("utf-8", errors="replace")
+            try:
+                initial_text = self.engine.read_bytes(label).decode("utf-8", errors="replace")
+            except PermissionError as e:  # restricted to other users
+                QMessageBox.warning(self, "Edit", str(e))
+                return
         else:
             os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
             fd, tmp_path = tempfile.mkstemp(prefix="pfs_inapp_", suffix=".txt", dir=EDIT_CACHE_DIR)
@@ -3552,7 +3726,11 @@ class VaultGraphWindow(QMainWindow):
         """Images: in-app read-only viewer."""
         if not self.engine.has_label(label):
             return
-        image_bytes = self.engine.read_bytes(label)  # in memory; never written to disk
+        try:
+            image_bytes = self.engine.read_bytes(label)  # in memory; never written to disk
+        except PermissionError as e:  # restricted to other users
+            QMessageBox.warning(self, "View", str(e))
+            return
         dlg = ImageViewerDialog(self, label, image_bytes)
         self._active_dialogs.append(dlg)
         dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
@@ -3989,7 +4167,7 @@ def _open_python_engine(storage_root: str):
 
 def _open_cpp_engine(storage_root: str):
     """Opens a C++-engine vault, asking for the passphrase in dialogs; refuses Python-engine vaults."""
-    from gearhash.master_key_store import create_new_vault_key, load_vault_key, WrongPassphraseError, MASTER_KEY_FILENAME
+    from gearhash.master_key_store import create_new_vault_key, unlock_user, WrongPassphraseError, MASTER_KEY_FILENAME
     from pfs_engine_binding import CppVaultSession, PfsEngineError
 
     existing = _existing_vault_engine(storage_root)
@@ -4012,23 +4190,25 @@ def _open_cpp_engine(storage_root: str):
         if pw1 != pw2:
             QMessageBox.critical(None, "Unlock Failed", "Passphrases didn't match.")
             return None
-        kek = create_new_vault_key(storage_root, pw1)
+        create_new_vault_key(storage_root, pw1)
+        user = unlock_user(storage_root, pw1)
     else:
         pw, ok = QInputDialog.getText(None, "Unlock C++ Vault", f"Passphrase for {storage_root}:", QLineEdit.Password)
         if not ok:
             sys.exit(0)
         try:
-            kek = load_vault_key(storage_root, pw)
+            user = unlock_user(storage_root, pw)
         except WrongPassphraseError:
             QMessageBox.critical(None, "Unlock Failed", "Wrong passphrase.")
             return None
 
+    kek = user.kek
     try:
         session = CppVaultSession(storage_root, kek)
     except PfsEngineError as e:
         QMessageBox.critical(None, "Unlock Failed", f"Couldn't open the C++ vault: {e}")
         return None
-    return CppEngineAdapter(session, kek)
+    return CppEngineAdapter(session, kek, user)
 
 
 def main():
