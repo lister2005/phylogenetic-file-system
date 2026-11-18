@@ -41,16 +41,19 @@ class Hasher:
         """Return the digest value."""
         return self.hash
 
-    def chunks(self, mask: int, data: bytes, min_size: int = None, max_size: int = None) -> Iter:
-        """Return an iterator over the chunks determined by chunk boundaries."""
-        return Iter(self, mask, data, min_size=min_size, max_size=max_size)
+    def chunks(self, mask: int, data: bytes, min_size: int = None, max_size: int = None,
+               anchored: bool = False) -> Iter:
+        """Return an iterator over the chunks determined by chunk boundaries
+        (anchored: see chunk.Iter)."""
+        return Iter(self, mask, data, min_size=min_size, max_size=max_size, anchored=anchored)
 
     def stream_chunks(self, mask: int, file_obj, min_size: int = None, max_size: int = None,
-                       read_ahead: int = 8 * 1024 * 1024) -> StreamingIter:
+                       read_ahead: int = 8 * 1024 * 1024, anchored: bool = False) -> StreamingIter:
         """Like chunks(), but reads from an open file object in bounded
         increments instead of requiring the whole file as an in-memory
         bytes object. Use this for large files."""
-        return StreamingIter(self, mask, file_obj, min_size=min_size, max_size=max_size, read_ahead=read_ahead)
+        return StreamingIter(self, mask, file_obj, min_size=min_size, max_size=max_size, read_ahead=read_ahead,
+                             anchored=anchored)
 
     def is_chunk_boundary(self, mask: int) -> bool:
         """True if the current digest is a chunk boundary for `mask` (see :func:`mask`)."""

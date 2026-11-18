@@ -156,15 +156,20 @@ struct pfs_chunker {
 	struct pfs_sb *sbi;
 	u64 hash; /* never reset between chunks, like the userspace chunker */
 	u8 *buf;
-	u32 len;
+	u32 len;      /* bytes buffered for the current chunk */
+	u32 scanned;  /* of those, bytes already folded into hash */
+	u64 best_hash; /* lowest hash at a candidate cut so far (anchored fallback) */
+	u32 best_end;  /* the chunk length that candidate would give */
 	struct pfs_chunk **chunks;
 	u32 nchunks;
 	u32 cap;
 	u32 new_chunks;
 };
 
-/* Ends the current chunk: stores it (or reuses an identical one) and adds it to the list. */
-static int pfs_chunker_emit(struct pfs_chunker *ck)
+/* Ends the current chunk after its first `cut` buffered bytes: stores it (or
+ * reuses an identical one) and adds it to the list. The rest of the buffer
+ * starts the next chunk and is scanned again. */
+static int pfs_chunker_emit(struct pfs_chunker *ck, u32 cut)
 {
 	struct pfs_chunk *c;
 	bool is_new;
@@ -181,29 +186,48 @@ static int pfs_chunker_emit(struct pfs_chunker *ck)
 		ck->chunks = grown;
 		ck->cap = cap;
 	}
-	c = pfs_chunk_get(ck->sbi, ck->buf, ck->len, &is_new);
+	c = pfs_chunk_get(ck->sbi, ck->buf, cut, &is_new);
 	if (!c)
 		return -ENOMEM;
 	ck->chunks[ck->nchunks++] = c;
 	ck->new_chunks += is_new;
-	ck->len = 0;
+	memmove(ck->buf, ck->buf + cut, ck->len - cut);
+	ck->len -= cut;
+	ck->scanned = 0;
+	ck->best_hash = U64_MAX;
+	ck->best_end = PFS_CHUNK_MAX;
 	return 0;
 }
 
-/* Same boundary rule as gearhash_core.c's scan_chunk_c(): the first
- * PFS_CHUNK_MIN bytes of a chunk are hashed but never cut; after that, a
- * chunk ends right after any byte leaving (hash & mask) == 0, and always
- * at PFS_CHUNK_MAX. */
+/* Same boundary rule as gearhash_core.c's scan_chunk_anchored_c(): the
+ * first PFS_CHUNK_MIN bytes of a chunk are hashed but never cut; after that,
+ * a chunk ends right after any byte leaving (hash & mask) == 0. If none does
+ * by PFS_CHUNK_MAX, it ends at the candidate with the lowest hash (the
+ * earliest on a tie), the hash goes back to its value there, and the bytes
+ * after it are scanned again as the next chunk. */
 static int pfs_chunker_feed(struct pfs_chunker *ck, const u8 *data, size_t n)
 {
 	size_t i;
 	int err;
 
 	for (i = 0; i < n; i++) {
-		ck->hash = (ck->hash << 1) + pfs_gear_table[data[i]];
 		ck->buf[ck->len++] = data[i];
-		if ((ck->len > PFS_CHUNK_MIN && !(ck->hash & PFS_CHUNK_MASK)) || ck->len == PFS_CHUNK_MAX) {
-			err = pfs_chunker_emit(ck);
+		while (ck->scanned < ck->len) {
+			ck->hash = (ck->hash << 1) + pfs_gear_table[ck->buf[ck->scanned++]];
+			if (ck->scanned <= PFS_CHUNK_MIN)
+				continue;
+			if (!(ck->hash & PFS_CHUNK_MASK)) {
+				err = pfs_chunker_emit(ck, ck->scanned);
+			} else {
+				if (ck->hash < ck->best_hash) {
+					ck->best_hash = ck->hash;
+					ck->best_end = ck->scanned;
+				}
+				if (ck->scanned < PFS_CHUNK_MAX)
+					continue;
+				ck->hash = ck->best_hash;
+				err = pfs_chunker_emit(ck, ck->best_end);
+			}
 			if (err)
 				return err;
 		}
@@ -234,7 +258,7 @@ static int pfs_speciate(struct inode *inode)
 {
 	struct pfs_inode *pi = PFS_I(inode);
 	struct pfs_sb *sbi = PFS_SB(inode->i_sb);
-	struct pfs_chunker ck = { .sbi = sbi };
+	struct pfs_chunker ck = { .sbi = sbi, .best_hash = U64_MAX, .best_end = PFS_CHUNK_MAX };
 	struct pfs_generation *tip, *gen;
 	loff_t size = i_size_read(inode);
 	loff_t pos = 0;
@@ -267,7 +291,7 @@ static int pfs_speciate(struct inode *inode)
 		folio_put(folio);
 	}
 	if (!err && ck.len)
-		err = pfs_chunker_emit(&ck);
+		err = pfs_chunker_emit(&ck, ck.len);
 	if (err) {
 		pfs_chunker_abort(&ck);
 		goto out;

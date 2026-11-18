@@ -15,6 +15,13 @@ size_t scan_chunk_c(const uint8_t* data, size_t data_len, size_t cursor,
                      size_t min_size, size_t max_size,
                      const uint64_t* gear_table);
 
+// Storage chunking: like scan_chunk_c, but when no natural cut comes before
+// max_size it cuts at the lowest-hash candidate instead of at max_size.
+size_t scan_chunk_anchored_c(const uint8_t* data, size_t data_len, size_t cursor,
+                              uint64_t* current_hash, uint64_t mask,
+                              size_t min_size, size_t max_size,
+                              const uint64_t* gear_table);
+
 int scan_batch_c(const uint8_t* data, size_t data_len, uint64_t* hash_ptr,
                   uint64_t mask, size_t min_size, size_t max_size,
                   const uint64_t* gear_table, int* results, int max_chunks);

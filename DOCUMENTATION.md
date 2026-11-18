@@ -132,8 +132,8 @@ and does the same job. The desktop app and the shell can use either.
 
 ## Building it: problems and what they taught
 
-PFS didn't work well the first time, or the second. These are the seven
-problems that taught the most, roughly in the order they turned up.
+PFS didn't work well the first time, or the second. These are the problems
+that taught the most, roughly in the order they turned up.
 
 ### 1. Storing a large file was painfully slow
 
@@ -247,28 +247,42 @@ to the Tree view, where every version is its own dot and the new one visibly
 appears. It was a useful reminder that a system can be correct and still
 feel broken if people can't see what it did.
 
-### A known blind spot
+### A blind spot, and how it was closed
 
-One problem hasn't been fixed, and it is built into how content-defined
-chunking works. PFS decides where to cut a file by looking at the last 64
-bytes before each position. If those bytes match a certain pattern (roughly
-a 1 in 8,000 chance at any position), it cuts there. In ordinary files the
-bytes keep changing, so cut points appear naturally every few kilobytes, and
-because they depend on the content, they move with it when you edit.
+One problem was built into how content-defined chunking works. PFS decides
+where to cut a file by looking at the last 64 bytes before each position. If
+those bytes match a certain pattern (roughly a 1 in 8,000 chance at any
+position), it cuts there. In ordinary files the bytes keep changing, so cut
+points appear naturally every few kilobytes, and because they depend on the
+content, they move with it when you edit.
 
-Text that repeats exactly breaks this. If a 47-character phrase is repeated
+Text that repeats exactly broke this. If a 47-character phrase is repeated
 over and over, the chunker only ever sees the same 47 situations again and
-again. If none of them happens to match the pattern, there are no natural
-cut points anywhere in the file, and PFS falls back to cutting every 16 KB,
-its maximum piece size. That is exactly the fixed-size cutting that
+again. If none of them happens to match the pattern, there are no natural cut
+points anywhere, and PFS used to fall back to cutting every 16 KB, its
+maximum piece size. That is exactly the fixed-size cutting that
 content-defined chunking exists to avoid: insert two bytes near the start and
-every later cut shifts, so every piece looks new. In a test, inserting two
-bytes near the start of ordinary data left 8 of its 9 pieces shared with
-the original; the same insertion in repeated text left none of them shared.
+every later cut shifts, so every piece looks new. Repeated log lines, zero
+padding and silence in audio all did this.
 
-Ordinary writing doesn't trigger this, even when it is repetitive, but long
-identical runs (padding, silence in audio, repeated log lines) can. It is
-listed in the manual as a known limitation.
+The fix keeps the content in charge even when no natural cut appears. When a
+piece reaches its maximum size, PFS goes back and cuts at the position, among
+those it could have cut at, whose hash value is the lowest. That position
+depends only on the content, so in repeating data it falls at the same point
+of the pattern every time, and after an edit the pieces line up with the old
+ones again. Measured with two bytes inserted near the start:
+
+| Data | Pieces still shared, before | After |
+|---|---|---|
+| Ordinary data | 36 of 37 | 39 of 40 |
+| A repeated 47-character phrase | 11 of 23 | 87 of 88 |
+| Zero padding | 21 of 22 | 75 of 76 |
+| Repeated log lines | 0 of 22 | 82 of 83 |
+
+The same rule had to be written four times, in the Python chunker, the C
+library, the C++ engine and the kernel module, and tests check that all of
+them cut in exactly the same places. The price is more, smaller pieces in
+repetitive regions, which means more index entries there.
 
 ## Where it stands
 
@@ -284,8 +298,8 @@ users; the desktop app, the shell and the mounted folder.
 written and compiles, but hasn't yet been loaded and tested on a real
 machine.
 
-**Known limits:** Linux only; files that aren't text merge piece by piece, not line by line;
-text that repeats exactly deduplicates poorly (see above); no independent
+**Known limits:** Linux only; files that aren't text merge piece by piece, not
+line by line; no independent
 security audit; every user can change or delete any file, and removing a
 user doesn't re-encrypt the vault.
 

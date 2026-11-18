@@ -55,6 +55,17 @@ in C++. A vault belongs to the engine that created it.
 PFS doesn't replace your computer's own file system. It looks after the files
 you put into a vault, and leaves everything else alone.
 
+**Good for:** documents, media and other files you edit again and again;
+text and source files, which merge line by line across branches; logs and
+other repetitive files, which still deduplicate after an edit; `.env` files
+and credentials, shared with chosen people.
+
+**Not yet:** systems other than Linux; production storage that needs an
+independent security audit; permissions for who may *change* a file (users
+control who can *read* a restricted secret, but every user can edit or delete
+files); replacing your computer's main file system. The kernel-module version
+compiles but hasn't been tested on real hardware yet.
+
 ## Get started
 
 You need Python 3.12. The C++ engine is optional and also needs `cmake`, `g++`,

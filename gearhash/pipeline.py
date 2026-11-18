@@ -352,7 +352,7 @@ class StoragePipeline:
                     for chunk in hasher.stream_chunks(
                         chunk_mask, f,
                         min_size=STORAGE_MIN_SIZE, max_size=STORAGE_MAX_SIZE,
-                        read_ahead=STORAGE_READ_AHEAD,
+                        read_ahead=STORAGE_READ_AHEAD, anchored=True,
                     ):
                         chunk_data = chunk.data
                         file_hasher.update(chunk_data)

@@ -209,8 +209,9 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
             std::vector<ChunkSpan> window;
             window.reserve(kDedupBatchSize);
             while (window.size() < kDedupBatchSize && cursor < src.size) {
-                size_t chunk_len = scan_chunk_c(src.data, src.size, cursor, &rolling_hash,
-                                                 kChunkMask, kMinSize, kMaxSize, kGearTable);
+                // Anchored: no fixed-length cuts in repetitive data (gearhash_core.c).
+                size_t chunk_len = scan_chunk_anchored_c(src.data, src.size, cursor, &rolling_hash,
+                                                          kChunkMask, kMinSize, kMaxSize, kGearTable);
                 if (chunk_len == 0) break;
                 Bytes32 digest = sha256(src.data + cursor, chunk_len);
                 block_hashes.push_back(digest);

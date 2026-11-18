@@ -49,6 +49,8 @@ if os.path.exists(_so_path):
             ctypes.POINTER(ctypes.c_uint64)  # const uint64_t* gear_table
         ]
         _c_lib.scan_chunk_c.restype = ctypes.c_size_t
+        _c_lib.scan_chunk_anchored_c.argtypes = _c_lib.scan_chunk_c.argtypes
+        _c_lib.scan_chunk_anchored_c.restype = ctypes.c_size_t
         
         _c_table_ptr = (ctypes.c_uint64 * len(GEAR_TABLE))(*GEAR_TABLE)
         USING_C_EXTENSION = True
@@ -58,10 +60,43 @@ else:
     C_LOAD_ERROR = f"Shared library binary missing at target path: {_so_path}"
 
 
+
+_U64 = 0xFFFFFFFFFFFFFFFF
+
+
+def _scan_python(data, start: int, hash_value: int, table, mask: int, min_size: int, max_size: int,
+                 anchored: bool):
+    """Pure-Python scan_chunk_c / scan_chunk_anchored_c: (chunk length, hash
+    at the cut). See gearhash_core.c for the rules."""
+    data_len = len(data)
+    anchored = anchored and start + max_size <= data_len
+    max_limit = min(start + max_size, data_len)
+    min_limit = min(start + min_size, data_len)
+    cursor = start
+    while cursor < min_limit:
+        hash_value = ((hash_value << 1) + table[data[cursor]]) & _U64
+        cursor += 1
+    best_hash, best_end = _U64 + 1, max_limit
+    while cursor < max_limit:
+        hash_value = ((hash_value << 1) + table[data[cursor]]) & _U64
+        cursor += 1
+        if (hash_value & mask) == 0:
+            return cursor - start, hash_value
+        if anchored and hash_value < best_hash:
+            best_hash, best_end = hash_value, cursor
+    if anchored:
+        return best_end - start, best_hash
+    return cursor - start, hash_value
+
+
 class Iter(Iterator[Chunk]):
     """Iterates over the chunks of an in-memory buffer using the Gear rolling hash."""
-    def __init__(self, hasher: "Hasher", mask: int, data: bytes, min_size: int = None, max_size: int = None) -> None:
-        """Prepares to chunk data; min_size/max_size default to the module's 4 KB / 16 KB."""
+    def __init__(self, hasher: "Hasher", mask: int, data: bytes, min_size: int = None, max_size: int = None,
+                 anchored: bool = False) -> None:
+        """Prepares to chunk data; min_size/max_size default to the module's 4 KB / 16 KB.
+        anchored: cut at the lowest-hash position when no natural cut comes
+        before max_size (storage chunking; see scan_chunk_anchored_c)."""
+        self.anchored = anchored
         self.hasher = hasher
         self.mask = mask
         self.data = data
@@ -82,7 +117,8 @@ class Iter(Iterator[Chunk]):
         
         if USING_C_EXTENSION:
             c_hash = ctypes.c_uint64(self.hasher.hash)
-            chunk_len = _c_lib.scan_chunk_c(
+            scan = _c_lib.scan_chunk_anchored_c if self.anchored else _c_lib.scan_chunk_c
+            chunk_len = scan(
                 self.data,
                 len(self.data),
                 self.cursor,
@@ -95,21 +131,9 @@ class Iter(Iterator[Chunk]):
             self.hasher.hash = c_hash.value
             self.cursor += chunk_len
         else:
-            # Pure-Python fallback
-            max_limit = min(offset + self.max_size, len(self.data))
-            min_limit = min(offset + self.min_size, len(self.data))
-            
-            while self.cursor < min_limit:
-                byte = self.data[self.cursor]
-                self.hasher.hash = ((self.hasher.hash << 1) + self.hasher.table[byte]) & 0xFFFFFFFFFFFFFFFF
-                self.cursor += 1
-                
-            while self.cursor < max_limit:
-                byte = self.data[self.cursor]
-                self.hasher.hash = ((self.hasher.hash << 1) + self.hasher.table[byte]) & 0xFFFFFFFFFFFFFFFF
-                self.cursor += 1
-                if (self.hasher.hash & self.mask) == 0:
-                    break
+            chunk_len, self.hasher.hash = _scan_python(self.data, offset, self.hasher.hash, self.hasher.table,
+                                                       self.mask, self.min_size, self.max_size, self.anchored)
+            self.cursor += chunk_len
 
         return Chunk(hash=self.hasher.digest(), offset=offset, len=self.cursor - offset)
 
@@ -127,8 +151,11 @@ class StreamingIter(Iterator[StreamedChunk]):
         min_size: int = None,
         max_size: int = None,
         read_ahead: int = 8 * 1024 * 1024,
+        anchored: bool = False,
     ) -> None:
-        """Prepares to chunk a file object while reading it in read_ahead-sized blocks."""
+        """Prepares to chunk a file object while reading it in read_ahead-sized
+        blocks. anchored: as for Iter."""
+        self.anchored = anchored
         self.hasher = hasher
         self.mask = mask
         self.file_obj = file_obj
@@ -169,7 +196,8 @@ class StreamingIter(Iterator[StreamedChunk]):
             # write time.
             window = bytes(self.buffer[:self.max_size])
             c_hash = ctypes.c_uint64(self.hasher.hash)
-            chunk_len = _c_lib.scan_chunk_c(
+            scan = _c_lib.scan_chunk_anchored_c if self.anchored else _c_lib.scan_chunk_c
+            chunk_len = scan(
                 window,
                 len(window),
                 0,
@@ -181,23 +209,9 @@ class StreamingIter(Iterator[StreamedChunk]):
             )
             self.hasher.hash = c_hash.value
         else:
-            cursor = 0
-            min_limit = min(self.min_size, data_len)
-            max_limit = min(self.max_size, data_len)
-
-            while cursor < min_limit:
-                byte = self.buffer[cursor]
-                self.hasher.hash = ((self.hasher.hash << 1) + self.hasher.table[byte]) & 0xFFFFFFFFFFFFFFFF
-                cursor += 1
-
-            while cursor < max_limit:
-                byte = self.buffer[cursor]
-                self.hasher.hash = ((self.hasher.hash << 1) + self.hasher.table[byte]) & 0xFFFFFFFFFFFFFFFF
-                cursor += 1
-                if (self.hasher.hash & self.mask) == 0:
-                    break
-
-            chunk_len = cursor
+            window = bytes(self.buffer[:self.max_size])
+            chunk_len, self.hasher.hash = _scan_python(window, 0, self.hasher.hash, self.hasher.table, self.mask,
+                                                       self.min_size, self.max_size, self.anchored)
 
         chunk_bytes = bytes(self.buffer[:chunk_len])
         del self.buffer[:chunk_len]  # drop the consumed prefix
