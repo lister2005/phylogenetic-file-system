@@ -72,6 +72,9 @@ struct PfsFuseState {
     uint64_t view_epoch = UINT64_MAX;
     std::map<std::string, std::vector<std::string>> clade_to_labels;
     std::map<std::string, std::string> label_to_clade;
+    // label -> manifest filename as last seen, to tell the clade worker what
+    // another program changed. Guarded by `mutex`.
+    std::map<std::string, std::string> catalog_seen;
 };
 
 // Returns the mount's shared state, set up in main().
@@ -83,23 +86,57 @@ PfsFuseState* state() {
 void label_changed_locked(PfsFuseState* st, const std::string& label) {
     st->catalog_epoch++;
     auto manifest_filename = st->session->catalog.get(label);
+    if (manifest_filename) st->catalog_seen[label] = *manifest_filename;
     if (manifest_filename && st->clades) st->clades->changed(label, *manifest_filename);
 }
 
 // Reports a deleted file to the clade worker. Caller holds st->mutex.
 void label_removed_locked(PfsFuseState* st, const std::string& label) {
     st->catalog_epoch++;
+    st->catalog_seen.erase(label);
     if (st->clades) st->clades->removed(label);
 }
 
 // Refreshes clade_to_labels/label_to_clade from the worker's latest
 // partition, filtered by the catalog, without waiting.
+// Picks up changes another program made to the vault and reports them to
+// the clade worker. Caller holds st->mutex.
+void refresh_locked(PfsFuseState* st) {
+    if (!st->session->refresh()) return;
+    st->catalog_epoch++;
+    std::map<std::string, std::string> now;
+    for (const auto& label : st->session->catalog.labels()) {
+        auto m = st->session->catalog.get(label);
+        if (m) now[label] = *m;
+    }
+    if (st->clades) {
+        for (const auto& kv : st->catalog_seen) {
+            if (!now.count(kv.first)) st->clades->removed(kv.first);
+        }
+        for (const auto& kv : now) {
+            auto it = st->catalog_seen.find(kv.first);
+            if (it == st->catalog_seen.end() || it->second != kv.second) st->clades->changed(kv.first, kv.second);
+        }
+    }
+    st->catalog_seen = std::move(now);
+}
+
+// True for a file tagged secret: never shown in the mount, where any program
+// could read it without the passphrase. Caller holds st->mutex.
+bool hidden_locked(PfsFuseState* st, const std::string& label) {
+    return VaultSession::is_secret(st->session->lineage.get_tags(label));
+}
+
 void ensure_clades_locked(PfsFuseState* st) {
     if (!st->clades) return;
     auto partition = st->clades->snapshot();
     if (partition->version == st->view_version && st->catalog_epoch == st->view_epoch) return;
     auto view = filtered_clades(
-        *partition, [st](const std::string& label) { return st->session->catalog.get(label).has_value(); }, 2);
+        *partition,
+        [st](const std::string& label) {
+            return st->session->catalog.get(label).has_value() && !hidden_locked(st, label);
+        },
+        2);
     st->clade_to_labels = std::move(view.first);
     st->label_to_clade = std::move(view.second);
     st->view_version = partition->version;
@@ -138,7 +175,7 @@ bool resolve_locked(PfsFuseState* st, const std::string& path, Resolved* out) {
             return true;
         }
         bool in_clade = st->label_to_clade.count(rest) > 0;
-        bool in_catalog = st->session->catalog.get(rest).has_value();
+        bool in_catalog = st->session->catalog.get(rest).has_value() && !hidden_locked(st, rest);
         bool has_open_handle = false;
         for (const auto& kv : st->handles) {
             if (kv.second.label == rest) { has_open_handle = true; break; }
@@ -244,6 +281,7 @@ int pfs_getattr(const char* path, struct stat* stbuf, struct fuse_file_info*) {
     std::string p(path);
 
     std::lock_guard<std::mutex> lock(st->mutex);
+    refresh_locked(st);
     Resolved r;
     if (!resolve_locked(st, p, &r)) return -ENOENT;
 
@@ -298,6 +336,7 @@ int pfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, stru
     std::string p(path);
 
     std::lock_guard<std::mutex> lock(st->mutex);
+    refresh_locked(st);
     Resolved r;
     if (!resolve_locked(st, p, &r)) return -ENOENT;
 
@@ -322,7 +361,9 @@ int pfs_readdir(const char* path, void* buf, fuse_fill_dir_t filler, off_t, stru
     std::sort(clade_names.begin(), clade_names.end());
 
     std::set<std::string> all_names;
-    for (const auto& label : st->session->catalog.labels()) all_names.insert(label);
+    for (const auto& label : st->session->catalog.labels()) {
+        if (!hidden_locked(st, label)) all_names.insert(label);
+    }
     for (const auto& kv : st->handles) all_names.insert(kv.second.label);
     std::vector<std::string> root_files;
     for (const auto& name : all_names) {
@@ -343,6 +384,7 @@ int pfs_open(const char* path, struct fuse_file_info* fi) {
     std::string manifest_path;
     {
         std::lock_guard<std::mutex> lock(st->mutex);
+        refresh_locked(st);
         Resolved r;
         if (!resolve_locked(st, p, &r) || r.kind != ResolveKind::kFile) return -ENOENT;
         label = r.name;
@@ -377,6 +419,12 @@ int pfs_create(const char* path, mode_t, struct fuse_file_info* fi) {
     std::string rest = p.substr(1);
     if (rest.empty() || rest.find('/') != std::string::npos) return -EACCES;
     label = rest;
+    {
+        auto* st = state();
+        std::lock_guard<std::mutex> lock(st->mutex);
+        // Would overwrite a secret file nobody can see here.
+        if (st->session->catalog.get(label) && hidden_locked(st, label)) return -EACCES;
+    }
 
     FileHandle handle;
     handle.label = label;
@@ -563,15 +611,17 @@ int pfs_rename(const char* old_path, const char* new_path, unsigned int) {
     std::string new_label = (last_slash == std::string::npos) ? rest : rest.substr(last_slash + 1);
     if (new_label.empty()) return -EINVAL;
 
+    // Replace + rename as one change, under the vault's write lock.
+    VaultSession::Change change(*st->session);
     if (!st->session->catalog.get(old_label)) return -ENOENT;
-    if (st->session->catalog.get(new_label) && new_label != old_label) {
+    // Would replace a secret file nobody can see here.
+    if (st->session->catalog.get(new_label) && hidden_locked(st, new_label)) return -EACCES;
+    if (new_label == old_label) return 0;
+    if (st->session->catalog.get(new_label)) {
         // Replacing an existing destination goes through delete_label too.
         st->session->delete_label(new_label);
     }
-    auto manifest_filename = st->session->catalog.get(old_label);
-    st->session->catalog.remove(old_label);
-    st->session->catalog.set(new_label, *manifest_filename);
-    st->session->lineage.rename_label(old_label, new_label);
+    st->session->rename_label(old_label, new_label);
     st->catalog_epoch++;
     if (st->clades) st->clades->renamed(old_label, new_label);
     return 0;
@@ -603,7 +653,10 @@ void* pfs_init(struct fuse_conn_info*, struct fuse_config* cfg) {
         std::lock_guard<std::mutex> lock(st->mutex);
         for (const auto& label : st->session->catalog.labels()) {
             auto manifest_filename = st->session->catalog.get(label);
-            if (manifest_filename) labels.push_back({label, *manifest_filename});
+            if (manifest_filename) {
+                labels.push_back({label, *manifest_filename});
+                st->catalog_seen[label] = *manifest_filename;
+            }
         }
     }
     st->clades = std::make_unique<CladeWorker>(loader);

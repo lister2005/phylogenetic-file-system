@@ -10,6 +10,7 @@ from gearhash.dedup_index import GlobalBlockIndex, DB_FILENAME, _lookup_key
 from gearhash.keyring import KeyRing, KEYRING_FILENAME
 from gearhash.immutability import set_immutable, with_mutable
 from gearhash.phenotype import detect_from_file
+from gearhash.scrub import scrub_and_remove
 
 # Storage chunking profile: 8 KiB average (mask 0x1FFF), 4-16 KiB bounds.
 STORAGE_MIN_SIZE = 4096
@@ -497,6 +498,74 @@ class StoragePipeline:
         if os.path.exists(traits_path):
             set_immutable(traits_path, False)
             os.remove(traits_path)
+
+    def manifest_chunk_hashes(self, manifest_path: str) -> list:
+        """A recipe's chunk hashes, in order."""
+        manifest_filename = os.path.basename(manifest_path)
+        with open(manifest_path, "rb") as f:
+            raw = self.crypto.decrypt_block(f.read(), associated_data=manifest_filename.encode())
+        engine = FKSLookupEngine(raw_bytes=raw)
+        return [engine.lookup(i) for i in range(engine.metadata.get("total_blocks", 0))]
+
+    def _overwrite_regions(self, path: str, regions) -> None:
+        """Overwrites each (offset, length) region of a container with random bytes."""
+        if not regions or not os.path.exists(path):
+            return
+        set_immutable(path, False)
+        try:
+            with open(path, "r+b") as f:
+                for offset, length in regions:
+                    f.seek(offset)
+                    f.write(os.urandom(length))
+                f.flush()
+                os.fsync(f.fileno())
+        finally:
+            set_immutable(path, True)
+
+    def shred_manifest(self, manifest_path: str, destroy_hashes: set) -> dict:
+        """Securely removes a recipe. Chunks in destroy_hashes (used by nothing
+        else) are overwritten with random bytes in both containers and their
+        index entries securely deleted; the recipe's other chunks just lose
+        one reference each, as with delete_file(). The recipe and its
+        fingerprint file are overwritten before being deleted.
+
+        Returns {"chunks_destroyed": int, "chunks_kept_shared": int}.
+        """
+        hashes = self.manifest_chunk_hashes(manifest_path)
+        global_index = GlobalBlockIndex(self.storage_root, self.crypto)
+        try:
+            primary, mirror = [], []
+            for content_hash in set(hashes) & destroy_hashes:
+                entry = global_index.lookup(content_hash)
+                if entry is not None:
+                    primary.append((entry[0], entry[1]))
+                spare = global_index.get_mirror(content_hash)
+                if spare is not None:
+                    mirror.append(spare)
+            self._overwrite_regions(self.container_path, primary)
+            self._overwrite_regions(self.mirror_container_path, mirror)
+
+            global_index.begin()
+            try:
+                for content_hash in hashes:
+                    if content_hash not in destroy_hashes:
+                        global_index.decrement_ref(content_hash)
+            except Exception:
+                global_index.rollback()
+                raise
+            global_index.commit()
+            destroyed = global_index.remove_securely(set(hashes) & destroy_hashes)
+        finally:
+            global_index.close()
+
+        set_immutable(manifest_path, False)
+        scrub_and_remove(manifest_path)
+        traits_path = traits_path_for(manifest_path)
+        if os.path.exists(traits_path):
+            set_immutable(traits_path, False)
+            scrub_and_remove(traits_path)
+        kept = len(set(hashes) - destroy_hashes)
+        return {"chunks_destroyed": destroyed, "chunks_kept_shared": kept}
 
     def rebuild_ref_counts(self, live_manifest_filenames) -> dict:
         """Recomputes every chunk's ref_count from the manifests that are still

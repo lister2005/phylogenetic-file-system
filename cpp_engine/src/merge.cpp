@@ -46,14 +46,9 @@ std::vector<Bytes32> manifest_chunk_list(const std::string& storage_root, const 
 
 }  // namespace
 
-// Merges two branches chunk by chunk against their common ancestor; clashes use the given choices.
-MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
-                            uint64_t generation_a, uint64_t generation_b, const MergeResolutions& resolutions) {
-    for (const auto& kv : resolutions) {
-        if (kv.second != 'a' && kv.second != 'b') {
-            throw std::invalid_argument("A resolution must be 'a' or 'b'.");
-        }
-    }
+// The two branch tips and their common ancestor, after checking the request.
+MergeNodes merge_nodes(const LineageStore& lineage, const std::string& label, uint64_t generation_a,
+                       uint64_t generation_b) {
     auto node_a_opt = lineage.get_generation(label, generation_a);
     auto node_b_opt = lineage.get_generation(label, generation_b);
     if (!node_a_opt) throw std::invalid_argument("No generation " + std::to_string(generation_a) +
@@ -81,6 +76,40 @@ MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, con
             "One of these generations is a direct ancestor of the other -- that's just linear "
             "history, not a divergent branch. Nothing to merge.");
     }
+    if (ancestor.pruned) {
+        throw std::invalid_argument("The common ancestor of these branches was pruned -- there is no base "
+                                    "version to compare them with.");
+    }
+    return MergeNodes{node_a, node_b, ancestor};
+}
+
+// Commits caller-merged content as the merge of two branches.
+MergeResult commit_merged_file(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
+                               uint64_t generation_a, uint64_t generation_b, const std::string& source_path) {
+    MergeNodes nodes = merge_nodes(lineage, label, generation_a, generation_b);
+    WriteResult write_result = pipeline.secure_and_persist_file(source_path, label);
+    std::string manifest_filename =
+        write_result.manifest_path.substr(write_result.manifest_path.find_last_of('/') + 1);
+    lineage.record_version(label, manifest_filename, write_result.new_chunks_written, write_result.total_blocks,
+                            {nodes.node_b.node_uuid}, &nodes.node_a);
+    MergeResult result;
+    result.manifest_path = write_result.manifest_path;
+    result.total_blocks = write_result.total_blocks;
+    result.new_chunks_written = write_result.new_chunks_written;
+    result.duplicate_chunks_found = write_result.duplicate_chunks_found;
+    return result;
+}
+
+// Merges two branches chunk by chunk against their common ancestor; clashes use the given choices.
+MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
+                            uint64_t generation_a, uint64_t generation_b, const MergeResolutions& resolutions) {
+    for (const auto& kv : resolutions) {
+        if (kv.second != 'a' && kv.second != 'b') {
+            throw std::invalid_argument("A resolution must be 'a' or 'b'.");
+        }
+    }
+    MergeNodes nodes = merge_nodes(lineage, label, generation_a, generation_b);
+    LineageNode node_a = nodes.node_a, node_b = nodes.node_b, ancestor = nodes.ancestor;
 
     const Bytes32& kek = pipeline.kek();
     const std::string& storage_root = pipeline.storage_root();

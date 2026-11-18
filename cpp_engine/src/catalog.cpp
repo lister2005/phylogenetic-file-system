@@ -56,7 +56,7 @@ void Catalog::load() {
 }
 
 // Encrypts the catalog and replaces the file atomically.
-void Catalog::save() {
+void Catalog::save(bool scrub) {
     BinaryWriter w;
     w.raw_bytes(reinterpret_cast<const uint8_t*>(kMagic), 4);
     w.u16(kVersion);
@@ -79,7 +79,9 @@ void Catalog::save() {
     }
     int fd = open(tmp.c_str(), O_WRONLY);
     if (fd >= 0) { fsync(fd); close(fd); }
-    if (rename(tmp.c_str(), path_.c_str()) != 0) {
+    if (scrub) {
+        scrub_then_replace(tmp, path_);
+    } else if (rename(tmp.c_str(), path_.c_str()) != 0) {
         throw std::runtime_error("failed to rename catalog into place: " + path_);
     }
     set_immutable(path_, true);
@@ -102,6 +104,12 @@ void Catalog::set(const std::string& label, const std::string& manifest_filename
 void Catalog::remove(const std::string& label) {
     entries_.erase(label);
     save();
+}
+
+// Removes a file's entry and saves, overwriting the old catalog file first.
+void Catalog::remove_scrubbed(const std::string& label) {
+    entries_.erase(label);
+    save(true);
 }
 
 // Returns every file name in the catalog.

@@ -65,7 +65,8 @@ public:
                                 const std::vector<NodeUuid>& lateral_parent_uuids = {},
                                 const LineageNode* fork_from = nullptr);
 
-    // Open branch tips: nodes that aren't another node's primary parent.
+    // Open branch tips: nodes no later version of the same file has as a
+    // parent, primary or lateral (a merge closes the branch it merged in).
     std::vector<LineageNode> get_heads(const std::string& label) const;
     std::vector<LineageNode> get_history(const std::string& label) const;  // generation 0 first
     std::optional<LineageNode> get_generation(const std::string& label, uint64_t generation_index) const;
@@ -73,8 +74,14 @@ public:
     std::optional<LineageNode> find_node_by_uuid(const NodeUuid& node_uuid) const;
     std::vector<std::string> all_labels() const;
 
-    void delete_label(const std::string& label);  // all generations. O(N).
+    // All generations. O(N). With scrub, the old history file is overwritten
+    // first (used by 'shred').
+    void delete_label(const std::string& label, bool scrub = false);
     std::optional<std::string> mark_pruned(const std::string& label, uint64_t generation_index);  // O(N)
+    // Like mark_pruned, but also tags the version "shredded" with `when` and
+    // rewrites the history file with scrubbing. O(N).
+    std::optional<std::string> mark_shredded(const std::string& label, uint64_t generation_index,
+                                             const std::string& when);
     void rename_label(const std::string& old_label, const std::string& new_label);  // O(N)
 
     Tags get_tags(const std::string& label) const;
@@ -83,6 +90,9 @@ public:
 
     // Collapses the append log into one snapshot. Manual maintenance.
     void compact();
+
+    // Re-reads the file, for changes made by another program.
+    void reload() { load(); }
 
 private:
     std::string storage_root_;
@@ -94,7 +104,7 @@ private:
     std::map<NodeUuid, LineageNode*> by_uuid_;
 
     void load();
-    void save();  // full snapshot, O(N)
+    void save(bool scrub = false);  // full snapshot, O(N); scrub overwrites the old file first
     void append_node(const LineageNode& node);  // O(1)
     void rebuild_by_uuid();
 };

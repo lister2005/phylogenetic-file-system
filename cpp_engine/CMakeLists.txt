@@ -270,7 +270,7 @@ endif()
 
 # Component 2: the lineage store (per-label edit history DAG).
 add_library(lineage_store STATIC src/lineage_store.cpp)
-target_link_libraries(lineage_store PUBLIC crypto_utils)
+target_link_libraries(lineage_store PUBLIC crypto_utils immutability)
 
 if(PFS_BUILD_BENCH)
     add_executable(lineage_store_test bench/lineage_store_test.cpp)

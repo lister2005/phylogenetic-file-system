@@ -128,6 +128,20 @@ int pfs_merge_branches_resolved(pfs_session_t* session, const char* label, uint6
                                 size_t resolution_count, char* out_manifest_filename, size_t out_buf_len,
                                 uint64_t* out_conflicts, size_t conflicts_cap, size_t* out_conflict_count);
 
+/*
+ * The generation two branches of label last had in common (for a
+ * line-by-line merge done by the caller). Same checks as a merge.
+ */
+int pfs_merge_base(pfs_session_t* session, const char* label, uint64_t generation_a, uint64_t generation_b,
+                   uint64_t* out_base_generation);
+
+/*
+ * Commits source_path (content the caller merged) as the merge of two
+ * branches: generation_a primary parent, generation_b lateral parent.
+ */
+int pfs_commit_merged(pfs_session_t* session, const char* label, uint64_t generation_a, uint64_t generation_b,
+                      const char* source_path, char* out_manifest_filename, size_t out_buf_len);
+
 /* Reconstructs one past generation of `label` to output_path. */
 int pfs_checkout(pfs_session_t* session, const char* label, uint64_t generation_index, const char* output_path);
 
@@ -146,6 +160,22 @@ int pfs_delete_label_ex(pfs_session_t* session, const char* label, int force,
  */
 int pfs_prune_generation(pfs_session_t* session, const char* label, uint64_t generation_index, int force,
                           int* out_freed);
+
+typedef struct {
+    uint64_t versions_shredded;
+    uint64_t manifests_freed;
+    uint64_t manifests_kept_shared;
+    uint64_t chunks_destroyed;
+    uint64_t chunks_kept_shared;
+} pfs_shred_report_t;
+
+/*
+ * Securely erases a label's whole history (has_generation 0) or one old
+ * generation, overwriting content nothing else uses (see VaultSession::shred).
+ * Refuses the current version, and "protected" unless force.
+ */
+int pfs_shred(pfs_session_t* session, const char* label, int has_generation, uint64_t generation_index,
+              int force, pfs_shred_report_t* out_report);
 
 typedef struct {
     uint64_t old_size;
@@ -194,6 +224,18 @@ int pfs_get_lateral_parents_by_uuid(pfs_session_t* session, const char* uuid_hex
 
 /* Open branch heads of `label`. */
 int pfs_get_heads(pfs_session_t* session, const char* label, pfs_generation_callback cb, void* user_data);
+
+/*
+ * Picks up changes other programs made to the vault (several programs may
+ * have it open). Returns 1 if anything changed, 0 if not, -1 on error.
+ */
+int pfs_refresh(pfs_session_t* session);
+
+/* 'spares all': 1 if every chunk gets a spare copy, 0 if only shared ones do. */
+int pfs_get_mirror_all(pfs_session_t* session);
+
+/* Turns 'spares all' on or off. *out_added (may be NULL): existing chunks that got a spare. */
+int pfs_set_mirror_all(pfs_session_t* session, int enabled, uint64_t* out_added);
 
 /*
  * Starts a new epoch with a fresh DEK; nothing is re-encrypted. Returns the

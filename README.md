@@ -30,6 +30,10 @@ living map of your files.
 - **It repairs itself.** Spare copies of shared pieces (or of every piece, if
   you turn that on with `spares all`) let PFS recover from disk damage, and it
   tells you when it does.
+- **Safe for secrets.** Mark a `.env` file as secret and PFS keeps it off the
+  disk: `run` hands its variables straight to a program, comparisons show
+  which values changed but never the values, and `shred` destroys old keys
+  for good.
 - **Three ways in:**
   - a **desktop app** that draws your files as an animated map, with a time
     slider to look back at how things were;
@@ -37,7 +41,7 @@ living map of your files.
   - a **mounted folder**, so any other program can open and save files in PFS
     as if it were an ordinary folder.
 
-  With the Python engine, all three can use the same vault at the same time.
+  All three can use the same vault at the same time, with either engine.
 
 ## What to expect
 

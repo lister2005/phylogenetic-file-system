@@ -235,6 +235,28 @@ class GlobalBlockIndex:
             (key, encrypted_value),
         )
 
+    def remove_securely(self, content_hashes) -> int:
+        """Deletes the entries (and spare-copy entries) of these chunks, with
+        SQLite's secure_delete on so the deleted rows are overwritten, then
+        checkpoints the write-ahead log so no old copy of them stays in it.
+        Returns how many entries were deleted. Used by 'shred'.
+        """
+        self.conn.execute("PRAGMA secure_delete=ON")
+        removed = 0
+        self.begin()
+        try:
+            for content_hash in content_hashes:
+                key = _lookup_key(self.hmac_key, content_hash)
+                cur = self.conn.execute("DELETE FROM blocks WHERE lookup_key = ?", (key,))
+                removed += cur.rowcount
+                self.conn.execute("DELETE FROM mirrors WHERE lookup_key = ?", (key,))
+        except Exception:
+            self.rollback()
+            raise
+        self.commit()
+        self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        return removed
+
     def iter_all(self) -> Iterator[Tuple[bytes, int, int, int, int]]:
         """Yields (content_hash, offset, length, ref_count, epoch_id) for every row. O(N)."""
         for lookup_key, encrypted_value in self.conn.execute("SELECT lookup_key, encrypted_value FROM blocks"):

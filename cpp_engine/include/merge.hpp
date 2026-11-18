@@ -59,4 +59,20 @@ MergeResult merge_branches(StoragePipeline& pipeline, LineageStore& lineage,
                             const std::string& label, uint64_t generation_a, uint64_t generation_b,
                             const MergeResolutions& resolutions = {});
 
+// The two branch tips and their common ancestor, after the checks
+// merge_branches() makes (same std::invalid_argument errors).
+struct MergeNodes {
+    LineageNode node_a;
+    LineageNode node_b;
+    LineageNode ancestor;
+};
+MergeNodes merge_nodes(const LineageStore& lineage, const std::string& label, uint64_t generation_a,
+                       uint64_t generation_b);
+
+// Commits source_path (content merged by the caller, e.g. line by line) as
+// the merge of two branches: generation_a is the primary parent and
+// generation_b a lateral parent, as with merge_branches().
+MergeResult commit_merged_file(StoragePipeline& pipeline, LineageStore& lineage, const std::string& label,
+                               uint64_t generation_a, uint64_t generation_b, const std::string& source_path);
+
 }  // namespace pfs_engine

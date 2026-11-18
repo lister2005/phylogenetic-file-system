@@ -100,6 +100,17 @@ class _CVacuumReport(ctypes.Structure):
     ]
 
 
+class _CShredReport(ctypes.Structure):
+    """C layout of the result of shred."""
+    _fields_ = [
+        ("versions_shredded", ctypes.c_uint64),
+        ("manifests_freed", ctypes.c_uint64),
+        ("manifests_kept_shared", ctypes.c_uint64),
+        ("chunks_destroyed", ctypes.c_uint64),
+        ("chunks_kept_shared", ctypes.c_uint64),
+    ]
+
+
 class _CFsckReport(ctypes.Structure):
     """C layout of the result of fsck."""
     _fields_ = [
@@ -182,6 +193,9 @@ def _load_lib():
     lib.pfs_prune_generation.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_int,
                                           ctypes.POINTER(ctypes.c_int)]
     lib.pfs_prune_generation.restype = ctypes.c_int
+    lib.pfs_shred.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_int, ctypes.c_uint64, ctypes.c_int,
+                              ctypes.POINTER(_CShredReport)]
+    lib.pfs_shred.restype = ctypes.c_int
     lib.pfs_vacuum.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CVacuumReport)]
     lib.pfs_vacuum.restype = ctypes.c_int
     lib.pfs_fsck.argtypes = [ctypes.c_void_p, ctypes.POINTER(_CFsckReport), _HASH_CALLBACK, ctypes.c_void_p]
@@ -202,6 +216,18 @@ def _load_lib():
     lib.pfs_get_heads.restype = ctypes.c_int
     lib.pfs_rotate_key.argtypes = [ctypes.c_void_p]
     lib.pfs_rotate_key.restype = ctypes.c_uint32
+    lib.pfs_merge_base.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64,
+                                   ctypes.POINTER(ctypes.c_uint64)]
+    lib.pfs_merge_base.restype = ctypes.c_int
+    lib.pfs_commit_merged.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint64, ctypes.c_uint64,
+                                      ctypes.c_char_p, ctypes.c_char_p, ctypes.c_size_t]
+    lib.pfs_commit_merged.restype = ctypes.c_int
+    lib.pfs_refresh.argtypes = [ctypes.c_void_p]
+    lib.pfs_refresh.restype = ctypes.c_int
+    lib.pfs_get_mirror_all.argtypes = [ctypes.c_void_p]
+    lib.pfs_get_mirror_all.restype = ctypes.c_int
+    lib.pfs_set_mirror_all.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_uint64)]
+    lib.pfs_set_mirror_all.restype = ctypes.c_int
 
     lib.pfs_build_tree.argtypes = [ctypes.c_void_p, ctypes.c_char_p, _TEXT_CALLBACK, ctypes.c_void_p]
     lib.pfs_build_tree.restype = ctypes.c_int
@@ -440,6 +466,16 @@ class CppVaultSession:
         if rc != 0:
             raise _err()
         return bool(freed.value)
+
+    def shred(self, label: str, generation_index=None, force: bool = False) -> dict:
+        """Securely erases a file (generation_index None) or one old version;
+        returns what was erased and what was kept because it is still in use."""
+        report = _CShredReport()
+        rc = _lib.pfs_shred(self._handle, label.encode("utf-8"), int(generation_index is not None),
+                            generation_index or 0, int(force), ctypes.byref(report))
+        if rc != 0:
+            raise _err()
+        return {name: getattr(report, name) for name, _ in _CShredReport._fields_}
 
     def vacuum(self) -> dict:
         """Rewrites the container without unused chunks and returns a report."""
@@ -747,6 +783,41 @@ class CppVaultSession:
         buf = ctypes.create_string_buffer(1024)
         _lib.pfs_get_mirror_container_path(self._handle, buf, len(buf))
         return buf.value.decode("utf-8")
+
+    def merge_base(self, label: str, generation_a: int, generation_b: int) -> int:
+        """The generation two branches last had in common."""
+        base = ctypes.c_uint64(0)
+        if _lib.pfs_merge_base(self._handle, label.encode("utf-8"), generation_a, generation_b,
+                               ctypes.byref(base)) != 0:
+            raise _err()
+        return base.value
+
+    def commit_merged(self, label: str, generation_a: int, generation_b: int, source_path: str) -> str:
+        """Commits caller-merged content as the merge of two branches; returns the recipe filename."""
+        buf = ctypes.create_string_buffer(256)
+        if _lib.pfs_commit_merged(self._handle, label.encode("utf-8"), generation_a, generation_b,
+                                  source_path.encode("utf-8"), buf, len(buf)) != 0:
+            raise _err()
+        return buf.value.decode("utf-8")
+
+    def refresh(self) -> bool:
+        """Picks up changes other programs made to the vault; True if any."""
+        rc = _lib.pfs_refresh(self._handle)
+        if rc < 0:
+            raise _err()
+        return bool(rc)
+
+    @property
+    def mirror_all(self) -> bool:
+        """True if every chunk gets a spare copy ('spares all')."""
+        return bool(_lib.pfs_get_mirror_all(self._handle))
+
+    def set_mirror_all(self, enabled: bool) -> int:
+        """Turns 'spares all' on or off; returns how many existing chunks got a spare."""
+        added = ctypes.c_uint64(0)
+        if _lib.pfs_set_mirror_all(self._handle, int(enabled), ctypes.byref(added)) != 0:
+            raise _err()
+        return added.value
 
     def rotate_key(self) -> int:
         """Starts a new key epoch for new chunks; returns its number."""

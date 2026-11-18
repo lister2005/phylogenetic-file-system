@@ -88,8 +88,9 @@ desktop app, a command shell, and a mounted folder that any program can use.
 
 - **Nothing is overwritten.** Every save is kept, and any version can be
   rebuilt exactly.
-- **History can branch and merge.** When two branches changed the same part
-  of a file, the user chooses which to keep. PFS never guesses.
+- **History can branch and merge.** Text files merge line by line; when two
+  branches changed the same lines, the user chooses which to keep. PFS never
+  guesses.
 - **Files find their relatives.** PFS groups close relatives into clades and
   draws their family tree with Neighbour-Joining or UPGMA, the same methods
   biologists use for species.
@@ -272,14 +273,16 @@ listed in the manual as a known limitation.
 ## Where it stands
 
 **Works today:** encrypted, deduplicating storage with full history,
-branching, merging and grafting; similarity grouping; two engines; the
-desktop app, the shell and the mounted folder.
+branching, merging and grafting; similarity grouping; two engines, either of
+which lets several programs share a vault; secrets mode for `.env` files and
+credentials (kept off the disk, handed to programs with `run`, old values
+destroyed with `shred`); the desktop app, the shell and the mounted folder.
 
 **Partly there:** a Linux kernel module version of PFS's storage has been
 written and compiles, but hasn't yet been loaded and tested on a real
 machine.
 
-**Known limits:** Linux only; merges are settled per piece, not per line;
+**Known limits:** Linux only; files that aren't text merge piece by piece, not line by line;
 text that repeats exactly deduplicates poorly (see above); no independent
 security audit; one passphrase per vault.
 

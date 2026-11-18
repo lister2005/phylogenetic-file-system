@@ -77,6 +77,10 @@ public:
     // Drops a chunk's row from blocks and mirrors. True if it had a mirror
     // row (vacuum uses this to decide on mirror compaction).
     bool remove(const Bytes32& content_hash);
+    // Deletes these chunks' entries and spare-copy entries with SQLite's
+    // secure_delete on, then checkpoints the write-ahead log so no old copy of
+    // them stays in it. Returns how many chunk entries existed. For 'shred'.
+    uint64_t remove_securely(const std::vector<Bytes32>& content_hashes);
 
     std::optional<MirrorEntry> get_mirror(const Bytes32& content_hash);
     void set_mirror(const Bytes32& content_hash, uint64_t offset, uint64_t length);

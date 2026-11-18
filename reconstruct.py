@@ -129,7 +129,8 @@ class _BlockFetcher:
             self._mirror_container.close()
 
 
-def reconstruct(manifest_path: str, container_path: str, output_path: str, master_key: bytes):
+def reconstruct(manifest_path: str, container_path: str, output_path: str, master_key: bytes,
+                quiet: bool = False):
     """Rebuilds a whole file from its recipe into output_path, checking it against the original's hash."""
     if not os.path.exists(manifest_path) or not os.path.exists(container_path):
         raise FileNotFoundError("Manifest or Container missing. Did the pipeline finish?")
@@ -183,7 +184,8 @@ def reconstruct(manifest_path: str, container_path: str, output_path: str, maste
             "recorded hash -- possible block substitution or corruption."
         )
 
-    print(f"Reconstruction complete and verified: {output_path}")
+    if not quiet:
+        print(f"Reconstruction complete and verified: {output_path}")
 
 
 class ManifestReader:

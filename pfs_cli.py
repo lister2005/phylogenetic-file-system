@@ -15,6 +15,7 @@ import time
 import secrets
 import hashlib
 import sqlite3
+import subprocess
 import threading
 
 sys.path.insert(0, os.getcwd())
@@ -34,6 +35,9 @@ from TreeConstructor import TreeConstructor
 from vault_session import VaultSession, VaultUnlockError, MutationConflictError, CATALOG_FILENAME, HISTORY_FILENAME
 from vault_lock import VaultBusyError
 from lineage import LINEAGE_FILENAME
+from text_merge import MAX_TEXT_MERGE_CHUNKS, merge_bytes
+from secret_store import (MemoryFile, MAX_SECRET_BYTES, DotenvError, auto_lock_seconds,
+                          environment_for as secret_environment_for, is_secret, read_via_memory)
 
 # Optional: only --engine cpp needs the compiled engine.
 try:
@@ -229,7 +233,266 @@ class _ReauthMixin:
         return True
 
 
-class PFSShell(_ReauthMixin, cmd.Cmd):
+def _split_run_args(arg: str):
+    """Splits 'run' arguments into (labels, command) at ' -- '. None, with a
+    message, if either side is missing or the quotes don't balance."""
+    if " -- " not in f" {arg} ":
+        print("Usage: run <label> [<label2> ...] -- <command> [arguments...]")
+        return None
+    left, right = f" {arg} ".split(" -- ", 1)
+    labels = _split_args(left.strip())
+    command = _split_args(right.strip())
+    if labels is None or command is None:
+        return None
+    if not labels or not command:
+        print("Usage: run <label> [<label2> ...] -- <command> [arguments...]")
+        return None
+    return labels, command
+
+
+def _confirm_plaintext_export(label: str, output_path: str) -> bool:
+    """Warns that a secret file is about to be written unencrypted, and asks
+    for 'yes'."""
+    print(f"'{label}' is tagged secret. This writes it UNENCRYPTED to {output_path}.")
+    print("Anyone who can read that file will see its values. Prefer 'run', which never writes it out.")
+    try:
+        answer = input("Type 'yes' to write it anyway: ")
+    except EOFError:
+        answer = ""
+    if answer.strip().lower() != "yes":
+        print("Cancelled.")
+        return False
+    return True
+
+
+LINE_MERGE_USAGE = ("Usage: merge <label> <generation_a> <generation_b> [a|b|both|<conflict>:<a|b|both>,...]  "
+                    "(conflicts are numbered from 1)")
+
+
+def _parse_line_merge_choice(text: str, conflict_count: int):
+    """'a', 'b' or 'both' -> that choice for every conflict; '1:a,2:both' ->
+    those conflicts (numbered from 1). None (with a message) if malformed."""
+    side = text.strip().lower()
+    if side in ("a", "b", "both"):
+        return {i: side for i in range(conflict_count)}
+    choices = {}
+    for item in side.split(","):
+        number, _, chosen = item.partition(":")
+        try:
+            index = int(number) - 1
+        except ValueError:
+            index = -1
+        if chosen not in ("a", "b", "both") or not 0 <= index < conflict_count:
+            print(f"Can't use '{text}': choose a, b or both, or give conflict numbers 1 to {conflict_count}.")
+            print(LINE_MERGE_USAGE)
+            return None
+        choices[index] = chosen
+    return choices
+
+
+def _preview_lines(lines, limit=5, width=100):
+    """Up to `limit` lines, each cut to `width` characters, for showing a conflict."""
+    shown = [line.rstrip("\n")[:width] for line in lines[:limit]]
+    if len(lines) > limit:
+        shown.append(f"... ({len(lines) - limit} more line(s))")
+    return shown or ["(these lines removed)"]
+
+
+class _LineMergeMixin:
+    """Line-by-line merging of text files, shared by both shells.
+
+    Subclasses provide _merge_base, _history_chunks, _read_generation_bytes
+    and _commit_merged for their engine, plus _label_is_secret.
+    """
+
+    def _try_line_merge(self, label: str, generation_a: int, generation_b: int, raw_choice):
+        """Merges two branches line by line if all three versions are text.
+        Returns False if they aren't (the caller uses the chunk merge), True
+        once it has merged or explained what is needed."""
+        try:
+            base = self._merge_base(label, generation_a, generation_b)
+        except (ValueError, KeyError, PfsEngineError) as e:
+            print(f"Merge failed -- nothing was committed.\n  {e}")
+            return True
+        sizes = self._history_chunks(label)
+        if any((sizes.get(g) or 0) > MAX_TEXT_MERGE_CHUNKS for g in (base, generation_a, generation_b)):
+            return False
+        result = merge_bytes(*(self._read_generation_bytes(label, g) for g in (base, generation_a, generation_b)))
+        if result is None:
+            return False
+        choices = {}
+        if result.conflicts:
+            if raw_choice is None:
+                self._print_line_conflicts(label, generation_a, generation_b, result)
+                return True
+            choices = _parse_line_merge_choice(raw_choice, len(result.conflicts))
+            if choices is None:
+                return True
+            missing = [c.index + 1 for c in result.conflicts if c.index not in choices]
+            if missing:
+                print(f"Conflict(s) {', '.join(map(str, missing))} still need a choice -- nothing was committed.")
+                return True
+        with MemoryFile() as mem:
+            mem.write(result.text(choices).encode("utf-8"))
+            self._commit_merged(label, generation_a, generation_b, mem.path)
+        if getattr(self, "_clades", None) is not None:
+            self._clades.changed(label)
+        settled = f", {len(result.conflicts)} conflict(s) settled as you chose" if result.conflicts else ""
+        print(f"Merged '{label}' generations {generation_a} + {generation_b} line by line "
+              f"(common ancestor: generation {base}{settled}).")
+        return True
+
+    def _print_line_conflicts(self, label, generation_a, generation_b, result) -> None:
+        """Shows each conflict (lines hidden for a secret file) and how to choose."""
+        secret = self._label_is_secret(label)
+        print(f"Both branches changed the same lines in {len(result.conflicts)} place(s); everything else "
+              f"merged automatically. Nothing was committed yet.")
+        for conflict in result.conflicts:
+            print(f"\n  Conflict {conflict.index + 1} -- {conflict.lines_description()}")
+            for side, generation, lines in (("A", generation_a, conflict.a), ("B", generation_b, conflict.b)):
+                if secret:
+                    print(f"    {side} (generation {generation}): {len(lines)} line(s), hidden (secret file)")
+                    continue
+                print(f"    {side} (generation {generation}):")
+                for line in _preview_lines(lines):
+                    print(f"      {line}")
+        print(f"\nMerge again with a choice for every conflict: add a, b or both (A's lines, then B's), "
+              f"e.g. 'merge {label} {generation_a} {generation_b} both',")
+        print(f"or per conflict, e.g. 'merge {label} {generation_a} {generation_b} 1:a,2:both'.")
+
+
+class _SecretsMixin:
+    """Secrets mode, shared by both shells: 'run', auto-lock, and warnings
+    before a secret file is written out unencrypted.
+
+    Subclasses provide _has_label(label), _label_tags(label) and
+    _read_label_bytes(label), plus _require_reauth from _ReauthMixin.
+    """
+
+    # time.monotonic() of the last command; None until the first.
+    _last_activity = None
+
+    def _label_is_secret(self, label: str) -> bool:
+        """True if the file is tagged secret."""
+        return is_secret(self._label_tags(label))
+
+    def _auto_lock_check(self, line: str) -> bool:
+        """Before each command: if the shell sat idle past the auto-lock time,
+        asks for the passphrase. Returns False if the command must not run."""
+        now = time.monotonic()
+        idle_limit = auto_lock_seconds()
+        last, self._last_activity = self._last_activity, now
+        if not idle_limit or last is None or now - last < idle_limit or not line.strip():
+            return True
+        print(f"The shell locked itself after {idle_limit / 60:g} minute(s) without use.")
+        if not self._require_reauth("unlock the shell", always_ask=True):
+            self._last_activity = last  # stay locked
+            return False
+        return True
+
+    def _secret_environment(self, labels):
+        """Reads each file in memory and returns the environment for 'run',
+        or None after printing what went wrong (never a value)."""
+        contents = []
+        for label in labels:
+            if not self._has_label(label):
+                print(f"No such label: '{label}'")
+                return None
+            try:
+                contents.append(self._read_label_bytes(label))
+            except ValueError as e:
+                print(f"Can't use '{label}': {e}")
+                return None
+        try:
+            return secret_environment_for(contents)
+        except (DotenvError, UnicodeDecodeError) as e:
+            print(f"Can't use those files: {e}")
+            return None
+
+    def do_run(self, arg):
+        """run <label> [<label2> ...] -- <command> [arguments...]  -- run a program with a .env file's variables
+
+Example:
+  run app.env -- npm start
+  run base.env prod.env -- python3 manage.py migrate
+(the files are decrypted in memory and their variables passed to the
+program's environment; nothing is written to disk and no value is
+printed. Later files override earlier ones. The program runs in the
+foreground; its exit code is shown when it finishes.)"""
+        parsed = _split_run_args(arg)
+        if parsed is None:
+            return
+        labels, command = parsed
+        noun = f"'{labels[0]}'" if len(labels) == 1 else f"{len(labels)} files"
+        if not self._require_reauth(f"run a program with {noun}"):
+            return
+        env = self._secret_environment(labels)
+        if env is None:
+            return
+        try:
+            result = subprocess.run(command, env=env)
+        except FileNotFoundError:
+            print(f"Command not found: {command[0]}")
+            return
+        finally:
+            env.clear()
+        print(f"(exited with code {result.returncode})")
+
+    def do_shred(self, arg):
+        """shred <label> [generation] [force]  -- securely erase a file, or one old version of it
+
+Example:
+  shred old_keys.env          (the whole file and all its history)
+  shred app.env 2             (only generation 2; not the current version)
+  shred app.env 2 force       (even if it is tagged 'protected')
+(content used only by what is shredded is overwritten in the vault, so it
+can't be recovered even by someone who later learns the passphrase. A
+shredded generation stays in 'lineage', marked shredded with the date.
+Content still used by another file or version is kept. Deleting or
+pruning a file tagged 'secret' shreds it automatically.)"""
+        parts = _split_args(arg)
+        if parts is None:
+            return
+        force = len(parts) > 1 and parts[-1].lower() == "force"
+        if force:
+            parts = parts[:-1]
+        if len(parts) not in (1, 2):
+            print("Usage: shred <label> [generation] [force]")
+            return
+        label = parts[0]
+        generation = None
+        if len(parts) == 2:
+            try:
+                generation = int(parts[1])
+            except ValueError:
+                print("Usage: shred <label> [generation] [force]  (generation must be an integer)")
+                return
+        if not self._has_label(label):
+            print(f"No such label: '{label}'")
+            return
+        what = f"'{label}' and all its history" if generation is None else f"generation {generation} of '{label}'"
+        if not self._require_reauth(f"shred {what}", always_ask=True):
+            return
+        try:
+            report = self._shred(label, generation, force)
+        except PermissionError as e:
+            print(f"Shred refused: {e}")
+            return
+        except (KeyError, ValueError) as e:
+            print(f"Shred failed: {e}")
+            return
+        if generation is None and getattr(self, "_clades", None) is not None:
+            self._clades.removed(label)
+        print(f"Shredded {what}: {report['versions_shredded']} version(s) erased, "
+              f"{report['chunks_destroyed']} piece(s) overwritten.")
+        if report["chunks_kept_shared"] or report["manifests_kept_shared"]:
+            print(f"Kept {report['chunks_kept_shared']} piece(s) and {report['manifests_kept_shared']} "
+                  f"recipe(s) that other files or versions still use: that content is still current.")
+        print("Note: on SSDs and copy-on-write filesystems the drive itself may keep old copies of "
+              "overwritten blocks; see 'Secret files' in the manual.")
+
+
+class PFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
     """The interactive shell for a Python-engine vault: one do_<name> method per command."""
     intro = (
         "\nPhylogenetic File System -- interactive shell.\n"
@@ -390,6 +653,38 @@ class PFSShell(_ReauthMixin, cmd.Cmd):
         """Returns the vault's current key, for passphrase re-checks."""
         return self.crypto.key
 
+    def _has_label(self, label: str) -> bool:
+        """True if a file with this name is in the vault."""
+        return label in self.catalog
+
+    def _label_tags(self, label: str) -> dict:
+        """A file's current tags."""
+        return self._session.lineage.get_tags(label)
+
+    def _read_label_bytes(self, label: str) -> bytes:
+        """A file's latest content, rebuilt in memory (for 'run')."""
+        return self._session.read_bytes(label)
+
+    def _shred(self, label, generation, force) -> dict:
+        """Shreds through the session (see VaultSession.shred)."""
+        return self._session.shred(label, generation, force=force)
+
+    def _merge_base(self, label, generation_a, generation_b) -> int:
+        """The generation two branches last had in common."""
+        return self._session.merge_base(label, generation_a, generation_b)
+
+    def _history_chunks(self, label) -> dict:
+        """generation -> chunk count, for every version of a file."""
+        return {n.generation_index: n.total_chunks for n in self._session.lineage.get_history(label)}
+
+    def _read_generation_bytes(self, label, generation) -> bytes:
+        """One generation's content, rebuilt in memory."""
+        return self._session.read_bytes(label, generation, limit=None)
+
+    def _commit_merged(self, label, generation_a, generation_b, path) -> None:
+        """Commits merged content as the merge of two branches."""
+        self._session.commit_merged(label, generation_a, generation_b, path)
+
 
     def do_write(self, arg):
         """write <file_path> [label]  -- ingest a file into the vault
@@ -540,6 +835,8 @@ resolves against 'navigate's directory, if set)"""
             return
         if not self._require_reauth(f"read '{label}'"):
             return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
+            return
         manifest_path = os.path.join(self.storage_root, self.catalog[label])
         try:
             reconstruct(manifest_path, self.pipeline.container_path, output_path, self.crypto.key)
@@ -588,11 +885,13 @@ Example:
 
         # Columns grow to fit the longest label and type.
         label_w = max([25] + [len(label) + 2 for label in [r[0] for r in rows] + missing])
-        type_w = max([24] + [len(r[1]) + 2 for r in rows])
+        type_w = max([24] + [len(r[1]) + 11 for r in rows])
         print(f"{'Label':<{label_w}}{'Type':<{type_w}}{'Size':>12}  {'Chunks':>8}  {'Dedup':>7}")
         for label, phenotype_name, meta in rows:
             total = meta["total_blocks"] or 1
             dedup_pct = 100 * meta["duplicate_chunks_found"] / total
+            if self._label_is_secret(label):
+                phenotype_name = f"{phenotype_name} (secret)"
             print(f"{label:<{label_w}}{phenotype_name:<{type_w}}{meta['original_size']:>12,}  "
                   f"{meta['total_blocks']:>8}  {dedup_pct:>6.1f}%")
         for label in missing:
@@ -636,7 +935,12 @@ Only a final 'force' after at least one label is the flag, so
         for label in labels:
             try:
                 report = self._session.delete_label(label, force=force)
-                if report["manifests_kept_shared"]:
+                if "versions_shredded" in report:
+                    print(f"'{label}' is secret, so it was shredded: {report['versions_shredded']} "
+                          f"version(s) erased, {report['chunks_destroyed']} piece(s) overwritten"
+                          + (f", {report['chunks_kept_shared']} kept because other files still use them."
+                             if report["chunks_kept_shared"] else "."))
+                elif report["manifests_kept_shared"]:
                     print(f"Deleted '{label}'. {report['manifests_freed']} manifest(s) freed; "
                           f"{report['manifests_kept_shared']} kept because something else in the vault "
                           f"still references them (shared content or a lateral parent elsewhere).")
@@ -1472,7 +1776,12 @@ pruned. Not the current tip -- use 'delete'. 'force' overrides
         except (KeyError, ValueError) as e:
             print(f"Prune failed: {e}")
             return
-        if report["freed"]:
+        if "versions_shredded" in report:
+            print(f"'{label}' is secret, so generation {generation} was shredded: "
+                  f"{report['chunks_destroyed']} piece(s) overwritten"
+                  + (f", {report['chunks_kept_shared']} kept because newer versions still use them."
+                     if report["chunks_kept_shared"] else "."))
+        elif report["freed"]:
             print(f"Pruned generation {generation} of '{label}'. Run 'vacuum' to reclaim its space.")
         else:
             print(f"Marked generation {generation} of '{label}' as pruned, but its manifest is still "
@@ -1519,28 +1828,27 @@ new -- see the 'new' count.)"""
         print(f"  {meta['original_size']:,} bytes total")
 
     def do_merge(self, arg):
-        """merge <label> <generation_a> <generation_b> [a|b|<position>:<a|b>,...]  -- reconcile two divergent branches of one label
+        """merge <label> <generation_a> <generation_b> [choice]  -- reconcile two divergent branches of one label
 
 Example:
   merge my_report 3 5
-  merge my_report 3 5 a          (every conflict: keep generation 3's chunk)
-  merge my_report 3 5 12:a,40:b  (choose per conflicting position)
-(3-way diff of chunk positions against the common ancestor: a chunk
-changed by one branch, or the same way by both, merges; a chunk changed
-differently by both is a conflict. An unresolved conflict refuses the
-merge and nothing is committed.)"""
+  merge my_report 3 5 both       (text: every conflict keeps A's lines, then B's)
+  merge my_report 3 5 1:a,2:b    (text: choose per conflict, numbered from 1)
+  merge photo 3 5 12:a,40:b      (other files: choose per conflicting chunk position)
+(both branches are compared with their common ancestor. Text files merge
+line by line: lines changed by one branch, or the same way by both, are
+taken automatically; lines changed differently by both are a conflict,
+settled with a, b or both. Other files merge by chunk position, settled
+with a or b. An unsettled conflict commits nothing and lists what needs
+a choice.)"""
         parts = _split_args(arg)
         if parts is None:
             return
         if len(parts) not in (3, 4):
-            print(MERGE_USAGE)
+            print(LINE_MERGE_USAGE)
             return
-        choice = _parse_merge_choice(parts[3]) if len(parts) == 4 else (None, {})
-        if choice is None:
-            print(MERGE_USAGE)
-            return
-        all_side, choices = choice
         label, gen_a_str, gen_b_str = parts[:3]
+        raw_choice = parts[3] if len(parts) == 4 else None
         if label not in self.catalog:
             print(f"No such label: '{label}'")
             return
@@ -1551,6 +1859,13 @@ merge and nothing is committed.)"""
             return
         if not self._require_reauth(f"merge '{label}' generations {generation_a} and {generation_b}"):
             return
+        if self._try_line_merge(label, generation_a, generation_b, raw_choice):
+            return
+        choice = _parse_merge_choice(raw_choice) if raw_choice is not None else (None, {})
+        if choice is None:
+            print(MERGE_USAGE)
+            return
+        all_side, choices = choice
 
         try:
             manifest_path = _merge_resolving(
@@ -1627,6 +1942,8 @@ output path resolves against 'navigate's directory)"""
             return
         if not self._require_reauth(f"check out '{label}' generation {generation}"):
             return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
+            return
         manifest_path = os.path.join(self.storage_root, node.manifest_filename)
         try:
             reconstruct(manifest_path, self.pipeline.container_path, output_path, self.crypto.key)
@@ -1698,6 +2015,8 @@ writes <label>_ancestor_<N>_gen<G> in the navigate or working directory.)"""
 
         if not self._require_reauth(f"check out '{label}' generation {node.generation_index} "
                                      f"({n} generation(s) back from tip)"):
+            return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
             return
         manifest_path = os.path.join(self.storage_root, node.manifest_filename)
         try:
@@ -1961,6 +2280,8 @@ Example:
     def onecmd(self, line):
         """Runs one command after picking up other programs' changes, printing errors instead of crashing."""
         stripped = line.strip() if isinstance(line, str) else ""
+        if not self._auto_lock_check(stripped):
+            return False
         try:
             self._session.refresh()  # pick up changes other programs made to this vault
             result = super().onecmd(line)
@@ -1977,7 +2298,7 @@ Example:
         return result
 
 
-class CppPFSShell(_ReauthMixin, cmd.Cmd):
+class CppPFSShell(_LineMergeMixin, _SecretsMixin, _ReauthMixin, cmd.Cmd):
     """Shell for the compiled C++ engine (--engine cpp). Separate from
     PFSShell so it's always clear which engine a command runs on.
     """
@@ -2026,10 +2347,48 @@ class CppPFSShell(_ReauthMixin, cmd.Cmd):
         # 'test' and 'attack' only use throwaway labels.
         self._clades = CladeWorker(cpp_session_loader(self._session),
                                    name="cli-cpp-clade-worker").start(self._session.list_labels())
+        self._catalog_seen = None
+        self._report_catalog_changes()  # records the starting state; the worker already has these files
 
     def _current_kek(self) -> bytes:
         """Returns the vault's current key, for passphrase re-checks."""
         return self._kek
+
+    def _has_label(self, label: str) -> bool:
+        """True if a file with this name is in the vault."""
+        return label in self._session.list_labels()
+
+    def _label_tags(self, label: str) -> dict:
+        """A file's current tags."""
+        return self._session.get_tags(label)
+
+    def _read_label_bytes(self, label: str) -> bytes:
+        """A file's latest content, rebuilt in memory (for 'run')."""
+        return read_via_memory(lambda path: self._session.reconstruct_label(label, path), MAX_SECRET_BYTES)
+
+    def _merge_base(self, label, generation_a, generation_b) -> int:
+        """The generation two branches last had in common."""
+        return self._session.merge_base(label, generation_a, generation_b)
+
+    def _history_chunks(self, label) -> dict:
+        """generation -> chunk count, for every version of a file."""
+        return {n.generation_index: n.total_chunks for n in self._session.get_history(label)}
+
+    def _read_generation_bytes(self, label, generation) -> bytes:
+        """One generation's content, rebuilt in memory."""
+        return read_via_memory(lambda path: self._session.checkout(label, generation, path))
+
+    def _commit_merged(self, label, generation_a, generation_b, path) -> None:
+        """Commits merged content as the merge of two branches."""
+        self._session.commit_merged(label, generation_a, generation_b, path)
+
+    def _shred(self, label, generation, force) -> dict:
+        """Shreds through the C++ engine; its errors become the shell's usual ones."""
+        try:
+            return self._session.shred(label, generation, force=force)
+        except PfsEngineError as e:
+            message = str(e)
+            raise (PermissionError(message) if "protected" in message else ValueError(message))
 
     def _unlock_or_create(self) -> bytes:
         """Creates a new C++-engine vault or unlocks an existing one; returns its key."""
@@ -2120,6 +2479,8 @@ Example:
         output_path = self._resolve_path(output_path)
         if not self._require_reauth(f"read '{label}'"):
             return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
+            return
         try:
             self._session.reconstruct_label(label, output_path)
         except PfsEngineError as e:
@@ -2146,8 +2507,14 @@ Example:
         if not self._require_reauth(f"delete '{label}'", always_ask=True):
             return
         try:
+            if self._label_is_secret(label):
+                report = self._shred(label, None, force)
+                print(f"'{label}' is secret, so it was shredded: {report['versions_shredded']} version(s) "
+                      f"erased, {report['chunks_destroyed']} piece(s) overwritten.")
+                self._clades.removed(label)
+                return
             report = self._session.delete_label(label, force=force)
-        except PfsEngineError as e:
+        except (PfsEngineError, PermissionError, ValueError) as e:
             print(f"Delete failed: {e}")
             return
         self._clades.removed(label)
@@ -2226,27 +2593,24 @@ either source is tagged 'no_graft_source'.)"""
               f"rest already existed from '{label_a}' and '{label_b}')")
 
     def do_merge(self, arg):
-        """merge <label> <generation_a> <generation_b> [a|b|<position>:<a|b>,...]  -- reconcile two divergent branches (C++ engine)
+        """merge <label> <generation_a> <generation_b> [choice]  -- reconcile two divergent branches (C++ engine)
 
 Example:
   merge my_report 3 5
-  merge my_report 3 5 b          (every conflict: keep generation 5's chunk)
-  merge my_report 3 5 12:a,40:b  (choose per conflicting position)
-(3-way diff of chunk positions against the common ancestor; a chunk
-changed differently by both branches is a conflict. An unresolved
-conflict refuses the merge and nothing is committed.)"""
+  merge my_report 3 5 both       (text: every conflict keeps A's lines, then B's)
+  merge my_report 3 5 1:a,2:b    (text: choose per conflict, numbered from 1)
+  merge photo 3 5 12:a,40:b      (other files: choose per conflicting chunk position)
+(text files merge line by line against the common ancestor; other files
+merge by chunk position. An unsettled conflict commits nothing and lists
+what needs a choice.)"""
         parts = _split_args(arg)
         if parts is None:
             return
         if len(parts) not in (3, 4):
-            print(MERGE_USAGE)
+            print(LINE_MERGE_USAGE)
             return
-        choice = _parse_merge_choice(parts[3]) if len(parts) == 4 else (None, {})
-        if choice is None:
-            print(MERGE_USAGE)
-            return
-        all_side, choices = choice
         label, gen_a_str, gen_b_str = parts[:3]
+        raw_choice = parts[3] if len(parts) == 4 else None
         try:
             generation_a, generation_b = int(gen_a_str), int(gen_b_str)
         except ValueError:
@@ -2254,6 +2618,13 @@ conflict refuses the merge and nothing is committed.)"""
             return
         if not self._require_reauth(f"merge '{label}' generations {generation_a} and {generation_b}"):
             return
+        if self._try_line_merge(label, generation_a, generation_b, raw_choice):
+            return
+        choice = _parse_merge_choice(raw_choice) if raw_choice is not None else (None, {})
+        if choice is None:
+            print(MERGE_USAGE)
+            return
+        all_side, choices = choice
         try:
             manifest = _merge_resolving(
                 lambda r: self._session.merge_branches(label, generation_a, generation_b, r),
@@ -2315,6 +2686,8 @@ Example:
                       "(generation must be an integer or '@tip')")
                 return
         if not self._require_reauth(f"check out '{label}' generation {generation}"):
+            return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
             return
         try:
             self._session.checkout(label, generation, output_path)
@@ -2387,6 +2760,8 @@ writes <label>_ancestor_<N>_gen<G>.bin in the navigate or working directory.)"""
 
         if not self._require_reauth(f"check out '{label}' generation {node.generation_index} "
                                     f"({n} generation(s) back from tip)"):
+            return
+        if self._label_is_secret(label) and not _confirm_plaintext_export(label, output_path):
             return
         try:
             self._session.checkout(label, node.generation_index, output_path)
@@ -2504,8 +2879,13 @@ is tagged 'protected' unless you add 'force'.)"""
         if not self._require_reauth(f"prune generation {generation} of '{label}'"):
             return
         try:
+            if self._label_is_secret(label):
+                report = self._shred(label, generation, force)
+                print(f"'{label}' is secret, so generation {generation} was shredded: "
+                      f"{report['chunks_destroyed']} piece(s) overwritten.")
+                return
             freed = self._session.prune_generation(label, generation, force=force)
-        except PfsEngineError as e:
+        except (PfsEngineError, PermissionError, ValueError) as e:
             print(f"Prune failed: {e}")
             return
         if freed:
@@ -3104,14 +3484,152 @@ not a lineage and has no root. Sets the shell's focus to <label>.)"""
 
     def onecmd(self, line):
         """Runs one command, printing errors instead of crashing."""
+        if not self._auto_lock_check(line.strip() if isinstance(line, str) else ""):
+            return False
         try:
+            if self._session.refresh():  # pick up changes other programs made to this vault
+                self._report_catalog_changes()
             return super().onecmd(line)
         except Exception as e:
             print(f"Error: {type(e).__name__}: {e}")
             return False
 
+    def _report_catalog_changes(self) -> None:
+        """Tells the clade worker which files another program added, changed or removed."""
+        current = {}
+        for label in self._session.list_labels():
+            try:
+                current[label] = self._session.get_manifest_info(label)["manifest_filename"]
+            except PfsEngineError:
+                continue
+        seen = self._catalog_seen
+        if seen is None:  # the starting state: the worker already knows every file
+            self._catalog_seen = current
+            return
+        for label in seen.keys() - current.keys():
+            self._clades.removed(label)
+        for label, manifest in current.items():
+            if seen.get(label) != manifest:
+                self._clades.changed(label)
+        self._catalog_seen = current
+
+    def do_spares(self, arg):
+        """spares [all|shared]  -- which chunks get a spare (mirror) copy for self-healing (C++ engine)
+
+Example:
+  spares          (show the current setting)
+  spares all      (every chunk: any damaged chunk can be repaired; uses about
+                   twice the container space)
+  spares shared   (the default: only chunks used by 3+ versions or files)
+(turning 'all' on also makes spares for chunks already stored; turning it
+off keeps the spares that exist)"""
+        choice = arg.strip().lower()
+        if not choice:
+            mode = "all" if self._session.mirror_all else "shared"
+            print(f"Spare copies: {mode} -- " + ("every chunk has one." if mode == "all" else
+                  "only chunks used by 3 or more versions/files ('spares all' to cover every chunk)."))
+            return
+        if choice not in ("all", "shared"):
+            print("Usage: spares [all|shared]")
+            return
+        if not self._require_reauth(f"set spare copies to '{choice}'"):
+            return
+        added = self._session.set_mirror_all(choice == "all")
+        if choice == "all":
+            print(f"Spare copies: all. {added} existing chunk(s) got a spare now; new chunks get one as "
+                  f"they are written.")
+        else:
+            print("Spare copies: shared (the default). Spares already made are kept.")
+
+
+def secret_environment_from_vault(storage_root: str, engine: str, labels, passphrase: str) -> dict:
+    """Opens a vault, reads each file in memory and returns the environment
+    for 'run'. Raises ValueError with a readable message (never a value)."""
+    if not os.path.exists(os.path.join(storage_root, MASTER_KEY_FILENAME)):
+        raise ValueError(f"No vault at '{storage_root}'.")
+    existing = _existing_vault_engine(storage_root)
+    if existing and existing != engine:
+        other = "--engine cpp" if existing == "cpp" else "the default Python engine"
+        raise ValueError(f"'{storage_root}' belongs to the other engine; use {other}.")
+    contents = []
+    if engine == "cpp":
+        if CppVaultSession is None:
+            raise ValueError(f"Couldn't load the C++ engine library: {_CPP_ENGINE_IMPORT_ERROR}")
+        try:
+            kek = load_vault_key(storage_root, passphrase)
+        except WrongPassphraseError:
+            raise ValueError("Wrong passphrase.")
+        session = CppVaultSession(storage_root, kek)
+        try:
+            known = set(session.list_labels())
+            for label in labels:
+                if label not in known:
+                    raise ValueError(f"No such label: '{label}'")
+                contents.append(read_via_memory(lambda path, l=label: session.reconstruct_label(l, path),
+                                                MAX_SECRET_BYTES))
+        finally:
+            session.close()
+    else:
+        session = VaultSession(storage_root)
+        try:
+            def refuse_new():
+                """Never creates a vault from 'run'."""
+                raise ValueError(f"No vault at '{storage_root}'.")
+            try:
+                session.unlock_or_create(refuse_new, lambda: passphrase, lambda: False)
+            except VaultUnlockError as e:
+                raise ValueError(str(e))
+            for label in labels:
+                if label not in session.catalog:
+                    raise ValueError(f"No such label: '{label}'")
+                contents.append(session.read_bytes(label))
+        finally:
+            session.close()
+    try:
+        return secret_environment_for(contents)
+    except (DotenvError, UnicodeDecodeError) as e:
+        raise ValueError(f"Can't use those files: {e}")
+
+
+def run_main(argv) -> int:
+    """'pfs_cli.py run <vault> --env <label> ... -- <command>': asks for the
+    passphrase, loads the .env files in memory, and replaces this process
+    with the command, its environment holding their variables."""
+    import argparse
+    if "--" not in argv:
+        print("Usage: pfs_cli.py run <vault> [--engine cpp] --env <label> [--env <label> ...] -- <command> [arguments...]")
+        return 2
+    split = argv.index("--")
+    own, command = argv[:split], argv[split + 1:]
+    parser = argparse.ArgumentParser(
+        prog="pfs_cli.py run",
+        description="Run a program with the variables from .env files stored in a vault. The files are "
+                    "decrypted in memory and never written to disk.")
+    parser.add_argument("storage_root", help="vault directory")
+    parser.add_argument("--env", dest="labels", action="append", required=True, metavar="LABEL",
+                         help="a stored .env file to load (repeat for several; later ones win)")
+    parser.add_argument("--engine", choices=["python", "cpp"], default="python")
+    args = parser.parse_args(own)
+    if not command:
+        parser.error("give the command to run after --")
+    passphrase = getpass.getpass("Enter vault passphrase: ")
+    try:
+        env = secret_environment_from_vault(args.storage_root, args.engine, args.labels, passphrase)
+    except ValueError as e:
+        print(e, file=sys.stderr)
+        return 1
+    finally:
+        passphrase = None
+    try:
+        os.execvpe(command[0], command, env)
+    except FileNotFoundError:
+        print(f"Command not found: {command[0]}", file=sys.stderr)
+        return 127
+
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "run":
+        sys.exit(run_main(sys.argv[2:]))
     import argparse
     parser = argparse.ArgumentParser(description="PFS interactive shell")
     parser.add_argument("storage_root", nargs="?", default=None,

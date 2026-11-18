@@ -47,7 +47,8 @@ from vault_session import VaultSession, VaultUnlockError, MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer
 from TreeConstructor import TreeConstructor
 from pfs_engine_adapter import PythonEngineAdapter, CppEngineAdapter
-from gearhash.phenotype import detect_from_file
+from gearhash.phenotype import detect as detect_phenotype, detect_from_file
+from secret_store import SECRET_TAG, auto_lock_seconds, is_secret, masked_changes
 import lineage_diff
 
 # ---------- palette ----------
@@ -1122,6 +1123,95 @@ class ConflictResolutionDialog(QDialog):
         self.merge_button.setEnabled(len(self.resolutions()) == len(self.positions))
 
 
+class LineConflictDialog(QDialog):
+    """Lets the user settle each conflict of a line-by-line merge: keep
+    branch A's lines, branch B's, or both (A's first). For a secret file the
+    lines themselves are hidden. Merge stays disabled until every conflict
+    has a choice.
+    """
+
+    def __init__(self, parent, label, generation_a, generation_b, conflicts, hide_lines=False):
+        """Builds one row per conflict: where it is, both versions' lines, and a choice."""
+        super().__init__(parent)
+        self.setWindowTitle(f"Resolve merge conflicts -- {label}")
+        self.resize(820, 600)
+        self.conflicts = list(conflicts)
+        layout = QVBoxLayout(self)
+        intro = QLabel(
+            f"Generations {generation_a} (A) and {generation_b} (B) changed the same lines of '{label}' in "
+            f"different ways in {len(self.conflicts)} place(s). Everything else was merged automatically. "
+            f"Choose what to keep in each place; nothing is saved until you press Merge.", self)
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        body = QWidget(scroll)
+        body_layout = QVBoxLayout(body)
+        self.combos = []
+        for conflict in self.conflicts:
+            heading = QLabel(f"<b>Conflict {conflict.index + 1}</b> -- {conflict.lines_description()}", body)
+            body_layout.addWidget(heading)
+            if hide_lines:
+                note = QLabel(f"A: {len(conflict.a)} line(s), B: {len(conflict.b)} line(s). "
+                              f"Hidden because this file is secret.", body)
+                body_layout.addWidget(note)
+            else:
+                row = QHBoxLayout()
+                for side, lines in (("A", conflict.a), ("B", conflict.b)):
+                    column = QVBoxLayout()
+                    column.addWidget(QLabel(f"{side} -- generation {generation_a if side == 'A' else generation_b}",
+                                            body))
+                    view = QPlainTextEdit(body)
+                    view.setReadOnly(True)
+                    view.setPlainText("".join(lines) if lines else "(these lines removed)")
+                    view.setMaximumHeight(120)
+                    column.addWidget(view)
+                    row.addLayout(column)
+                body_layout.addLayout(row)
+            combo = QComboBox(body)
+            combo.addItem("Choose...", None)
+            combo.addItem(f"Keep A (generation {generation_a})", "a")
+            combo.addItem(f"Keep B (generation {generation_b})", "b")
+            combo.addItem("Keep both (A, then B)", "both")
+            combo.currentIndexChanged.connect(self._update_merge_button)
+            body_layout.addWidget(combo)
+            self.combos.append(combo)
+        body_layout.addStretch(1)
+        scroll.setWidget(body)
+        layout.addWidget(scroll, stretch=1)
+
+        buttons = QHBoxLayout()
+        for text, side in ((f"All from A (gen {generation_a})", "a"), (f"All from B (gen {generation_b})", "b"),
+                           ("All: keep both", "both")):
+            button = QPushButton(text, self)
+            button.clicked.connect(lambda _checked=False, side=side: self.choose_all(side))
+            buttons.addWidget(button)
+        buttons.addStretch(1)
+        self.merge_button = QPushButton("Merge", self)
+        self.merge_button.clicked.connect(self.accept)
+        cancel = QPushButton("Cancel", self)
+        cancel.clicked.connect(self.reject)
+        buttons.addWidget(self.merge_button)
+        buttons.addWidget(cancel)
+        layout.addLayout(buttons)
+        self._update_merge_button()
+
+    def choose_all(self, side):
+        """Makes the same choice for every conflict."""
+        for combo in self.combos:
+            combo.setCurrentIndex(combo.findData(side))
+
+    def choices(self):
+        """{conflict index: 'a', 'b' or 'both'} for every conflict with a choice."""
+        return {c.index: combo.currentData() for c, combo in zip(self.conflicts, self.combos)
+                if combo.currentData() is not None}
+
+    def _update_merge_button(self, *_):
+        """Enables Merge only once every conflict has a choice."""
+        self.merge_button.setEnabled(len(self.choices()) == len(self.conflicts))
+
+
 class TextViewerDialog(QDialog):
     """Read-only in-app text viewer (past generations)."""
 
@@ -1236,7 +1326,7 @@ class LineageDiffDialog(QDialog):
     """
 
     def __init__(self, parent, result: "lineage_diff.LineageDiffResult", theme_colors: dict,
-                 text_diff_lines=None):
+                 text_diff_lines=None, text_heading=None):
         """Builds the version-comparison window: the chunk strip, counts and, for text, the changed lines."""
         super().__init__(parent)
         self.result = result  # the structured result, for tests and callers
@@ -1271,7 +1361,7 @@ class LineageDiffDialog(QDialog):
         layout.addWidget(chunk_map)
 
         if text_diff_lines is not None:
-            text_label = QLabel("Line-level diff (bonus -- both generations decode as text):", self)
+            text_label = QLabel(text_heading or "Line-level diff (bonus -- both generations decode as text):", self)
             text_label.setStyleSheet(f"color:{c['dim']}; font-size:11px; margin-top:6px;")
             layout.addWidget(text_label)
             text_view = QTextEdit(self)
@@ -1380,6 +1470,16 @@ class VaultGraphWindow(QMainWindow):
         self._time_preview_timer.setSingleShot(True)
         self._time_preview_timer.timeout.connect(self._preview_selection_at_cutoff)
         self._time_preview_cache = {}  # (label, generation) -> (size, type, preview lines or None)
+
+        # Auto-lock: any mouse or keyboard input restarts the idle timer.
+        self._lock_overlay = None
+        self._dialogs_hidden_by_lock = []
+        self._idle_timer = QTimer(self)
+        self._idle_timer.setSingleShot(True)
+        self._idle_timer.timeout.connect(self._lock_now)
+        if auto_lock_seconds() > 0:
+            self._idle_timer.start(int(auto_lock_seconds() * 1000))
+            QApplication.instance().installEventFilter(self)
 
         self._rebuild()
         self._maybe_show_tour()
@@ -1611,9 +1711,80 @@ class VaultGraphWindow(QMainWindow):
         self.toast_label.raise_()
         self._toast_timer.start(3000)
 
+    _ACTIVITY_EVENTS = (QEvent.KeyPress, QEvent.MouseButtonPress, QEvent.MouseMove, QEvent.Wheel)
+
+    def eventFilter(self, obj, event):
+        """Restarts the auto-lock timer on any mouse or keyboard input."""
+        if event.type() in self._ACTIVITY_EVENTS and self._lock_overlay is None and auto_lock_seconds() > 0:
+            self._idle_timer.start(int(auto_lock_seconds() * 1000))
+        return super().eventFilter(obj, event)
+
+    def _lock_now(self):
+        """Locks the window: covers it, hides open viewers and editors, and
+        waits for the passphrase."""
+        if self._lock_overlay is not None:
+            return
+        self._dialogs_hidden_by_lock = [d for d in self._active_dialogs if d.isVisible()]
+        for dlg in self._dialogs_hidden_by_lock:
+            dlg.hide()
+        overlay = QWidget(self)
+        overlay.setObjectName("lockOverlay")
+        overlay.setStyleSheet(f"#lockOverlay {{ background: {BG}; }}")
+        layout = QVBoxLayout(overlay)
+        layout.addStretch(1)
+        title = QLabel("PFS is locked", overlay)
+        title.setStyleSheet(f"color:{TEXT}; font-size:20px; font-weight:bold;")
+        title.setAlignment(Qt.AlignCenter)
+        note = QLabel(f"It locked itself after {auto_lock_seconds() / 60:g} minute(s) without use. "
+                      f"Enter the vault passphrase to continue.", overlay)
+        note.setStyleSheet(f"color:{TEXT_DIM};")
+        note.setAlignment(Qt.AlignCenter)
+        self._lock_input = QLineEdit(overlay)
+        self._lock_input.setEchoMode(QLineEdit.Password)
+        self._lock_input.setPlaceholderText("Passphrase")
+        self._lock_input.setFixedWidth(320)
+        self._lock_input.returnPressed.connect(lambda: self._try_unlock(self._lock_input.text()))
+        self._lock_message = QLabel("", overlay)
+        self._lock_message.setStyleSheet(f"color:{ACCENT};")
+        self._lock_message.setAlignment(Qt.AlignCenter)
+        for widget in (title, note):
+            layout.addWidget(widget)
+        row = QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(self._lock_input)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addWidget(self._lock_message)
+        layout.addStretch(1)
+        overlay.setGeometry(self.rect())
+        overlay.show()
+        overlay.raise_()
+        self._lock_input.setFocus()
+        self._lock_overlay = overlay
+
+    def _try_unlock(self, passphrase: str) -> bool:
+        """Unlocks if the passphrase is right; returns whether it was."""
+        if self._lock_overlay is None:
+            return True
+        if not self.engine.verify_passphrase(passphrase):
+            self._lock_message.setText("Wrong passphrase.")
+            self._lock_input.clear()
+            return False
+        self._lock_overlay.deleteLater()
+        self._lock_overlay = None
+        for dlg in self._dialogs_hidden_by_lock:
+            if dlg in self._active_dialogs:
+                dlg.show()
+        self._dialogs_hidden_by_lock = []
+        if auto_lock_seconds() > 0:
+            self._idle_timer.start(int(auto_lock_seconds() * 1000))
+        return True
+
     def resizeEvent(self, event):
-        """Keeps the message centred when the window is resized."""
+        """Keeps the message centred (and the lock screen covering the window) on resize."""
         super().resizeEvent(event)
+        if getattr(self, "_lock_overlay", None) is not None:
+            self._lock_overlay.setGeometry(self.rect())
         if hasattr(self, "toast_label") and self.toast_label.isVisible():
             x = max(8, (self.view.width() - self.toast_label.width()) // 2)
             y = max(8, self.view.height() - 76)
@@ -2459,6 +2630,8 @@ class VaultGraphWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Stops the timers when the window closes."""
+        self._idle_timer.stop()
+        QApplication.instance().removeEventFilter(self)
         self._clade_poll_timer.stop()
         self._vault_refresh_timer.stop()
         super().closeEvent(event)
@@ -2562,7 +2735,10 @@ class VaultGraphWindow(QMainWindow):
                 ("Size", f"{size:,} bytes" if size is not None else "unavailable (pruned)"),
                 ("Type", type_name)]
         cards = [{"heading": f"As of {when}", "rows": rows}]
-        if lines:
+        if self.engine.is_secret(label):
+            cards.append({"heading": "Beginning of the file then", "rows": [],
+                          "note": "Hidden: this file is secret."})
+        elif lines:
             preview = "<br>".join(html.escape(line) or "&nbsp;" for line in lines)
             cards.append({"heading": "Beginning of the file then", "rows": [],
                           "note": f'<span style="font-family: monospace;">{preview}</span>'})
@@ -2572,9 +2748,16 @@ class VaultGraphWindow(QMainWindow):
 
     def _generation_preview(self, label, node):
         """(size, type name, first lines if text) for one generation, or
-        (None, '?', None) if it was pruned. Big files aren't decrypted."""
+        (None, '?', None) if it was pruned. Big files aren't decrypted. A
+        secret file is read in memory and its lines are never shown."""
         if node.pruned:
             return None, "?", None
+        if self.engine.is_secret(label):
+            try:
+                data = self.engine.read_bytes(label, node.generation_index)
+            except Exception:
+                return None, "?", None
+            return len(data), detect_phenotype(data[:64]).name, None
         os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix="pfs_timepreview_", dir=EDIT_CACHE_DIR)
         os.close(fd)
@@ -2686,6 +2869,8 @@ class VaultGraphWindow(QMainWindow):
         ]
         if sharing_labels:
             file_rows.append(("Storage", f"shared with {', '.join(sharing_labels)} (0 new bytes)"))
+        if is_secret(tags):
+            file_rows.append(("Secret", "yes -- opens only inside the app; values hidden in comparisons"))
 
         cards = [
             {"heading": "File", "rows": file_rows},
@@ -2779,7 +2964,14 @@ class VaultGraphWindow(QMainWindow):
         self._run_lineage_diff(owning_label, parent_node.generation_index, node.generation_index)
 
     def _try_text_diff(self, label, generation_old, generation_new):
-        """Line diff when both generations decode as UTF-8; None otherwise."""
+        """Line diff when both generations decode as UTF-8; None otherwise. For
+        a secret file: which variables changed, read in memory, values hidden."""
+        if self.engine.is_secret(label):
+            try:
+                return masked_changes(self.engine.read_bytes(label, generation_old),
+                                      self.engine.read_bytes(label, generation_new))
+            except Exception:
+                return None
         path_a = path_b = None
         try:
             fd_a, path_a = tempfile.mkstemp(prefix="pfs_lineage_diff_")
@@ -2811,7 +3003,9 @@ class VaultGraphWindow(QMainWindow):
 
         text_diff_lines = None if result.identical else self._try_text_diff(label, generation_old, generation_new)
 
-        dlg = LineageDiffDialog(self, result, self._theme_colors(), text_diff_lines)
+        heading = ("Changed variables (values hidden -- this file is secret):"
+                   if text_diff_lines is not None and self.engine.is_secret(label) else None)
+        dlg = LineageDiffDialog(self, result, self._theme_colors(), text_diff_lines, heading)
         self._active_dialogs.append(dlg)
         dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
         dlg.show()
@@ -2827,19 +3021,26 @@ class VaultGraphWindow(QMainWindow):
             meta = self.engine.get_metadata(label)
             phenotype_name = meta.get("phenotype_name", "") if meta else ""
 
+            secret = self.engine.is_secret(label)
             menu.addAction("Info", lambda: self._show_details_for_label(label))
             if _is_inapp_text_phenotype(phenotype_name):
                 menu.addAction("Edit (in-app, real-time)", lambda: self._edit_label_inapp(label))
             elif _is_inapp_image_phenotype(phenotype_name):
                 menu.addAction("View Image", lambda: self._view_image_inapp(label))
-            menu.addAction("View (read-only, external)", lambda: self._view_label(label))
-            menu.addAction("Edit externally...", lambda: self._edit_label(label))
+            if not secret:
+                # Secret files never leave the app: these hand a plaintext copy to another program.
+                menu.addAction("View (read-only, external)", lambda: self._view_label(label))
+                menu.addAction("Edit externally...", lambda: self._edit_label(label))
             menu.addAction("Rename...", lambda: self._rename_label(label))
             menu.addAction("Duplicate (zero-cost alias)...", lambda: self._duplicate_label(label))
             menu.addAction("Trace ancestry", lambda: self._trace_ancestry(label))
             menu.addAction("Reveal in Tree", lambda: self._reveal_in_tree(label))
             menu.addSeparator()
-            menu.addAction("Delete...", lambda: self._delete_label(label))
+            menu.addAction("Unmark as secret" if secret else "Mark as secret",
+                           lambda: self._set_secret(label, not secret))
+            menu.addSeparator()
+            menu.addAction("Delete (shreds it)..." if secret else "Delete...", lambda: self._delete_label(label))
+            menu.addAction("Shred (erase securely)...", lambda: self._shred_action(label))
         elif self._mode == "tree":
             node_uuid = node.data(0)
             owning_label = node.data(1)
@@ -2861,8 +3062,14 @@ class VaultGraphWindow(QMainWindow):
             if lineage_node.parent_uuid:
                 menu.addAction("Diff against parent", lambda: self._diff_against_parent(owning_label, node_uuid))
             if not is_tip and not lineage_node.pruned:
-                menu.addAction("Prune this generation...",
-                                lambda: self._prune_generation_action(owning_label, lineage_node.generation_index))
+                if self.engine.is_secret(owning_label):
+                    menu.addAction("Shred this generation...",
+                                    lambda: self._shred_action(owning_label, lineage_node.generation_index))
+                else:
+                    menu.addAction("Prune this generation...",
+                                    lambda: self._prune_generation_action(owning_label, lineage_node.generation_index))
+                    menu.addAction("Shred this generation...",
+                                    lambda: self._shred_action(owning_label, lineage_node.generation_index))
             if len(heads) > 1:
                 menu.addSeparator()
                 menu.addAction("Merge branches...", lambda: self._merge_action_for_label(owning_label))
@@ -2928,12 +3135,49 @@ class VaultGraphWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
         try:
-            self.engine.delete_label(label)
+            report = self.engine.delete_label(label)
         except PermissionError as e:
             QMessageBox.warning(self, "Delete refused", str(e))
             return
-        self._toast(f"Deleted '{label}'")
+        if report and "versions_shredded" in report:
+            self._toast(f"Shredded '{label}' (it was secret): {report['chunks_destroyed']} piece(s) overwritten")
+        else:
+            self._toast(f"Deleted '{label}'")
         self._rebuild()
+
+    def _set_secret(self, label, secret: bool):
+        """Marks a file as secret, or removes the mark."""
+        if secret:
+            self.engine.set_tag(label, SECRET_TAG, True)
+            self._toast(f"'{label}' is now secret: it opens only inside the app")
+        else:
+            self.engine.remove_tag(label, SECRET_TAG)
+            self._toast(f"'{label}' is no longer secret")
+        self._rebuild()
+
+    def _shred_action(self, label, generation_index=None):
+        """Asks for confirmation, then securely erases a file or one old version."""
+        what = (f"'{label}' and all its history" if generation_index is None
+                else f"generation {generation_index} of '{label}'")
+        confirm = QMessageBox.question(
+            self, "Shred",
+            f"Shred {what}?\n\nIts content is overwritten inside the vault and can't be recovered, even "
+            f"with the passphrase. Content still used by other files or versions is kept.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        holder = {}
+        try:
+            self._perform_write_and_animate(
+                lambda: holder.setdefault("report", self.engine.shred(label, generation_index)))
+        except Exception as e:  # refused (protected, current version) or failed, either engine
+            QMessageBox.warning(self, "Shred", str(e))
+            return
+        report = holder["report"]
+        kept = (f"; {report['chunks_kept_shared']} kept (still used elsewhere)"
+                if report["chunks_kept_shared"] else "")
+        self._toast(f"Shredded {what}: {report['chunks_destroyed']} piece(s) overwritten{kept}")
 
     def _trace_ancestry(self, label):
         """Fades everything except the file and the chain of files it was made from."""
@@ -2982,6 +3226,14 @@ class VaultGraphWindow(QMainWindow):
 
     def _checkout_generation(self, label, generation_index):
         """Asks where to save, then writes an old generation there as an ordinary file."""
+        if self.engine.is_secret(label):
+            confirm = QMessageBox.warning(
+                self, "Secret file",
+                f"'{label}' is secret. Checking it out writes its values UNENCRYPTED to a file that any "
+                f"program can read.\n\nWrite it anyway?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if confirm != QMessageBox.Yes:
+                return
         path, _ = QFileDialog.getSaveFileName(self, f"Checkout {label} gen {generation_index} to...")
         if not path:
             return
@@ -3003,8 +3255,11 @@ class VaultGraphWindow(QMainWindow):
         if confirm != QMessageBox.Yes:
             return
         try:
-            self.engine.prune_generation(label, generation_index)
-            self._toast(f"Pruned '{label}' generation {generation_index}")
+            report = self.engine.prune_generation(label, generation_index)
+            if report and "versions_shredded" in report:
+                self._toast(f"Shredded '{label}' generation {generation_index} (the file is secret)")
+            else:
+                self._toast(f"Pruned '{label}' generation {generation_index}")
             self._rebuild()
         except (ValueError, PermissionError) as e:
             QMessageBox.warning(self, "Prune failed", str(e))
@@ -3035,6 +3290,14 @@ class VaultGraphWindow(QMainWindow):
         gen_a = heads[choices.index(choice_a)].generation_index
         gen_b = heads[choices.index(choice_b)].generation_index
         try:
+            line_merge = self.engine.text_merge(label, gen_a, gen_b)
+        except Exception as e:  # can't be merged at all (either engine)
+            QMessageBox.warning(self, "Merge failed", str(e))
+            return
+        if line_merge is not None:
+            self._finish_line_merge(label, gen_a, gen_b, line_merge)
+            return
+        try:
             self._merge_with_resolutions(label, gen_a, gen_b, {})
         except MutationConflictError as e:
             dlg = self._conflict_dialog(label, gen_a, gen_b, e.conflicting_positions)
@@ -3047,6 +3310,22 @@ class VaultGraphWindow(QMainWindow):
                 QMessageBox.warning(self, "Merge failed", str(e2))
         except ValueError as e:
             QMessageBox.warning(self, "Merge failed", str(e))
+
+    def _finish_line_merge(self, label, gen_a, gen_b, line_merge, choices=None):
+        """Saves a line-by-line merge, asking about conflicts first (unless
+        choices is given). Returns True if it was saved."""
+        if line_merge.conflicts and choices is None:
+            dlg = LineConflictDialog(self, label, gen_a, gen_b, line_merge.conflicts,
+                                     hide_lines=self.engine.is_secret(label))
+            if dlg.exec() != QDialog.Accepted:
+                self._toast("Merge cancelled -- nothing was saved")
+                return False
+            choices = dlg.choices()
+        text = line_merge.text(choices)
+        self._perform_write_and_animate(lambda: self.engine.commit_text_merge(label, gen_a, gen_b, text))
+        extra = f", {len(line_merge.conflicts)} conflict(s) resolved" if line_merge.conflicts else ""
+        self._toast(f"Merged '{label}' generations {gen_a} and {gen_b} line by line{extra}")
+        return True
 
     def _merge_with_resolutions(self, label, gen_a, gen_b, resolutions):
         """Runs the merge with the user's choices and reports the result."""
@@ -3123,6 +3402,8 @@ class VaultGraphWindow(QMainWindow):
         meta = self.engine.get_metadata(label)
         if meta is None:
             return
+        if self._refuse_external_for_secret(label):
+            return
         ext = _extension_for_phenotype(meta.get("phenotype_name", ""))
 
         os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
@@ -3147,6 +3428,8 @@ class VaultGraphWindow(QMainWindow):
         meta = self.engine.get_metadata(label)
         if meta is None:
             return
+        if self._refuse_external_for_secret(label):
+            return
         ext = _extension_for_phenotype(meta.get("phenotype_name", ""))
 
         os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
@@ -3161,10 +3444,46 @@ class VaultGraphWindow(QMainWindow):
             return
         self._toast(f"Opened '{label}' read-only -- changes there won't be saved back")
 
+    def _refuse_external_for_secret(self, label) -> bool:
+        """For a secret file, explains that it can't be opened in another
+        program and returns True."""
+        if not self.engine.is_secret(label):
+            return False
+        QMessageBox.information(
+            self, "Secret file",
+            f"'{label}' is secret, so it only opens inside PFS: another program would need an "
+            f"unencrypted copy on disk.\n\nUse Edit (in-app) for text, or 'run' in the shell to give its "
+            f"variables to a program.")
+        return True
+
+    def _show_inapp_viewer(self, title, phenotype_name, data):
+        """Shows text or an image read-only in a window inside the app."""
+        if _is_inapp_text_phenotype(phenotype_name):
+            dlg = TextViewerDialog(self, title, data.decode("utf-8", errors="replace"))
+        else:
+            dlg = ImageViewerDialog(self, title, data)
+        self._active_dialogs.append(dlg)
+        dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
+        dlg.show()
+
     def _view_generation(self, label, generation_index):
         """Shows one past generation read-only: text and images in-app, other
-        types in the OS default app. Nothing is committed.
+        types in the OS default app. Nothing is committed. A secret file is
+        read in memory and never handed to another program.
         """
+        title = f"{label} -- generation {generation_index} (read-only)"
+        if self.engine.is_secret(label):
+            try:
+                data = self.engine.read_bytes(label, generation_index)
+            except Exception as e:  # pruned or shredded, either engine
+                QMessageBox.warning(self, "View", str(e))
+                return
+            phenotype_name = detect_phenotype(data[:64]).name
+            if _is_inapp_text_phenotype(phenotype_name) or _is_inapp_image_phenotype(phenotype_name):
+                self._show_inapp_viewer(title, phenotype_name, data)
+            else:
+                self._refuse_external_for_secret(label)
+            return
         os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
         fd, tmp_path = tempfile.mkstemp(prefix="pfs_viewgen_", dir=EDIT_CACHE_DIR)
         os.close(fd)
@@ -3175,18 +3494,11 @@ class VaultGraphWindow(QMainWindow):
             QMessageBox.warning(self, "View", str(e))
             return
         phenotype_name = detect_from_file(tmp_path).name
-        title = f"{label} -- generation {generation_index} (read-only)"
         if _is_inapp_text_phenotype(phenotype_name) or _is_inapp_image_phenotype(phenotype_name):
             with open(tmp_path, "rb") as f:
                 data = f.read()
             os.remove(tmp_path)
-            if _is_inapp_text_phenotype(phenotype_name):
-                dlg = TextViewerDialog(self, title, data.decode("utf-8", errors="replace"))
-            else:
-                dlg = ImageViewerDialog(self, title, data)
-            self._active_dialogs.append(dlg)
-            dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
-            dlg.show()
+            self._show_inapp_viewer(title, phenotype_name, data)
             return
         view_path = tmp_path + _extension_for_phenotype(phenotype_name)
         os.replace(tmp_path, view_path)
@@ -3200,18 +3512,26 @@ class VaultGraphWindow(QMainWindow):
         """Text: in-app editor whose Save commits directly."""
         if not self.engine.has_label(label):
             return
-        os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
-        fd, tmp_path = tempfile.mkstemp(prefix="pfs_inapp_", suffix=".txt", dir=EDIT_CACHE_DIR)
-        os.close(fd)
-        self.engine.reconstruct_current(label, tmp_path)
-        with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
-            initial_text = f.read()
+        if self.engine.is_secret(label):
+            # Secret: the text lives only in memory and in the editor.
+            tmp_path = None
+            initial_text = self.engine.read_bytes(label).decode("utf-8", errors="replace")
+        else:
+            os.makedirs(EDIT_CACHE_DIR, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(prefix="pfs_inapp_", suffix=".txt", dir=EDIT_CACHE_DIR)
+            os.close(fd)
+            self.engine.reconstruct_current(label, tmp_path)
+            with open(tmp_path, "r", encoding="utf-8", errors="replace") as f:
+                initial_text = f.read()
 
         def on_save(new_text):
             """Stores the editor's text as a new version and switches to the Tree view."""
-            with open(tmp_path, "w", encoding="utf-8") as f:
-                f.write(new_text)
-            self._perform_write_and_animate(lambda: self.engine.commit_write(label, tmp_path))
+            if tmp_path is None:
+                self._perform_write_and_animate(lambda: self.engine.commit_bytes(label, new_text.encode("utf-8")))
+            else:
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    f.write(new_text)
+                self._perform_write_and_animate(lambda: self.engine.commit_write(label, tmp_path))
             # Show Tree mode, where the new generation is its own node.
             self._reveal_in_tree(label)
 
@@ -3220,7 +3540,7 @@ class VaultGraphWindow(QMainWindow):
 
         def cleanup(_result=None):
             """Deletes the editor's temporary file when the editor closes."""
-            if os.path.exists(tmp_path):
+            if tmp_path is not None and os.path.exists(tmp_path):
                 os.remove(tmp_path)
             if dlg in self._active_dialogs:
                 self._active_dialogs.remove(dlg)
@@ -3232,14 +3552,7 @@ class VaultGraphWindow(QMainWindow):
         """Images: in-app read-only viewer."""
         if not self.engine.has_label(label):
             return
-        fd, tmp_path = tempfile.mkstemp(prefix="pfs_imgview_")
-        os.close(fd)
-        try:
-            self.engine.reconstruct_current(label, tmp_path)
-            with open(tmp_path, "rb") as f:
-                image_bytes = f.read()
-        finally:
-            os.remove(tmp_path)
+        image_bytes = self.engine.read_bytes(label)  # in memory; never written to disk
         dlg = ImageViewerDialog(self, label, image_bytes)
         self._active_dialogs.append(dlg)
         dlg.finished.connect(lambda _r=None: self._active_dialogs.remove(dlg) if dlg in self._active_dialogs else None)
@@ -3715,7 +4028,7 @@ def _open_cpp_engine(storage_root: str):
     except PfsEngineError as e:
         QMessageBox.critical(None, "Unlock Failed", f"Couldn't open the C++ vault: {e}")
         return None
-    return CppEngineAdapter(session)
+    return CppEngineAdapter(session, kek)
 
 
 def main():

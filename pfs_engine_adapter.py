@@ -6,12 +6,34 @@ only through checkout()/reconstruct_current().
 """
 import os
 import tempfile
+from contextlib import contextmanager
 
 from clade_worker import CladeWorker, filtered_view, python_session_loader, cpp_session_loader
 from reconstruct import reconstruct
 from vault_session import MutationConflictError
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from gearhash.pipeline import release_free_memory
+from gearhash.master_key_store import WrongPassphraseError, load_vault_key
+from secret_store import MemoryFile, is_secret, read_via_memory
+from text_merge import MAX_TEXT_MERGE_CHUNKS, merge_bytes
+
+@contextmanager
+def _scratch_file(in_memory: bool):
+    """Yields a path for temporary content: an in-memory file for secret
+    content, an ordinary temporary file otherwise (large files would not fit
+    comfortably in memory). Removed afterwards either way."""
+    if in_memory:
+        with MemoryFile() as mem:
+            yield mem.path
+        return
+    fd, tmp_path = tempfile.mkstemp(prefix="pfs_gui_dup_")
+    os.close(fd)
+    try:
+        yield tmp_path
+    finally:
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
+
 
 class NodeInfo:
     """A lineage node in either engine; uuids are hex strings in both."""
@@ -83,6 +105,57 @@ class _CladeTracking:
         if self._clade_worker is None:
             return None
         return self._clade_worker.tree(algorithm, labels, timeout=wait)
+
+    # ---------- secrets mode (both engines) ----------
+
+    def is_secret(self, label: str) -> bool:
+        """True if the file is tagged secret."""
+        return is_secret(self.get_tags(label))
+
+    def read_bytes(self, label: str, generation_index=None) -> bytes:
+        """A file's content (latest, or one generation), rebuilt in memory
+        without touching the disk."""
+        if generation_index is None:
+            return read_via_memory(lambda path: self.reconstruct_current(label, path))
+        return read_via_memory(lambda path: self.checkout(label, generation_index, path))
+
+    def commit_bytes(self, label: str, data: bytes) -> None:
+        """Stores data as the next version of label, from memory."""
+        with MemoryFile() as mem:
+            mem.write(data)
+            self.commit_write(label, mem.path)
+
+    def verify_passphrase(self, passphrase: str) -> bool:
+        """True if the passphrase unlocks this vault's key (for the auto-lock)."""
+        try:
+            kek = load_vault_key(self.storage_root, passphrase)
+        except (WrongPassphraseError, OSError, ValueError):
+            return False
+        known = self._known_kek()
+        return known is None or kek == known
+
+    def _known_kek(self):
+        """The key the vault was opened with, if known (engine-specific)."""
+        return None
+
+    # ---------- line-by-line merging (both engines) ----------
+
+    def text_merge(self, label: str, generation_a: int, generation_b: int):
+        """A line-by-line merge of two branches against their common ancestor
+        (text_merge.MergeResult), or None if a version isn't text or is too
+        large, in which case use merge_branches(). Reads in memory only."""
+        base = self.merge_base(label, generation_a, generation_b)
+        sizes = {n.generation_index: n.total_chunks for n in self.get_history(label)}
+        if any((sizes.get(g) or 0) > MAX_TEXT_MERGE_CHUNKS for g in (base, generation_a, generation_b)):
+            return None
+        return merge_bytes(*(self.read_bytes(label, g) for g in (base, generation_a, generation_b)))
+
+    def commit_text_merge(self, label: str, generation_a: int, generation_b: int, text: str) -> None:
+        """Stores merged text as the merge of two branches, from memory."""
+        with MemoryFile() as mem:
+            mem.write(text.encode("utf-8"))
+            self.commit_merged(label, generation_a, generation_b, mem.path)
+        self._clade_event("changed", label)
 
     def _clade_event(self, kind: str, *labels) -> None:
         # start() loads every label, so nothing to report before it.
@@ -219,9 +292,9 @@ class PythonEngineAdapter(_CladeTracking):
         self._session.rename_label(old_label, new_label)
         self._clade_event("renamed", old_label, new_label)
 
-    def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
+    def prune_generation(self, label: str, generation_index: int, force: bool = False) -> dict:
         """Frees one old generation's storage."""
-        self._session.prune_generation(label, generation_index, force=force)
+        return self._session.prune_generation(label, generation_index, force=force)
 
     def merge_branches(self, label: str, generation_a: int, generation_b: int, resolutions=None) -> None:
         """Merges two branches of a file, using the user's choices for any clashing parts."""
@@ -234,27 +307,27 @@ class PythonEngineAdapter(_CladeTracking):
         if node is None or node.manifest_filename is None:
             raise ValueError("That generation's content is no longer available (pruned).")
         manifest_path = os.path.join(self._session.storage_root, node.manifest_filename)
-        reconstruct(manifest_path, self._session.pipeline.container_path, out_path, self._session.crypto.key)
+        reconstruct(manifest_path, self._session.pipeline.container_path, out_path, self._session.crypto.key,
+                    quiet=True)
 
     def reconstruct_current(self, label: str, out_path: str) -> None:
         """Rebuilds the latest version of a file into out_path."""
         manifest_path = self._session.manifest_path_for(label)
-        reconstruct(manifest_path, self._session.pipeline.container_path, out_path, self._session.crypto.key)
+        reconstruct(manifest_path, self._session.pipeline.container_path, out_path, self._session.crypto.key,
+                    quiet=True)
 
     def duplicate_label(self, label: str, new_label: str) -> None:
         """Makes a second file with the same content, recorded as made from the first."""
-        fd, tmp_path = tempfile.mkstemp(prefix="pfs_gui_dup_")
-        os.close(fd)
-        try:
+        secret = self.is_secret(label)
+        with _scratch_file(secret) as tmp_path:
             self.reconstruct_current(label, tmp_path)
             fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(tmp_path)
             self._session.commit_write(new_label, tmp_path, lateral_parent_labels=[label],
                                         similarity_fingerprint=fingerprint)
             del fingerprint
             release_free_memory()
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        if secret:
+            self.set_tag(new_label, "secret", True)
         self._clade_event("changed", new_label)
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> None:
@@ -267,17 +340,61 @@ class PythonEngineAdapter(_CladeTracking):
         """Returns the fingerprint loader for a Python-engine vault."""
         return python_session_loader(self._session)
 
+    def _known_kek(self):
+        """The key the vault was opened with."""
+        return self._session.crypto.key
+
+    def merge_base(self, label: str, generation_a: int, generation_b: int) -> int:
+        """The generation two branches last had in common."""
+        return self._session.merge_base(label, generation_a, generation_b)
+
+    def commit_merged(self, label: str, generation_a: int, generation_b: int, source_path: str) -> None:
+        """Commits caller-merged content as the merge of two branches."""
+        self._session.commit_merged(label, generation_a, generation_b, source_path)
+
+    def shred(self, label: str, generation_index=None, force: bool = False) -> dict:
+        """Securely erases a file, or one old version (see VaultSession.shred)."""
+        report = self._session.shred(label, generation_index, force=force)
+        if generation_index is None:
+            self._clade_event("removed", label)
+        return report
+
 
 class CppEngineAdapter(_CladeTracking):
     """Wraps pfs_engine_binding.CppVaultSession."""
 
-    def __init__(self, session):
-        """Wraps a C++-engine session."""
+    def __init__(self, session, kek: bytes = None):
+        """Wraps a C++-engine session; kek (if given) lets the auto-lock check
+        a re-entered passphrase against the key the vault was opened with."""
         self._session = session
+        self._kek = kek
 
     def refresh(self) -> bool:
-        """A C++-engine vault is held by one process, so nothing changes underneath."""
-        return False
+        """Picks up other programs' changes to the vault and tells the clade
+        worker which files changed; True if any."""
+        if self._clade_worker is not None and getattr(self, "_seen_view", None) is None:
+            self._seen_view = self._catalog_view()  # once; later views come only after a change
+        if not self._session.refresh():
+            return False
+        if self._clade_worker is not None:
+            before, after = self._seen_view, self._catalog_view()
+            for label in before.keys() - after.keys():
+                self._clade_event("removed", label)
+            for label, manifest in after.items():
+                if before.get(label) != manifest:
+                    self._clade_event("changed", label)
+            self._seen_view = after
+        return True
+
+    def _catalog_view(self) -> dict:
+        """label -> recipe filename, for telling what another program changed."""
+        view = {}
+        for label in self._session.list_labels():
+            try:
+                view[label] = self._session.get_manifest_info(label)["manifest_filename"]
+            except Exception:  # removed meanwhile
+                continue
+        return view
 
     @property
     def storage_root(self) -> str:
@@ -377,7 +494,9 @@ class CppEngineAdapter(_CladeTracking):
         self._clade_event("changed", label)
 
     def delete_label(self, label: str, force: bool = False) -> dict:
-        """Deletes a file and its history; returns what was freed."""
+        """Deletes a file and its history (shredding it if it is secret); returns what was freed."""
+        if self.is_secret(label):
+            return self.shred(label, None, force=force)
         report = self._session.delete_label(label, force=force)
         self._clade_event("removed", label)
         return report
@@ -387,8 +506,11 @@ class CppEngineAdapter(_CladeTracking):
         self._session.rename_label(old_label, new_label)
         self._clade_event("renamed", old_label, new_label)
 
-    def prune_generation(self, label: str, generation_index: int, force: bool = False) -> None:
-        """Frees one old generation's storage."""
+    def prune_generation(self, label: str, generation_index: int, force: bool = False):
+        """Frees one old generation's storage (shredding it if the file is secret)."""
+        if self.is_secret(label):
+            report = self.shred(label, generation_index, force=force)
+            return {"freed": report["manifests_freed"] > 0, **report}
         self._session.prune_generation(label, generation_index, force=force)
 
     def merge_branches(self, label: str, generation_a: int, generation_b: int, resolutions=None) -> None:
@@ -410,14 +532,12 @@ class CppEngineAdapter(_CladeTracking):
 
     def duplicate_label(self, label: str, new_label: str) -> None:
         """Makes a second file with the same content, recorded as made from the first."""
-        fd, tmp_path = tempfile.mkstemp(prefix="pfs_gui_dup_")
-        os.close(fd)
-        try:
+        secret = self.is_secret(label)
+        with _scratch_file(secret) as tmp_path:
             self.reconstruct_current(label, tmp_path)
             self._session.commit_write_lateral(new_label, tmp_path, label)
-        finally:
-            if os.path.exists(tmp_path):
-                os.remove(tmp_path)
+        if secret:
+            self.set_tag(new_label, "secret", True)
         self._clade_event("changed", new_label)
 
     def graft(self, label_a: str, label_b: str, new_label: str) -> None:
@@ -428,6 +548,29 @@ class CppEngineAdapter(_CladeTracking):
     def _clade_loader(self):
         """Returns the fingerprint loader for a C++-engine vault."""
         return cpp_session_loader(self._session)
+
+    def _known_kek(self):
+        """The key the vault was opened with, if it was given."""
+        return self._kek
+
+    def merge_base(self, label: str, generation_a: int, generation_b: int) -> int:
+        """The generation two branches last had in common (ValueError if they can't be merged)."""
+        from pfs_engine_binding import PfsEngineError  # only importable with the C++ engine built
+        try:
+            return self._session.merge_base(label, generation_a, generation_b)
+        except PfsEngineError as e:
+            raise ValueError(str(e))
+
+    def commit_merged(self, label: str, generation_a: int, generation_b: int, source_path: str) -> None:
+        """Commits caller-merged content as the merge of two branches."""
+        self._session.commit_merged(label, generation_a, generation_b, source_path)
+
+    def shred(self, label: str, generation_index=None, force: bool = False) -> dict:
+        """Securely erases a file, or one old version (see VaultSession.shred)."""
+        report = self._session.shred(label, generation_index, force=force)
+        if generation_index is None:
+            self._clade_event("removed", label)
+        return report
 
     def close(self) -> None:
         """Stops the clade worker and closes the vault."""

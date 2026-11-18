@@ -334,6 +334,34 @@ int pfs_merge_branches_resolved(pfs_session_t* session_h, const char* label, uin
     }
 }
 
+// The generation two branches last had in common.
+int pfs_merge_base(pfs_session_t* session_h, const char* label, uint64_t generation_a, uint64_t generation_b,
+                   uint64_t* out_base_generation) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    try {
+        uint64_t base = s->session.merge_base(label, generation_a, generation_b);
+        if (out_base_generation) *out_base_generation = base;
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
+// Commits caller-merged content as the merge of two branches.
+int pfs_commit_merged(pfs_session_t* session_h, const char* label, uint64_t generation_a, uint64_t generation_b,
+                      const char* source_path, char* out_manifest_filename, size_t out_buf_len) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    try {
+        MergeResult r = s->session.commit_merged(label, generation_a, generation_b, source_path);
+        copy_out(r.manifest_path.substr(r.manifest_path.find_last_of('/') + 1), out_manifest_filename, out_buf_len);
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
 // Rebuilds one generation of a file into output_path.
 int pfs_checkout(pfs_session_t* session_h, const char* label, uint64_t generation_index, const char* output_path) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
@@ -361,18 +389,7 @@ int pfs_checkout(pfs_session_t* session_h, const char* label, uint64_t generatio
 int pfs_rename_label(pfs_session_t* session_h, const char* old_label, const char* new_label) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
-        if (!s->session.catalog.contains(old_label)) {
-            set_error(std::string("no such label: '") + old_label + "'");
-            return -1;
-        }
-        if (s->session.catalog.contains(new_label)) {
-            set_error(std::string("label '") + new_label + "' already exists");
-            return -1;
-        }
-        auto manifest_filename = s->session.catalog.get(old_label);
-        s->session.catalog.set(new_label, *manifest_filename);
-        s->session.catalog.remove(old_label);
-        s->session.lineage.rename_label(old_label, new_label);
+        s->session.rename_label(old_label, new_label);
         return 0;
     } catch (const std::exception& e) {
         set_error(e);
@@ -402,6 +419,28 @@ int pfs_prune_generation(pfs_session_t* session_h, const char* label, uint64_t g
     try {
         PruneResult r = s->session.prune_generation(label, generation_index, force != 0);
         if (out_freed) *out_freed = r.freed ? 1 : 0;
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
+// Securely erases a file or one old generation; fills out_report.
+int pfs_shred(pfs_session_t* session_h, const char* label, int has_generation, uint64_t generation_index,
+              int force, pfs_shred_report_t* out_report) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    try {
+        std::optional<uint64_t> gen;
+        if (has_generation) gen = generation_index;
+        ShredResult r = s->session.shred(label, gen, force != 0);
+        if (out_report) {
+            out_report->versions_shredded = r.versions_shredded;
+            out_report->manifests_freed = r.manifests_freed;
+            out_report->manifests_kept_shared = r.manifests_kept_shared;
+            out_report->chunks_destroyed = r.chunks_destroyed;
+            out_report->chunks_kept_shared = r.chunks_kept_shared;
+        }
         return 0;
     } catch (const std::exception& e) {
         set_error(e);
@@ -458,7 +497,7 @@ int pfs_fsck(pfs_session_t* session_h, pfs_fsck_report_t* out_report, pfs_hash_c
 int pfs_set_tag_bool(pfs_session_t* session_h, const char* label, const char* key, int value) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
-        s->session.lineage.set_tag(label, key, TagValue::from_bool(value != 0));
+        s->session.set_tag(label, key, TagValue::from_bool(value != 0));
         return 0;
     } catch (const std::exception& e) {
         set_error(e);
@@ -470,7 +509,7 @@ int pfs_set_tag_bool(pfs_session_t* session_h, const char* label, const char* ke
 int pfs_set_tag_string(pfs_session_t* session_h, const char* label, const char* key, const char* value) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
-        s->session.lineage.set_tag(label, key, TagValue::from_string(value));
+        s->session.set_tag(label, key, TagValue::from_string(value));
         return 0;
     } catch (const std::exception& e) {
         set_error(e);
@@ -482,7 +521,7 @@ int pfs_set_tag_string(pfs_session_t* session_h, const char* label, const char* 
 int pfs_remove_tag(pfs_session_t* session_h, const char* label, const char* key) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
-        return s->session.lineage.remove_tag(label, key) ? 1 : 0;
+        return s->session.remove_tag(label, key) ? 1 : 0;
     } catch (const std::exception& e) {
         set_error(e);
         return -1;
@@ -566,11 +605,41 @@ int pfs_get_heads(pfs_session_t* session_h, const char* label, pfs_generation_ca
     }
 }
 
+// Picks up other programs' changes; returns 1 if anything changed, 0 if not, -1 on error.
+int pfs_refresh(pfs_session_t* session_h) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    try {
+        return s->session.refresh() ? 1 : 0;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
+// Returns 1 if 'spares all' is on, 0 if not.
+int pfs_get_mirror_all(pfs_session_t* session_h) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    return s->session.pipeline.mirror_all() ? 1 : 0;
+}
+
+// Turns 'spares all' on or off; *out_added: how many existing chunks got a spare.
+int pfs_set_mirror_all(pfs_session_t* session_h, int enabled, uint64_t* out_added) {
+    auto* s = reinterpret_cast<pfs_session*>(session_h);
+    try {
+        uint64_t added = s->session.set_mirror_all(enabled != 0);
+        if (out_added) *out_added = added;
+        return 0;
+    } catch (const std::exception& e) {
+        set_error(e);
+        return -1;
+    }
+}
+
 // Starts a new key epoch; returns its number, or UINT32_MAX on error.
 uint32_t pfs_rotate_key(pfs_session_t* session_h) {
     auto* s = reinterpret_cast<pfs_session*>(session_h);
     try {
-        return s->session.pipeline.keyring().rotate();
+        return s->session.rotate_key();
     } catch (const std::exception& e) {
         set_error(e);
         return UINT32_MAX;

@@ -1,4 +1,5 @@
 #include "lineage_store.hpp"
+#include "immutability.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -182,7 +183,7 @@ void LineageStore::rebuild_by_uuid() {
 }
 
 // Rewrites the whole history as one snapshot (used only by the rare operations that edit it).
-void LineageStore::save() {
+void LineageStore::save(bool scrub) {
     // Full snapshot, O(N): only the rare mutating operations use this.
     BinaryWriter body;
     uint32_t total = 0;
@@ -214,7 +215,9 @@ void LineageStore::save() {
     }
     int fd = open(tmp.c_str(), O_WRONLY);
     if (fd >= 0) { fsync(fd); close(fd); }
-    if (rename(tmp.c_str(), path_.c_str()) != 0) {
+    if (scrub) {
+        scrub_then_replace(tmp, path_);
+    } else if (rename(tmp.c_str(), path_.c_str()) != 0) {
         throw std::runtime_error("failed to rename lineage store into place: " + path_);
     }
 }
@@ -287,9 +290,12 @@ LineageNode LineageStore::record_version(const std::string& label, const std::op
 std::vector<LineageNode> LineageStore::get_heads(const std::string& label) const {
     auto it = history_.find(label);
     if (it == history_.end()) return {};
-    std::set<NodeUuid> claimed;  // nodes that are someone's primary parent
+    // Nodes a later version of this file has as a parent, primary or lateral:
+    // a merge closes the branch it merged in.
+    std::set<NodeUuid> claimed;
     for (const auto& n : it->second) {
         if (n.has_parent) claimed.insert(n.parent_uuid);
+        for (const auto& lateral : n.lateral_parent_uuids) claimed.insert(lateral);
     }
     std::vector<LineageNode> heads;
     for (const auto& n : it->second) {
@@ -342,12 +348,31 @@ std::vector<std::string> LineageStore::all_labels() const {
 }
 
 // Removes a file's whole history.
-void LineageStore::delete_label(const std::string& label) {
+void LineageStore::delete_label(const std::string& label, bool scrub) {
     auto it = history_.find(label);
     if (it == history_.end()) return;
     history_.erase(it);
     rebuild_by_uuid();
-    save();
+    save(scrub);
+}
+
+// Marks one generation pruned and tags it "shredded"; rewrites the file with scrubbing.
+std::optional<std::string> LineageStore::mark_shredded(const std::string& label, uint64_t generation_index,
+                                                       const std::string& when) {
+    auto it = history_.find(label);
+    if (it == history_.end()) return std::nullopt;
+    for (auto& node : it->second) {
+        if (node.generation_index == generation_index && !node.pruned) {
+            std::string old_manifest = node.manifest_filename;
+            node.pruned = true;
+            node.has_manifest = false;
+            node.manifest_filename.clear();
+            node.epigenetic_tags["shredded"] = TagValue::from_string(when);
+            save(true);
+            return old_manifest;
+        }
+    }
+    return std::nullopt;
 }
 
 // Marks one generation as pruned; returns its recipe filename so the caller can free it.

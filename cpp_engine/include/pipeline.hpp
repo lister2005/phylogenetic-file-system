@@ -1,4 +1,5 @@
 #pragma once
+#include <set>
 // The C++ engine's write and read paths: ports of gearhash/pipeline.py's
 // secure_and_persist_file() and reconstruct.py's reconstruct(), including
 // Ancestral Hardening (widely shared chunks get a mirror copy; a read
@@ -59,10 +60,27 @@ struct FsckReport {
     std::vector<std::string> unrecoverable;  // hex content hashes
 };
 
+// What shred_manifest() did.
+struct ShredReport {
+    uint64_t chunks_destroyed = 0;    // overwritten and removed from the index
+    uint64_t chunks_kept_shared = 0;  // still used by another live recipe
+};
+
 class StoragePipeline {
 public:
     // A chunk referenced by this many manifests gets a mirror copy (pipeline.py's MIRROR_REF_THRESHOLD).
     static constexpr uint32_t kMirrorRefThreshold = 3;
+
+    // 'spares all': every chunk gets a mirror copy, not only those crossing
+    // kMirrorRefThreshold. Kept encrypted in settings.pfss.
+    bool mirror_all() const { return mirror_all_; }
+    // Saves the setting. Turning it on also mirrors every stored chunk that
+    // has no spare yet; returns how many got one.
+    uint64_t set_mirror_all(bool enabled);
+    // Gives every live chunk without a mirror one; returns how many.
+    uint64_t mirror_existing_chunks();
+    // Re-reads settings.pfss (another program may have changed it).
+    void reload_settings();
 
     StoragePipeline(std::string storage_root, const Bytes32& kek);
 
@@ -86,6 +104,16 @@ public:
 
     // Decrements every chunk's ref count and removes the manifest; space is reclaimed by vacuum().
     void delete_file(const std::string& manifest_path);
+
+    // A recipe's chunk hashes, in order.
+    std::vector<Bytes32> manifest_chunk_hashes(const std::string& manifest_path);
+
+    // Securely removes a recipe. Chunks in `destroy` (used by nothing else)
+    // are overwritten with random bytes in both containers and their index
+    // entries securely deleted; the recipe's other chunks lose one reference
+    // each, as with delete_file(). The recipe file is overwritten before it is
+    // deleted. For 'shred'.
+    ShredReport shred_manifest(const std::string& manifest_path, const std::set<Bytes32>& destroy);
 
     // Recomputes every chunk's ref_count from the manifests in
     // live_manifest_filenames (catalog and lineage). vacuum() runs it first.
@@ -119,6 +147,8 @@ private:
     std::string container_path_;
     std::string mirror_container_path_;
     DedupIndex index_;
+    std::string settings_path_;
+    bool mirror_all_ = false;
     KeyRing keyring_;
 };
 

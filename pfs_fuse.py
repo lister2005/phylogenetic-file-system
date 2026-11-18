@@ -51,6 +51,7 @@ from reconstruct import ManifestReader
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from clade_worker import CladeWorker, filtered_view, python_session_loader
 from gearhash.pipeline import release_free_memory
+from secret_store import is_secret
 
 SCRATCH_DIRNAME = ".fuse_scratch"
 # Bytes per ManifestReader read when copying a version into a scratch file.
@@ -157,11 +158,19 @@ class PFSFuse(Operations):
             return {}, {}
         snapshot = self._clades.snapshot()
         with self._lock:
-            key = (snapshot.version, self._catalog_epoch)
+            hidden = self._hidden_labels()
+            key = (snapshot.version, self._catalog_epoch, hidden)
             if self._clade_view_key != key:
-                self._clade_view = filtered_view(snapshot, self.session.catalog, min_members=2)
+                visible = {l: m for l, m in self.session.catalog.items() if l not in hidden}
+                self._clade_view = filtered_view(snapshot, visible, min_members=2)
                 self._clade_view_key = key
             return self._clade_view
+
+    def _hidden_labels(self) -> frozenset:
+        """Files tagged secret: never shown in the mount, where any program
+        could read them without the passphrase. Caller holds self._lock."""
+        lineage = self.session.lineage
+        return frozenset(l for l in self.session.catalog if is_secret(lineage.get_tags(l)))
 
     # ---------- path resolution ----------
 
@@ -180,7 +189,7 @@ class PFSFuse(Operations):
             if name in clade_to_labels:
                 return ("clade_dir", name)
             with self._lock:
-                in_catalog = name in self.session.catalog
+                in_catalog = name in self.session.catalog and name not in self._hidden_labels()
                 has_open_handle = any(h["label"] == name for h in self._handles.values())
             if name not in label_to_clade and (in_catalog or has_open_handle):
                 return ("file", name)
@@ -244,7 +253,7 @@ class PFSFuse(Operations):
             raise FuseOSError(errno.ENOTDIR)
 
         with self._lock:
-            all_labels = set(self.session.catalog.keys())
+            all_labels = set(self.session.catalog.keys()) - self._hidden_labels()
             open_labels = {h["label"] for h in self._handles.values()}
         root_files = {l for l in (all_labels | open_labels) if l not in label_to_clade}
         return [".", ".."] + sorted(clade_to_labels.keys()) + sorted(root_files)
@@ -312,6 +321,9 @@ class PFSFuse(Operations):
         parts = [p for p in path.split("/") if p]
         if len(parts) != 1:
             raise FuseOSError(errno.EACCES)
+        with self._lock:
+            if parts[0] in self._hidden_labels():
+                raise FuseOSError(errno.EACCES)  # would overwrite a secret file nobody can see here
         return self._new_handle(parts[0], spill=self._new_spill(), dirty=True)
 
     def _new_handle(self, label: str, reader: ManifestReader = None, spill=None, dirty: bool = False) -> int:
@@ -486,6 +498,9 @@ class PFSFuse(Operations):
 
         if new_label == old_label:
             return
+        with self._lock:
+            if new_label in self._hidden_labels():
+                raise FuseOSError(errno.EACCES)  # would replace a secret file nobody can see here
         with self._lock, self.session.write_lock():  # replace + rename as one change
             if new_label in self.session.catalog and new_label != old_label:
                 # Replacing an existing destination goes through delete_label too.

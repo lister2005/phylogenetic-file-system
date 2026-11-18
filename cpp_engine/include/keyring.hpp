@@ -30,6 +30,13 @@ public:
 
     int64_t current_epoch() const { return current_epoch_; }
 
+    // Re-reads the file, for keys another program added (key rotation).
+    void reload() {
+        deks_.clear();
+        current_epoch_ = -1;
+        load();
+    }
+
 private:
     std::string storage_root_;
     std::string path_;

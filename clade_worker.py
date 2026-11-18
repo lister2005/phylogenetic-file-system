@@ -12,8 +12,8 @@ It also keeps the UPGMA/NJ tree up to date (tree()), but only for an
 algorithm someone has asked for: building one is O(n^2) to O(n^3), so it
 runs after each batch of changes, not on demand.
 
-A thread in the process holding the vault, not a separate process: the
-vault lock admits one process per vault. Fingerprints come from a loader
+A thread in each process that has the vault open, not a separate
+process. Fingerprints come from a loader
 called only on the worker thread, and are cached packed (32 bytes per
 trait). The C++ FUSE driver uses the port in clade_worker.hpp.
 """

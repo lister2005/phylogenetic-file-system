@@ -20,7 +20,11 @@ public:
     std::optional<std::string> get(const std::string& label) const;
     void set(const std::string& label, const std::string& manifest_filename);  // persists immediately
     void remove(const std::string& label);                                     // persists immediately
+    // Removes and persists with the old catalog file overwritten first (for 'shred').
+    void remove_scrubbed(const std::string& label);
     std::vector<std::string> labels() const;
+    // Re-reads the file, for changes made by another program.
+    void reload() { load(); }
 
 private:
     std::string storage_root_;
@@ -29,7 +33,7 @@ private:
     std::map<std::string, std::string> entries_;  // label -> manifest_filename
 
     void load();
-    void save();
+    void save(bool scrub = false);
 };
 
 }  // namespace pfs_engine

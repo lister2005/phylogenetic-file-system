@@ -8,6 +8,7 @@ import os
 import pickle
 import functools
 import hashlib
+import time
 from contextlib import contextmanager
 from typing import Callable, Dict, List, Optional
 from cryptography.exceptions import InvalidTag
@@ -23,6 +24,8 @@ from lineage import LineageStore, LINEAGE_FILENAME
 from reconstruct import reconstruct
 from PhylogeneticAnalyzer import PhylogeneticAnalyzer, SIMILARITY_PROFILE
 from vault_lock import VaultBusyError, VaultLock, VaultLockError
+from gearhash.scrub import scrub_then_replace
+from secret_store import MAX_SECRET_BYTES, is_secret, read_via_memory
 
 CATALOG_FILENAME = "catalog.enc"
 HISTORY_FILENAME = "history.enc"
@@ -274,8 +277,9 @@ class VaultSession:
         self.catalog.clear()
         self.catalog.update(loaded)
 
-    def save_catalog(self) -> None:
-        """Encrypts the catalog and replaces the file atomically."""
+    def save_catalog(self, scrub: bool = False) -> None:
+        """Encrypts the catalog and replaces the file atomically. With scrub,
+        the old file is overwritten first (used by 'shred')."""
         path = os.path.join(self.storage_root, CATALOG_FILENAME)
         raw = pickle.dumps(self.catalog)
         encrypted = self.crypto.encrypt_block(raw, associated_data=b"catalog")
@@ -284,7 +288,10 @@ class VaultSession:
             f.write(encrypted)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        if scrub:
+            scrub_then_replace(tmp, path)
+        else:
+            os.replace(tmp, path)
 
     def read_manifest_metadata(self, manifest_path: str) -> dict:
         """Decrypts a recipe file and returns its metadata."""
@@ -422,6 +429,8 @@ class VaultSession:
                 f"'{label}' is tagged 'protected' -- won't delete without an explicit override. "
                 f"Use 'untag {label} protected' first, or pass force."
             )
+        if is_secret(self.lineage.get_tags(label)):
+            return self._shred_locked(label, None)
 
         manifest_filenames = {self.catalog[label]}
         manifest_filenames.update(
@@ -556,6 +565,10 @@ class VaultSession:
                 f"past one), so pass force if you're sure you want to prune it anyway."
             )
 
+        if is_secret(node.epigenetic_tags) or is_secret(self.lineage.get_tags(label)):
+            report = self._shred_locked(label, generation_index)
+            return {"freed": report["manifests_freed"] > 0, **report}
+
         manifest_filename = self.lineage.mark_pruned(label, generation_index)
 
         freed = False
@@ -566,6 +579,108 @@ class VaultSession:
                 freed = True
 
         return {"freed": freed}
+
+    @_changes_vault
+    def shred(self, label: str, generation_index: Optional[int] = None, force: bool = False) -> dict:
+        """Securely erases a file's whole history (generation_index None) or one
+        old version of it, so the old content can't be recovered from the vault
+        even by someone who later learns the passphrase.
+
+        Chunks used only by what is being shredded are overwritten in both
+        containers and their index entries securely deleted; recipes and
+        fingerprint files are overwritten before deletion; the catalog and the
+        history file are rewritten with their old copies overwritten. A
+        shredded version stays in the history, marked pruned and tagged
+        'shredded' with the date. Content still used by another live file or
+        version is kept, and counted in the report.
+
+        Refuses the current version (shred the whole file, or save a new
+        version first) and 'protected' files unless force=True. Returns
+        {"versions_shredded", "manifests_freed", "manifests_kept_shared",
+        "chunks_destroyed", "chunks_kept_shared"}.
+        """
+        if label not in self.catalog:
+            raise KeyError(f"No such label: '{label}'")
+        if generation_index is None:
+            if not force and self.lineage.get_tags(label).get("protected"):
+                raise PermissionError(
+                    f"'{label}' is tagged 'protected' -- won't shred without an explicit override.")
+        else:
+            history = self.lineage.get_history(label)
+            if history and history[-1].generation_index == generation_index:
+                raise ValueError(
+                    f"Generation {generation_index} is '{label}'s current version -- save a new version "
+                    f"first, or shred the whole file.")
+            node = self.lineage.get_generation(label, generation_index)
+            if node is None:
+                raise ValueError(f"No generation {generation_index} recorded for '{label}'.")
+            if node.pruned:
+                raise ValueError(
+                    f"Generation {generation_index} of '{label}' was already pruned or shredded.")
+            if not force and node.epigenetic_tags.get("protected"):
+                raise PermissionError(
+                    f"Generation {generation_index} of '{label}' is tagged 'protected' -- won't shred "
+                    f"without an explicit override.")
+        return self._shred_locked(label, generation_index)
+
+    def _shred_locked(self, label: str, generation_index: Optional[int]) -> dict:
+        """The work of shred(); the caller holds the write lock and has checked the request."""
+        when = time.strftime("%Y-%m-%d %H:%M:%S")
+        if generation_index is None:
+            history = self.lineage.get_history(label)
+            candidates = {self.catalog[label]}
+            candidates.update(n.manifest_filename for n in history if n.manifest_filename is not None)
+            versions = len(history) or 1
+            del self.catalog[label]
+            self.lineage.delete_label(label, scrub=True)
+            self.save_catalog(scrub=True)
+        else:
+            manifest_filename = self.lineage.mark_shredded(label, generation_index, when)
+            candidates = {manifest_filename} if manifest_filename else set()
+            versions = 1
+
+        doomed = [m for m in candidates if self._manifest_reference_count(m) == 0
+                  and os.path.exists(os.path.join(self.storage_root, m))]
+        kept_manifests = len(candidates) - len(doomed)
+
+        # Chunks still used by any live recipe must survive.
+        live_chunks = set()
+        for manifest_filename in self._live_manifest_filenames():
+            path = os.path.join(self.storage_root, manifest_filename)
+            if os.path.exists(path):
+                live_chunks.update(self.pipeline.manifest_chunk_hashes(path))
+
+        destroyed = kept_chunks = 0
+        for manifest_filename in doomed:
+            path = os.path.join(self.storage_root, manifest_filename)
+            own = set(self.pipeline.manifest_chunk_hashes(path)) - live_chunks
+            report = self.pipeline.shred_manifest(path, own)
+            destroyed += report["chunks_destroyed"]
+            kept_chunks += report["chunks_kept_shared"]
+
+        return {"versions_shredded": versions, "manifests_freed": len(doomed),
+                "manifests_kept_shared": kept_manifests, "chunks_destroyed": destroyed,
+                "chunks_kept_shared": kept_chunks}
+
+    def read_bytes(self, label: str, generation_index: Optional[int] = None,
+                   limit: Optional[int] = MAX_SECRET_BYTES) -> bytes:
+        """A file's content (latest version, or one generation), rebuilt and
+        checked in memory without touching the disk. ValueError if it is
+        pruned or larger than limit."""
+        if label not in self.catalog:
+            raise KeyError(f"No such label: '{label}'")
+        if generation_index is None:
+            manifest_filename = self.catalog[label]
+        else:
+            node = self.lineage.get_generation(label, generation_index)
+            if node is None or node.manifest_filename is None:
+                raise ValueError(f"Generation {generation_index} of '{label}' isn't available.")
+            manifest_filename = node.manifest_filename
+        manifest_path = os.path.join(self.storage_root, manifest_filename)
+        return read_via_memory(
+            lambda out: reconstruct(manifest_path, self.pipeline.container_path, out, self.crypto.key,
+                                    quiet=True),
+            limit)
 
     def _find_common_ancestor(self, node_a, node_b):
         """Lowest common ancestor along primary parents."""
@@ -601,28 +716,9 @@ class VaultSession:
             )
         return self._manifest_chunk_list(node.manifest_filename)
 
-    @_changes_vault
-    def merge_branches(self, label: str, generation_a: int, generation_b: int,
-                       resolutions: Optional[Dict[int, str]] = None) -> str:
-        """Merges two branches of `label` by a 3-way diff of chunk positions
-        against their lowest common ancestor.
-
-        Per position: unchanged or changed identically -> kept; changed by one
-        branch -> that branch's; changed differently by both -> a conflict.
-        `resolutions` ({position: "a" or "b"}) settles conflicts by taking that
-        branch's chunk (or its end, if that branch ends there). Any conflict
-        left unresolved raises MutationConflictError and nothing is committed.
-        The result is committed as an ordinary write with generation_a as
-        primary parent and generation_b as lateral parent. Returns the new
-        manifest path.
-        """
-        resolutions = resolutions or {}
-        bad = [side for side in resolutions.values() if side not in ("a", "b")]
-        if bad:
-            raise ValueError(f"A resolution must be 'a' or 'b', not {bad[0]!r}.")
-        if label not in self.catalog:
-            raise KeyError(f"No such label: '{label}'")
-
+    def _merge_nodes(self, label: str, generation_a: int, generation_b: int):
+        """(node_a, node_b, common ancestor) for merging two branches of
+        label, after checking the request. ValueError if it can't be merged."""
         node_a = self.lineage.get_generation(label, generation_a)
         node_b = self.lineage.get_generation(label, generation_b)
         if node_a is None:
@@ -645,6 +741,61 @@ class VaultSession:
                 "One of these generations is a direct ancestor of the other -- that's just "
                 "linear history, not a divergent branch. Nothing to merge."
             )
+        if ancestor.pruned:
+            raise ValueError("The common ancestor of these branches was pruned -- there is no base "
+                             "version to compare them with.")
+        return node_a, node_b, ancestor
+
+    def merge_base(self, label: str, generation_a: int, generation_b: int) -> int:
+        """The generation two branches last had in common, for a line-by-line
+        merge done by the caller. Same checks as merge_branches()."""
+        if label not in self.catalog:
+            raise KeyError(f"No such label: '{label}'")
+        return self._merge_nodes(label, generation_a, generation_b)[2].generation_index
+
+    @_changes_vault
+    def commit_merged(self, label: str, generation_a: int, generation_b: int, source_path: str) -> str:
+        """Commits content the caller merged (for example line by line) as the
+        merge of two branches: generation_a is the primary parent and
+        generation_b a lateral parent, as with merge_branches(). Returns the
+        new manifest path."""
+        if label not in self.catalog:
+            raise KeyError(f"No such label: '{label}'")
+        node_a, node_b, _ancestor = self._merge_nodes(label, generation_a, generation_b)
+        fingerprint = PhylogeneticAnalyzer(SIMILARITY_PROFILE).extract_traits(source_path)
+        manifest_path = self.pipeline.secure_and_persist_file(source_path, similarity_fingerprint=fingerprint)
+        manifest_filename = os.path.basename(manifest_path)
+        meta = self.read_manifest_metadata(manifest_path)
+        self.lineage.record_version(label, manifest_filename,
+                                    new_chunks=meta["new_chunks_written"], total_chunks=meta["total_blocks"],
+                                    lateral_parent_uuids=[node_b.node_uuid], fork_from=node_a)
+        self.catalog[label] = manifest_filename
+        self.save_catalog()
+        return manifest_path
+
+    @_changes_vault
+    def merge_branches(self, label: str, generation_a: int, generation_b: int,
+                       resolutions: Optional[Dict[int, str]] = None) -> str:
+        """Merges two branches of `label` by a 3-way diff of chunk positions
+        against their lowest common ancestor.
+
+        Per position: unchanged or changed identically -> kept; changed by one
+        branch -> that branch's; changed differently by both -> a conflict.
+        `resolutions` ({position: "a" or "b"}) settles conflicts by taking that
+        branch's chunk (or its end, if that branch ends there). Any conflict
+        left unresolved raises MutationConflictError and nothing is committed.
+        The result is committed as an ordinary write with generation_a as
+        primary parent and generation_b as lateral parent. Returns the new
+        manifest path.
+        """
+        resolutions = resolutions or {}
+        bad = [side for side in resolutions.values() if side not in ("a", "b")]
+        if bad:
+            raise ValueError(f"A resolution must be 'a' or 'b', not {bad[0]!r}.")
+        if label not in self.catalog:
+            raise KeyError(f"No such label: '{label}'")
+
+        node_a, node_b, ancestor = self._merge_nodes(label, generation_a, generation_b)
 
         chunks_ancestor = self._manifest_chunk_list(ancestor.manifest_filename)
         chunks_a = self._manifest_chunk_list(node_a.manifest_filename)

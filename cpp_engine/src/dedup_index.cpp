@@ -352,6 +352,28 @@ bool DedupIndex::remove(const Bytes32& content_hash) {
     return sqlite3_changes(db_) > 0;
 }
 
+// Securely deletes these chunks' entries and spare-copy entries; returns how many existed.
+uint64_t DedupIndex::remove_securely(const std::vector<Bytes32>& content_hashes) {
+    exec_or_throw(db_, "PRAGMA secure_delete=ON");
+    uint64_t existed = 0;
+    begin();
+    try {
+        for (const auto& content_hash : content_hashes) {
+            if (lookup(content_hash)) existed++;
+            remove(content_hash);
+        }
+    } catch (...) {
+        rollback();
+        throw;
+    }
+    commit();
+    // Cached lookup statements keep a read open; reset them so the checkpoint can
+    // copy the overwritten pages into the database and empty the log.
+    refresh_prepared_statements();
+    exec_or_throw(db_, "PRAGMA wal_checkpoint(TRUNCATE)");
+    return existed;
+}
+
 // Returns every entry in the index, decrypted.
 std::vector<FullBlockEntry> DedupIndex::iter_all() {
     std::vector<FullBlockEntry> out;

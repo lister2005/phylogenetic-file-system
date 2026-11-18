@@ -12,8 +12,8 @@ open; changes are serialized.
 
 The OS releases flocks when the descriptor closes for any reason, so there
 is no stale lock to clean up. Sessions in one process share one descriptor
-per lock file through a refcounted registry. The C++ engine still takes
-.vault.lock exclusively (vault_lock.hpp); a vault belongs to one engine.
+per lock file through a refcounted registry. The C++ engine uses the same
+scheme (vault_lock.hpp); a vault still belongs to one engine.
 """
 
 import fcntl
@@ -90,8 +90,7 @@ class VaultLock:
                 os.close(fd)
                 raise VaultLockError(
                     f"Vault '{storage_root}' is busy: another program is running an operation that "
-                    f"needs the whole vault (vacuum, fsck repair or panic), or it is open in a "
-                    f"program that doesn't share vaults (the C++ engine). Try again shortly.")
+                    f"needs the whole vault (vacuum, fsck repair or panic). Try again shortly.")
             _registry[self._key] = {"fd": fd, "refcount": 1, "write": _WriteLock(write_path),
                                     "exclusive_depth": 0}
             self._active = True

@@ -25,6 +25,8 @@ import time
 import uuid
 from typing import Dict, List, Optional
 
+from gearhash.scrub import scrub_then_replace
+
 LINEAGE_FILENAME = "lineage.enc"
 
 # On disk: a magic header, then length-framed encrypted records, each a
@@ -141,8 +143,10 @@ class LineageStore:
             for node in nodes
         }
 
-    def _save(self) -> None:
-        """Rewrites the file as one snapshot. Used by the rare mutating operations."""
+    def _save(self, scrub: bool = False) -> None:
+        """Rewrites the file as one snapshot. Used by the rare mutating operations.
+        With scrub, the old file is overwritten first, so records it held
+        (such as a shredded version's) don't linger in its blocks."""
         stored = {label: [n.to_dict() for n in nodes] for label, nodes in self._history.items()}
         raw = pickle.dumps(stored)
         encrypted = self.crypto.encrypt_block(raw, associated_data=b"lineage_snapshot")
@@ -152,7 +156,10 @@ class LineageStore:
             f.write(framed)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, self.path)
+        if scrub:
+            scrub_then_replace(tmp, self.path)
+        else:
+            os.replace(tmp, self.path)
 
     def _append_node(self, node: "LineageNode") -> None:
         """Appends one node record. Used by record_version, the per-write path."""
@@ -197,12 +204,16 @@ class LineageStore:
         return node
 
     def get_heads(self, label: str) -> List[LineageNode]:
-        """Open branch tips: nodes that aren't another node's primary parent.
-        Being a lateral parent doesn't count.
+        """Open branch tips: nodes that no later version of the same file has
+        as a parent, primary or lateral. A merge's lateral parent (the other
+        branch) is closed by the merge; lateral parents from other files
+        (grafts, duplicates) belong to those files' histories, not this one.
         """
         nodes = self._history.get(label, [])
-        claimed_as_primary_parent = {n.parent_uuid for n in nodes if n.parent_uuid is not None}
-        return [n for n in nodes if n.node_uuid not in claimed_as_primary_parent]
+        claimed = {n.parent_uuid for n in nodes if n.parent_uuid is not None}
+        for n in nodes:
+            claimed.update(n.lateral_parent_uuids)
+        return [n for n in nodes if n.node_uuid not in claimed]
 
     def get_history(self, label: str) -> List[LineageNode]:
         """Chronological, generation 0 first."""
@@ -233,13 +244,29 @@ class LineageStore:
         """Returns the names of all files that have a history."""
         return list(self._history.keys())
 
-    def delete_label(self, label: str) -> None:
-        """Removes all of label's history (full delete). No-op if it has none."""
+    def delete_label(self, label: str, scrub: bool = False) -> None:
+        """Removes all of label's history (full delete). No-op if it has none.
+        With scrub, the old history file is overwritten (used by 'shred')."""
         if label in self._history:
             for node in self._history[label]:
                 self._by_uuid.pop(node.node_uuid, None)
             del self._history[label]
-            self._save()
+            self._save(scrub=scrub)
+
+    def mark_shredded(self, label: str, generation_index: int, when: str) -> Optional[str]:
+        """Like mark_pruned, but also tags the version 'shredded' with the date
+        and rewrites the history file with scrubbing, so the record of its
+        recipe is gone. Returns the recipe filename it had, or None."""
+        for node in self._history.get(label, []):
+            if node.generation_index == generation_index and not node.pruned:
+                manifest_filename = node.manifest_filename
+                node.pruned = True
+                node.manifest_filename = None
+                node.epigenetic_tags = dict(node.epigenetic_tags)
+                node.epigenetic_tags["shredded"] = when
+                self._save(scrub=True)
+                return manifest_filename
+        return None
 
     def mark_pruned(self, label: str, generation_index: int) -> Optional[str]:
         """Clears one generation's manifest_filename, keeping the record.

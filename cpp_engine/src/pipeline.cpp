@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 
 #include <algorithm>
 #include <filesystem>
@@ -84,7 +85,99 @@ StoragePipeline::StoragePipeline(std::string storage_root, const Bytes32& kek)
       container_path_(storage_root_ + "/data_container.bin"),
       mirror_container_path_(storage_root_ + "/data_container_mirror.bin"),
       index_(storage_root_ + "/global_index.db", kek),
-      keyring_(storage_root_, kek) {}
+      keyring_(storage_root_, kek),
+      settings_path_(storage_root_ + "/settings.pfss") {
+    reload_settings();
+}
+
+namespace {
+constexpr char kSettingsMagic[4] = {'P', 'F', 'S', 'S'};
+constexpr uint16_t kSettingsVersion = 1;
+const std::string kSettingsAad = "settings";
+}  // namespace
+
+// Re-reads settings.pfss; a missing file means the defaults.
+void StoragePipeline::reload_settings() {
+    mirror_all_ = false;
+    if (!file_exists(settings_path_)) return;
+    std::ifstream in(settings_path_, std::ios::binary);
+    std::vector<uint8_t> encrypted((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    std::vector<uint8_t> raw = aead_decrypt(kek_, encrypted.data(), encrypted.size(),
+                                            reinterpret_cast<const uint8_t*>(kSettingsAad.data()), kSettingsAad.size());
+    if (raw.size() < 7 || memcmp(raw.data(), kSettingsMagic, 4) != 0) {
+        throw std::runtime_error("bad settings file: " + settings_path_);
+    }
+    uint16_t version = static_cast<uint16_t>(raw[4] | (raw[5] << 8));
+    if (version != kSettingsVersion) throw std::runtime_error("unsupported settings version: " + settings_path_);
+    mirror_all_ = (raw[6] & 1) != 0;
+}
+
+// Saves the spares setting; turning it on mirrors every chunk that lacks a spare.
+uint64_t StoragePipeline::set_mirror_all(bool enabled) {
+    std::vector<uint8_t> raw(kSettingsMagic, kSettingsMagic + 4);
+    raw.push_back(static_cast<uint8_t>(kSettingsVersion & 0xFF));
+    raw.push_back(static_cast<uint8_t>(kSettingsVersion >> 8));
+    raw.push_back(enabled ? 1 : 0);
+    std::vector<uint8_t> encrypted = aead_encrypt(kek_, raw.data(), raw.size(),
+                                                  reinterpret_cast<const uint8_t*>(kSettingsAad.data()),
+                                                  kSettingsAad.size());
+    std::string tmp = settings_path_ + ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("failed to write settings: " + tmp);
+        out.write(reinterpret_cast<const char*>(encrypted.data()), static_cast<std::streamsize>(encrypted.size()));
+    }
+    int fd = open(tmp.c_str(), O_WRONLY);
+    if (fd >= 0) { fsync(fd); close(fd); }
+    if (rename(tmp.c_str(), settings_path_.c_str()) != 0) {
+        throw std::runtime_error("failed to move settings into place: " + settings_path_);
+    }
+    mirror_all_ = enabled;
+    return enabled ? mirror_existing_chunks() : 0;
+}
+
+// Copies every live chunk that has no spare into the mirror container.
+uint64_t StoragePipeline::mirror_existing_chunks() {
+    std::vector<FullBlockEntry> missing;
+    for (const auto& entry : index_.iter_all()) {
+        if (entry.ref_count > 0 && !index_.get_mirror(entry.content_hash)) missing.push_back(entry);
+    }
+    if (missing.empty()) return 0;
+    int primary_fd = open(container_path_.c_str(), O_RDONLY);
+    if (primary_fd < 0) throw std::runtime_error("can't read the container to make spares");
+    set_immutable(mirror_container_path_, false);
+    int mirror_fd = open(mirror_container_path_.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0600);
+    if (mirror_fd < 0) {
+        close(primary_fd);
+        throw std::runtime_error("can't open the mirror container");
+    }
+    uint64_t mirror_offset = file_size(mirror_container_path_);
+    index_.begin();
+    try {
+        for (const auto& entry : missing) {
+            std::vector<uint8_t> bytes(entry.length);
+            if (pread(primary_fd, bytes.data(), entry.length, static_cast<off_t>(entry.offset)) !=
+                    static_cast<ssize_t>(entry.length) ||
+                write(mirror_fd, bytes.data(), bytes.size()) != static_cast<ssize_t>(bytes.size())) {
+                throw std::runtime_error("failed copying a chunk into the mirror container");
+            }
+            index_.set_mirror(entry.content_hash, mirror_offset, entry.length);
+            mirror_offset += entry.length;
+        }
+        fsync(mirror_fd);
+    } catch (...) {
+        index_.rollback();
+        close(primary_fd);
+        close(mirror_fd);
+        set_immutable(mirror_container_path_, true);
+        throw;
+    }
+    index_.commit();
+    close(primary_fd);
+    close(mirror_fd);
+    set_immutable(mirror_container_path_, true);
+    return missing.size();
+}
 
 // Chunks a file, stores only the chunks not already in the vault, writes spares and the recipe.
 WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_path,
@@ -141,7 +234,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
                 if (it != local_state.end()) {
                     it->second.ref_count += 1;
                     dup_chunks++;
-                    crossed = (it->second.ref_count == StoragePipeline::kMirrorRefThreshold);
+                    crossed = mirror_all_ || (it->second.ref_count == StoragePipeline::kMirrorRefThreshold);
                     entry_ptr = &it->second;
                 } else {
                     auto dbit = db_state.find(span.digest);
@@ -150,7 +243,7 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
                         e.ref_count += 1;
                         auto inserted = local_state.emplace(span.digest, e);
                         dup_chunks++;
-                        crossed = (e.ref_count == StoragePipeline::kMirrorRefThreshold);
+                        crossed = mirror_all_ || (e.ref_count == StoragePipeline::kMirrorRefThreshold);
                         entry_ptr = &inserted.first->second;
                     } else {
                         std::vector<uint8_t> encrypted =
@@ -163,7 +256,8 @@ WriteResult StoragePipeline::secure_and_persist_file(const std::string& file_pat
                         new_chunks++;
                         auto inserted = local_state.emplace(span.digest, e);
                         entry_ptr = &inserted.first->second;
-                        // a new chunk (ref_count 1) can't equal the threshold
+                        // a new chunk (ref_count 1) only gets a spare with 'spares all'
+                        crossed = mirror_all_;
                     }
                 }
 
@@ -478,6 +572,78 @@ void StoragePipeline::delete_file(const std::string& manifest_path) {
     if (remove(manifest_path.c_str()) != 0) {
         throw std::runtime_error("failed to remove manifest '" + manifest_path + "': " + strerror(errno));
     }
+}
+
+// Returns a recipe's chunk hashes, in order.
+std::vector<Bytes32> StoragePipeline::manifest_chunk_hashes(const std::string& manifest_path) {
+    std::string manifest_filename = manifest_path.substr(manifest_path.find_last_of('/') + 1);
+    Manifest manifest = read_manifest_file(manifest_path, manifest_filename, kek_);
+    std::vector<Bytes32> hashes;
+    for (uint64_t idx = 0; idx < manifest.metadata().total_blocks; idx++) {
+        auto hash_opt = manifest.lookup(idx);
+        if (hash_opt) hashes.push_back(*hash_opt);
+    }
+    return hashes;
+}
+
+namespace {
+// Overwrites each (offset, length) region of a container with random bytes.
+void overwrite_regions(const std::string& path, const std::vector<std::pair<uint64_t, uint64_t>>& regions) {
+    if (regions.empty() || !file_exists(path)) return;
+    set_immutable(path, false);
+    int fd = open(path.c_str(), O_WRONLY);
+    if (fd < 0) {
+        set_immutable(path, true);
+        throw std::runtime_error("can't open '" + path + "' to overwrite chunks");
+    }
+    for (const auto& [offset, length] : regions) {
+        std::vector<uint8_t> noise(length);
+        RAND_bytes(noise.data(), static_cast<int>(noise.size()));
+        if (pwrite(fd, noise.data(), noise.size(), static_cast<off_t>(offset)) != static_cast<ssize_t>(length)) {
+            close(fd);
+            set_immutable(path, true);
+            throw std::runtime_error("failed to overwrite a chunk in '" + path + "'");
+        }
+    }
+    fsync(fd);
+    close(fd);
+    set_immutable(path, true);
+}
+}  // namespace
+
+// Securely removes a recipe, overwriting the chunks only it used.
+ShredReport StoragePipeline::shred_manifest(const std::string& manifest_path, const std::set<Bytes32>& destroy) {
+    std::vector<Bytes32> hashes = manifest_chunk_hashes(manifest_path);
+    std::set<Bytes32> own;
+    for (const auto& h : hashes) {
+        if (destroy.count(h)) own.insert(h);
+    }
+    std::vector<std::pair<uint64_t, uint64_t>> primary, spare;
+    for (const auto& h : own) {
+        if (auto entry = index_.lookup(h)) primary.emplace_back(entry->offset, entry->length);
+        if (auto mirror = index_.get_mirror(h)) spare.emplace_back(mirror->offset, mirror->length);
+    }
+    overwrite_regions(container_path_, primary);
+    overwrite_regions(mirror_container_path_, spare);
+
+    index_.begin();
+    try {
+        for (const auto& h : hashes) {
+            if (!own.count(h)) index_.decrement_ref(h);
+        }
+    } catch (...) {
+        index_.rollback();
+        throw;
+    }
+    index_.commit();
+    ShredReport report;
+    report.chunks_destroyed = index_.remove_securely(std::vector<Bytes32>(own.begin(), own.end()));
+    std::set<Bytes32> distinct(hashes.begin(), hashes.end());
+    report.chunks_kept_shared = distinct.size() - own.size();
+
+    set_immutable(manifest_path, false);
+    scrub_and_remove(manifest_path);
+    return report;
 }
 
 // Recounts every chunk's references from the recipes still in use, correcting wrong counts.
